@@ -1,0 +1,175 @@
+use super::*;
+use crate::metrics::tests::result;
+use crate::workspace::tests::scratch;
+
+fn trial(task: &str, arm: Arm, success: bool, wall: f64, cost: f64) -> TrialResult {
+    TrialResult {
+        task: task.into(),
+        arm,
+        success,
+        wall_secs: wall,
+        input_tokens: Some(1000),
+        output_tokens: Some(100),
+        ..result(Some(cost), None)
+    }
+}
+
+#[test]
+fn stats_use_the_sample_standard_deviation() {
+    let s = Stat::of(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]).unwrap();
+    assert_eq!(s.n, 8);
+    assert!((s.mean - 5.0).abs() < 1e-12);
+    assert!((s.stdev - (32.0f64 / 7.0).sqrt()).abs() < 1e-12);
+    assert_eq!(Stat::of(&[3.0]).unwrap().stdev, 0.0);
+    assert!(Stat::of(&[]).is_none());
+}
+
+#[test]
+fn pass_at_k_matches_the_closed_form() {
+    assert!((pass_at_k(4, 1, 1) - 0.25).abs() < 1e-12);
+    // 1 - C(3,2)/C(4,2) = 1 - 3/6.
+    assert!((pass_at_k(4, 1, 2) - 0.5).abs() < 1e-12);
+    assert_eq!(pass_at_k(4, 0, 4), 0.0);
+    assert_eq!(pass_at_k(4, 1, 4), 1.0);
+    assert_eq!(pass_at_k(3, 3, 1), 1.0);
+}
+
+#[test]
+fn summary_aggregates_per_arm_and_per_task() {
+    let results = vec![
+        trial("a", Arm::Claude, true, 10.0, 1.0),
+        trial("a", Arm::Claude, false, 20.0, 3.0),
+        trial("b", Arm::Claude, true, 30.0, 2.0),
+        trial("b", Arm::Claude, true, 40.0, 2.0),
+        trial("a", Arm::Archon, true, 50.0, 4.0),
+        trial("a", Arm::Archon, true, 70.0, 4.0),
+    ];
+    let summary = Summary::build(&results, None).unwrap();
+    assert_eq!(summary.k, 2);
+    let arms: Vec<Arm> = summary.arms.iter().map(|a| a.arm).collect();
+    assert_eq!(
+        arms,
+        [Arm::Archon, Arm::Claude],
+        "arms keep their canonical order"
+    );
+    let claude = &summary.arms[1];
+    assert_eq!((claude.trials, claude.successes), (4, 3));
+    assert!((claude.success_rate - 0.75).abs() < 1e-12);
+    assert!(
+        (claude.pass_at_1 - 0.75).abs() < 1e-12,
+        "mean of 0.5 and 1.0"
+    );
+    assert!((claude.pass_at_k - 1.0).abs() < 1e-12);
+    assert!((claude.wall_secs.mean - 25.0).abs() < 1e-12);
+    assert!((claude.cost_usd.unwrap().mean - 2.0).abs() < 1e-12);
+    assert_eq!(summary.tasks["a"].len(), 2);
+    assert_eq!(summary.tasks["b"].len(), 1);
+}
+
+#[test]
+fn partial_scores_and_timeouts_are_reported() {
+    let mut scored = trial("a", Arm::Codex, false, 5.0, 0.5);
+    scored.score = Some(0.75);
+    let mut slow = trial("a", Arm::Codex, false, 900.0, 1.0);
+    slow.timed_out = true;
+    let summary = Summary::build(&[scored, slow], None).unwrap();
+    let codex = &summary.arms[0];
+    assert_eq!((codex.trials, codex.infra, codex.timeouts), (2, 0, 1));
+    assert!((codex.score.mean - 0.375).abs() < 1e-12);
+    assert!(Summary::build(&[], None).is_err());
+}
+
+#[test]
+fn infra_failures_are_left_out_of_every_aggregate() {
+    let mut limited = trial("a", Arm::Claude, false, 10.0, 0.11);
+    limited.trial = 2;
+    limited.error = Some("claude reported success: You've hit your session limit".into());
+    let mut misgraded = trial("b", Arm::Claude, false, 120.0, 0.72);
+    misgraded.error = Some("grading: merge failed".into());
+    let mut noisy_pass = trial("a", Arm::Claude, true, 40.0, 1.0);
+    noisy_pass.error = Some("stopping archond: killed".into());
+    let results = vec![
+        trial("a", Arm::Claude, true, 30.0, 0.5),
+        limited,
+        misgraded,
+        noisy_pass,
+        trial("a", Arm::Codex, true, 50.0, 0.5),
+    ];
+    let summary = Summary::build(&results, None).unwrap();
+
+    let claude = summary.arms.iter().find(|a| a.arm == Arm::Claude).unwrap();
+    assert_eq!((claude.trials, claude.successes, claude.infra), (2, 2, 2));
+    assert!((claude.success_rate - 1.0).abs() < 1e-12);
+    assert!((claude.wall_secs.mean - 35.0).abs() < 1e-12);
+    assert_eq!(summary.k, 1, "codex has one graded trial of `a`");
+    assert!(
+        summary.tasks["b"].is_empty(),
+        "a cell of infra failures only has no aggregate"
+    );
+    let listed: Vec<(&str, u32)> = summary
+        .infra
+        .iter()
+        .map(|f| (f.task.as_str(), f.trial))
+        .collect();
+    assert_eq!(listed, [("a", 2), ("b", 1)]);
+    let md = render_markdown(&summary).unwrap();
+    assert!(md.contains("## Infrastructure failures"), "{md}");
+    assert!(
+        md.contains("- a / claude #2: claude reported success"),
+        "{md}"
+    );
+    assert!(md.contains("| b | — | — |"), "{md}");
+}
+
+#[test]
+fn a_run_of_infra_failures_only_has_no_summary() {
+    let mut broken = trial("a", Arm::Codex, false, 1.0, 0.0);
+    broken.error = Some("codex exited 1".into());
+    let error = Summary::build(&[broken], None).unwrap_err().to_string();
+    assert!(error.contains("infrastructure"), "{error}");
+}
+
+#[test]
+fn summary_files_are_written_from_results_jsonl() {
+    let tmp = scratch();
+    let lines: Vec<String> = [
+        trial("a", Arm::Claude, true, 10.0, 1.0),
+        trial("a", Arm::Codex, false, 12.0, 0.0),
+    ]
+    .iter()
+    .map(|r| serde_json::to_string(r).unwrap())
+    .collect();
+    std::fs::write(tmp.path().join("results.jsonl"), lines.join("\n") + "\n").unwrap();
+    let summary = write_summary(tmp.path()).unwrap();
+    assert_eq!(summary.arms.len(), 2);
+    let md = std::fs::read_to_string(tmp.path().join("summary.md")).unwrap();
+    assert!(md.contains("| claude | `m` | 1 | 1/1 (100%)"), "{md}");
+    assert!(
+        md.contains("| a | 1/1 · 10 ± 0 · 1.00 ± 0.00 · 1.0 ± 0.0 | 0/1 · 12 ± 0 · 0.00 ± 0.00 · 1.0 ± 0.0 |"),
+        "{md}"
+    );
+    let chart: Summary =
+        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("chart.json")).unwrap())
+            .unwrap();
+    assert_eq!(chart, summary);
+}
+
+#[test]
+fn metrics_only_some_trials_reported_show_their_n() {
+    let mut unpriced = trial("a", Arm::Codex, true, 8.0, 0.0);
+    unpriced.cost_usd = None;
+    unpriced.input_tokens = None;
+    let results = vec![
+        trial("a", Arm::Codex, true, 10.0, 1.0),
+        trial("a", Arm::Codex, false, 20.0, 3.0),
+        unpriced,
+    ];
+    let md = render_markdown(&Summary::build(&results, None).unwrap()).unwrap();
+    assert!(md.contains("| 1000 ± 0 (n=2) |"), "{md}");
+    assert!(md.contains("| 2.00 ± 1.41 (n=2) |"), "{md}");
+    assert!(
+        md.contains("| 100 ± 0 |"),
+        "output tokens came from all three: {md}"
+    );
+    assert!(md.contains("2/3 · 13 ± 6 · 2.00 ± 1.41 (n=2) ·"), "{md}");
+}

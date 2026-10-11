@@ -1,0 +1,46 @@
+{
+  "stamp": "20260926T200340Z",
+  "started_at": "2026-09-26T20:03:40.884977145Z",
+  "finished_at": "2026-09-26T21:15:03.728438624Z",
+  "archon_commit": null,
+  "versions": {
+    "aetherd": "0.1.1",
+    "archon": "pre-release build (before 1.0.0)",
+    "claude": "2.1.283 (Claude Code)",
+    "codex": "codex-cli 0.155.1"
+  },
+  "models": {
+    "aether": "claude-code/claude-opus-5-5",
+    "archon": "claude-code/claude-opus-5-5",
+    "claude": "claude-code/claude-opus-5-5",
+    "codex": "codex/gpt-5.6-sol"
+  },
+  "effort": "high",
+  "arms": [
+    "archon",
+    "aether",
+    "claude",
+    "codex"
+  ],
+  "tasks": [
+    "ask-cache-invalidation",
+    "feature-token-bucket",
+    "fix-off-by-one",
+    "long-backlog",
+    "multi-repo-currency",
+    "multi-repo-pagination",
+    "refactor-order-status",
+    "review-seeded-bug"
+  ],
+  "trials": 3,
+  "parallel": 3,
+  "timeout_factor": 1.0,
+  "max_usd": 37.0,
+  "max_trials": 100,
+  "planned": 96,
+  "completed": 52,
+  "skipped": 44,
+  "spent_usd": 40.011028599999996,
+  "unpriced_trials": 0,
+  "stopped_reason": "--max-usd 37.00 reached after $40.01; 44 trials skipped"
+}

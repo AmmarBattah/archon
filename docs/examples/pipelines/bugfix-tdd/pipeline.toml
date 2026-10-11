@@ -1,0 +1,46 @@
+# An example user pipeline. Copy this directory to
+# ~/.config/archon/pipelines/bugfix-tdd/ (or <repo>/.archon/pipelines/bugfix-tdd/)
+# and it is available on the next enqueue. See docs/PIPELINES.md.
+
+[pipeline]
+name = "bugfix-tdd"                  # must equal the directory name
+description = "Reproduce a bug with a failing test, fix it, two independent reviews, then ship"
+version = 1
+workspace = "worktree"
+requires_repo = true
+
+[nudges]
+tier = "balanced"
+independent_reviewers = true
+notes = "For bug reports with a clear symptom. A failing test is committed before any fix."
+
+[[stage]]
+id = "reproduce"
+kind = "work"
+prompt = "reproduce.md"
+timeout_minutes = 60
+nudge = "A careful model at medium effort; it only writes a test."
+
+[[stage]]
+id = "fix"
+kind = "work"
+prompt = "fix.md"
+timeout_minutes = 120
+nudge = "A strong coding model at high effort."
+
+[[stage]]
+id = "review"
+kind = "review"
+prompt = "review.md"
+fan_out = 2
+gate = "all_pass"
+timeout_minutes = 60
+nudge = "Two reviewers on different models when the allowlist permits."
+on_fail = { goto = "fix", max_loops = 2 }
+
+[[stage]]
+id = "ship"
+kind = "ship"
+prompt = "ship.md"
+timeout_minutes = 90
+nudge = "A fast model at low effort."

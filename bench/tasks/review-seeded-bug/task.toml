@@ -1,0 +1,12 @@
+id = "review-seeded-bug"
+title = "Review a rewritten session-token module and find its security bug"
+prompt = """
+`src/tokens.js` in this `session-lib` repository was just rewritten to sign \
+session tokens with HMAC-SHA256, and it ships to production tomorrow. Review \
+it for correctness and security problems. For each problem, give the file, \
+the function, what goes wrong (ideally a concrete input that triggers it) and \
+how severe it is. Do not change any code; report in your final message.
+"""
+timeout_minutes = 15
+pipeline = "ask"
+tags = ["review", "security", "node", "single-repo", "answer"]

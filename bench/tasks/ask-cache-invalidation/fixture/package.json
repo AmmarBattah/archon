@@ -1,0 +1,9 @@
+{
+  "name": "catalog-service",
+  "version": "2.3.1",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test"
+  }
+}

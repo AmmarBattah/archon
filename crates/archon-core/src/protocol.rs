@@ -1,0 +1,1223 @@
+//! The Archon daemon wire protocol (ARCHITECTURE §10). NDJSON over a Unix
+//! socket, shaped like Aether's so both are debugged the same way:
+//! client `{"req":N,"cmd":"...",...}`, daemon `{"frame":"reply","id":N,
+//! "result":{"Ok":{"reply":"...","data":...}}}` or `{"frame":"feed",...}`.
+
+use serde::{Deserialize, Serialize};
+
+use crate::Timestamp;
+use crate::aether_ids::AetherAgentId;
+use crate::autonomy::{AutonomyPatch, AutonomyPolicy, AutonomyView, Directive};
+use crate::catalog::CatalogListing;
+use crate::cost::{CostQuery, CostReport};
+use crate::error::ArchonError;
+use crate::github::{GithubThread, GithubWatch, GithubWatcherView, WatcherChange};
+use crate::id::{DirectiveId, PipelineRunId, QuestionId, QueueItemId, ReportId};
+use crate::model::{Effort, ModelChoice, ModelPlan, ModelReasons, ModelRef};
+use crate::model_evidence::{ModelEvidenceQuery, ModelEvidenceReport};
+use crate::notify::{FeedItem, NotificationKind, Question};
+use crate::policy::ModelPolicy;
+use crate::queue::{Caps, PauseState, Priority, QueueItem};
+use crate::repo::{Repo, ShipMode};
+use crate::run::{OperatorGate, PipelineRun, StageRun, StageState, Verdict};
+
+/// 3: a GitHub watcher `add` may carry an allowlist; an older archond
+/// would drop it and widen who may dispatch, so it is refused at hello.
+/// 4: `retry_item` may ask for a fresh retry and both it and `update_item`
+/// may carry `brief_append`; an older archond would silently drop them.
+/// 5: operator-only orchestrator attachment for the native TUI.
+pub const PROTOCOL_VERSION: u32 = 5;
+
+/// Longest accepted frame in either direction.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Who is on the other end. Guards against mistakes, not attacks: the
+/// socket's file mode is the security boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientKind {
+    ArchonCli,
+    ArchonMcp,
+    ArchonBench,
+}
+
+/// A repository by registry name or `repo_…` id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepoRef(pub String);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientFrame {
+    #[serde(rename = "req")]
+    pub id: u64,
+    #[serde(flatten)]
+    pub request: Request,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "frame", rename_all = "snake_case")]
+pub enum ServerFrame {
+    /// `id: 0` is the daemon explaining why it is closing the connection.
+    Reply {
+        id: u64,
+        result: Result<Reply, ErrorReply>,
+    },
+    Feed {
+        sub: u64,
+        item: FeedItem,
+    },
+}
+
+/// Everything a client can ask `archond`. MCP tools map 1:1 onto a subset
+/// (ARCHITECTURE §11).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum Request {
+    MessageOrchestrator {
+        text: String,
+        #[serde(default)]
+        kind: crate::agent_message::MessageKind,
+        /// Aether's out-of-band MCP caller identity, never a tool argument.
+        caller: Option<AetherAgentId>,
+    },
+    Hello {
+        protocol_version: u32,
+        client: ClientKind,
+        client_version: String,
+    },
+    Status,
+    /// CLI only.
+    Shutdown,
+
+    RepoAdd(RepoAdd),
+    RepoList,
+    /// CLI only.
+    RepoRemove {
+        repo: RepoRef,
+    },
+    /// CLI only; the one path to a repository's autonomy ceiling.
+    RepoUpdate {
+        repo: RepoRef,
+        patch: RepoPatch,
+    },
+
+    Enqueue(EnqueueRequest),
+    ListItems(ItemQuery),
+    /// Like `ListItems`, each item with its live stage, spend and PR URL.
+    ListItemSummaries(ItemQuery),
+    GetItem {
+        item: QueueItemId,
+    },
+    /// The stage runs of an item's latest run, or one stage's full output.
+    GetStage(StageQuery),
+    /// The one item whose id starts with `prefix` (see
+    /// [`crate::id::queue_item_prefix`]). An unknown prefix is `NotFound`;
+    /// an ambiguous one is refused, naming the items it matches.
+    ResolveItem {
+        prefix: String,
+    },
+    UpdateItem {
+        item: QueueItemId,
+        patch: ItemPatch,
+    },
+    CancelItem {
+        item: QueueItemId,
+        reason: Option<String>,
+    },
+    RetryItem {
+        item: QueueItemId,
+        model_plan: Option<ModelPlan>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_reasons: Option<ModelReasons>,
+        /// Start again from the base branch's head, on a new branch, with
+        /// the old worktree set aside; otherwise the worktree is reused.
+        #[serde(default)]
+        fresh: bool,
+        /// Appended to the brief under a dated "Amendment" heading.
+        #[serde(default)]
+        brief_append: Option<String>,
+    },
+    Pause(PauseTarget),
+    Resume(PauseTarget),
+    /// CLI only; runtime cap overrides until the daemon restarts.
+    SetCaps {
+        caps: Caps,
+    },
+
+    ListPipelines {
+        repo: Option<RepoRef>,
+    },
+    ModelPolicy {
+        repo: Option<RepoRef>,
+    },
+
+    /// Operator chat line to the orchestrator. CLI only.
+    Say {
+        text: String,
+    },
+    Notify {
+        kind: NotificationKind,
+        text: String,
+        item: Option<QueueItemId>,
+    },
+    AskOperator {
+        text: String,
+        item: Option<QueueItemId>,
+        #[serde(default)]
+        options: Vec<String>,
+    },
+    /// CLI only: the operator's answer, never the orchestrator's.
+    Answer {
+        question: QuestionId,
+        text: String,
+    },
+    ListQuestions {
+        open_only: bool,
+    },
+    /// Stream feed items with `seq > after` (`None`: live only).
+    SubscribeFeed {
+        after: Option<u64>,
+        verbose: bool,
+    },
+    FeedHistory {
+        before: Option<u64>,
+        limit: usize,
+        verbose: bool,
+    },
+
+    PublishReport {
+        title: String,
+        path: std::path::PathBuf,
+        item: Option<QueueItemId>,
+    },
+    /// Every recorded report, most recently changed first.
+    ListReports,
+    /// Show a recorded report again at the operator's request: resume its
+    /// Lavish session, even one they ended, or name its path without
+    /// Lavish. A failed reopen leaves the report as it was.
+    ReopenReport {
+        report: ReportId,
+    },
+
+    OrchestratorStatus,
+    /// CLI only: ensure the orchestrator is live, without sending a message.
+    OrchestratorAttach,
+    /// CLI only: cancel and recreate the orchestrator agent.
+    OrchestratorRestart,
+
+    /// CLI only: collect what finished runs left (ARCHITECTURE §13.2).
+    /// Worktrees go once their runs finished `older_than_secs` ago
+    /// (`None`: `worktrees.gc_after`); with `force`, even with changes.
+    Gc {
+        older_than_secs: Option<u64>,
+        force: bool,
+    },
+
+    /// Spend over a range of local days, grouped by day, repository,
+    /// pipeline, model, item or stage (ARCHITECTURE §5.3).
+    CostReport(CostQuery),
+    ModelEvidence(ModelEvidenceQuery),
+
+    /// Autonomy defaults, ceiling and directives, for one repository or
+    /// globally (ARCHITECTURE §18).
+    Autonomy {
+        repo: Option<RepoRef>,
+    },
+    /// Record a standing operator directive. It steers the orchestrator's
+    /// choices and never raises the ceiling, so the MCP proxy may send it.
+    SetDirective {
+        text: String,
+        expires_in_hours: Option<u32>,
+    },
+    /// Clear one directive, or every directive when `None`.
+    ClearDirective {
+        directive: Option<DirectiveId>,
+    },
+
+    /// Archon's GitHub watcher in its aetherd.
+    GithubWatcher,
+    /// CLI only: GitHub content must never change what is watched.
+    ConfigureGithubWatcher {
+        change: WatcherChange,
+    },
+    /// Comment on a thread of a repository Archon watches; archond appends
+    /// the reply marker so the comment never re-triggers the watcher.
+    GithubReply {
+        thread: GithubThread,
+        body: String,
+    },
+}
+
+impl Request {
+    /// Requests the MCP proxy may not forward (operator-only actions).
+    pub fn is_operator_only(&self) -> bool {
+        match self {
+            Self::Shutdown
+            | Self::RepoRemove { .. }
+            | Self::RepoUpdate { .. }
+            | Self::SetCaps { .. }
+            | Self::Say { .. }
+            | Self::OrchestratorRestart
+            | Self::OrchestratorAttach
+            | Self::Gc { .. }
+            | Self::ConfigureGithubWatcher { .. }
+            | Self::Answer { .. } => true,
+            Self::RepoAdd(add) => add.auto_merge,
+            Self::Pause(target) | Self::Resume(target) => {
+                matches!(target, PauseTarget::Global { hard: true })
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoAdd {
+    pub path: std::path::PathBuf,
+    pub name: Option<String>,
+    pub ship: Option<ShipMode>,
+    pub base_branch: Option<String>,
+    pub default_pipeline: Option<String>,
+    /// Registers the repository with the autonomy ceiling `merge=auto`;
+    /// operator only, as it raises the ceiling. `RepoUpdate` sets the rest.
+    #[serde(default)]
+    pub auto_merge: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoPatch {
+    pub ship: Option<ShipMode>,
+    #[serde(default)]
+    pub base_branch: Clearable<String>,
+    #[serde(default)]
+    pub default_pipeline: Clearable<String>,
+    /// Replaces the whole registry ceiling; the empty patch clears it.
+    pub autonomy_max: Option<AutonomyPatch>,
+}
+
+/// A patch to an optional setting. Explicit on the wire (`"keep"`,
+/// `"clear"`, `{"set":v}`) because JSON collapses `Option<Option<T>>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Clearable<T> {
+    #[default]
+    Keep,
+    Clear,
+    Set(T),
+}
+
+impl<T> Clearable<T> {
+    /// `current` after the patch.
+    pub fn apply(self, current: Option<T>) -> Option<T> {
+        match self {
+            Self::Keep => current,
+            Self::Clear => None,
+            Self::Set(value) => Some(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnqueueRequest {
+    /// Required unless the pipeline has `requires_repo = false`.
+    pub repo: Option<RepoRef>,
+    /// `None` uses the repository's default pipeline.
+    pub pipeline: Option<String>,
+    pub title: String,
+    pub brief: String,
+    #[serde(default)]
+    pub priority: Priority,
+    #[serde(default)]
+    pub depends_on: Vec<QueueItemId>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Must name every stage of the pipeline, within the model policy.
+    pub model_plan: ModelPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_reasons: Option<ModelReasons>,
+    pub budget_usd: Option<f64>,
+    /// Retrying an enqueue with the same key returns the first item.
+    pub idempotency_key: Option<String>,
+    /// Knobs chosen for this item; the rest come from the defaults. The
+    /// daemon refuses anything above the ceiling.
+    #[serde(default)]
+    pub autonomy: AutonomyPatch,
+    /// The GitHub thread that asked for this work, for replying when it ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<GithubThread>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemQuery {
+    /// `QueueState::kind()` names; empty means all.
+    #[serde(default)]
+    pub states: Vec<String>,
+    pub repo: Option<RepoRef>,
+    pub pipeline: Option<String>,
+    pub tag: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ItemPatch {
+    pub priority: Option<Priority>,
+    pub model_plan: Option<ModelPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_reasons: Option<ModelReasons>,
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub add_depends_on: Vec<QueueItemId>,
+    pub budget_usd: Option<f64>,
+    /// Appended to the brief under a dated "Amendment" heading; refused
+    /// while the item is dispatching or running.
+    #[serde(default)]
+    pub brief_append: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum PauseTarget {
+    Global {
+        /// Also pause running stage agents in Aether (`archon pause --hard`).
+        /// CLI only.
+        #[serde(default)]
+        hard: bool,
+    },
+    Repo {
+        name: RepoRef,
+    },
+    Pipeline {
+        name: String,
+    },
+}
+
+/// Adjacently tagged like Aether's replies: `{"reply":"item","data":{...}}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "reply", content = "data", rename_all = "snake_case")]
+pub enum Reply {
+    MessageReceipt {
+        receipt: crate::id::FeedItemId,
+    },
+    Welcome(Welcome),
+    Ok,
+    Status(Box<DaemonStatus>),
+    Repo(Repo),
+    Repos(Vec<Repo>),
+    Item(QueueItem),
+    Items(Vec<QueueItem>),
+    ItemSummaries(Vec<ItemSummary>),
+    ItemDetail(Box<ItemDetail>),
+    StageDetail(Box<StageDetail>),
+    Catalog(CatalogListing),
+    ModelPolicy(ModelPolicy),
+    Question(Question),
+    Questions(Vec<Question>),
+    Subscribed {
+        id: u64,
+        last_seq: u64,
+    },
+    Feed(Vec<FeedItem>),
+    Report(ReportPublished),
+    Reports(Vec<ReportSummary>),
+    Orchestrator(OrchestratorInfo),
+    Autonomy(Box<AutonomyView>),
+    Directive(Directive),
+    /// How many directives a clear removed.
+    Cleared(u32),
+    GithubWatcher(Box<GithubWatcherView>),
+    /// The comment `github_reply` posted.
+    GithubComment {
+        url: String,
+    },
+    Gc(Box<GcReport>),
+    CostReport(Box<CostReport>),
+    ModelEvidence(Box<ModelEvidenceReport>),
+}
+
+/// What one gc pass did (ARCHITECTURE §13.2). Paths are real paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcReport {
+    /// Worktrees, scratch directories, what team runs and fresh retries set
+    /// aside, and team directories gc emptied.
+    pub removed: Vec<std::path::PathBuf>,
+    /// Worktrees whose build caches were deleted; their source stays.
+    pub reclaimed: Vec<Reclaimed>,
+    /// Left alone on purpose, with why.
+    pub skipped: Vec<(std::path::PathBuf, String)>,
+    /// Attempted and failed, or could not be looked into, with why.
+    pub failed: Vec<(std::path::PathBuf, String)>,
+    /// Disk space freed by removals and reclaimed caches together.
+    pub bytes_freed: u64,
+}
+
+/// The build caches deleted from one worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reclaimed {
+    pub path: std::path::PathBuf,
+    pub bytes: u64,
+}
+
+impl GcReport {
+    /// Add `other`'s entries to this report.
+    pub fn absorb(&mut self, other: GcReport) {
+        self.removed.extend(other.removed);
+        self.reclaimed.extend(other.reclaimed);
+        self.skipped.extend(other.skipped);
+        self.failed.extend(other.failed);
+        self.bytes_freed = self.bytes_freed.saturating_add(other.bytes_freed);
+    }
+
+    /// Whether the pass removed or reclaimed anything.
+    pub fn freed_any(&self) -> bool {
+        !self.removed.is_empty() || !self.reclaimed.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Welcome {
+    pub protocol_version: u32,
+    pub daemon_version: String,
+    pub pid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    /// Read-time explanations for queued, blocked and operator-waiting items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_items: Vec<ItemSummary>,
+    pub daemon_version: String,
+    pub pid: u32,
+    pub started_at: Timestamp,
+    pub aether: AetherLinkStatus,
+    pub orchestrator: Option<OrchestratorInfo>,
+    pub caps: Caps,
+    pub pause: PauseState,
+    pub running_agents: u32,
+    pub active_runs: u32,
+    pub queued_items: u32,
+    pub blocked_items: u32,
+    pub open_questions: u32,
+    pub spend_today_usd: f64,
+    pub spend_total_usd: f64,
+    pub lavish_available: bool,
+    /// Global autonomy defaults and ceiling.
+    pub autonomy: AutonomyPolicy,
+    /// Directives in force.
+    pub directives: Vec<Directive>,
+    pub open_gates: u32,
+    /// News events (triggers) held until the orchestrator can take them.
+    #[serde(default)]
+    pub held_news: u32,
+    /// The `archon` MCP server in Aether, and archond's heals of it. `None`
+    /// from an archond that predates the check.
+    #[serde(default)]
+    pub mcp: Option<McpStatus>,
+    /// Archon's GitHub watcher. `None` in shared mode, where archond
+    /// leaves the operator's Aether watcher alone, or from an older archond.
+    #[serde(default)]
+    pub github: Option<GithubWatch>,
+    /// Free space where archond writes, and whether it holds dispatch.
+    /// `None` from an archond that predates the check.
+    #[serde(default)]
+    pub disk: Option<DiskStatus>,
+}
+
+/// `DaemonStatus::disk`: the fuller of the filesystems holding the data
+/// dir and the worktree root (ARCHITECTURE §7.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskStatus {
+    /// The watched path with the least free space.
+    pub path: std::path::PathBuf,
+    /// `None` when it could not be read; `error` says why.
+    pub free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// `limits.min_free_gb` in bytes; 0 when the low-disk hold is off.
+    pub min_free_bytes: u64,
+    /// Dispatch is held for disk space.
+    pub held: bool,
+    /// The disk-full failure that holds dispatch, if one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_full: Option<String>,
+    /// Why archond stopped its work and serves only reads until it
+    /// restarts: its own store hit a full disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standby: Option<String>,
+}
+
+/// `bytes` in GiB with one decimal, as `df -h` shows sizes.
+pub fn gib(bytes: u64) -> String {
+    let gib = bytes as f64 / f64::from(1u32 << 30);
+    format!("{gib:.1} GiB")
+}
+
+/// Aether's view of one MCP server (its `mcp_servers` reply).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum McpHealth {
+    /// Connected; agents started from now on get its `tools`.
+    Ready { tools: u32 },
+    /// The last contact failed; Aether offers none of its tools.
+    Failed { error: String },
+    /// Configured, not contacted yet (it starts when an agent first uses it).
+    Unknown,
+    /// Aether has not loaded a server by that name.
+    NotLoaded,
+    /// archond could not ask Aether.
+    Unreachable { error: String },
+}
+
+/// `DaemonStatus::mcp`: the server's health now and the supervisor's
+/// latest heal (ARCHITECTURE §16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpStatus {
+    pub health: McpHealth,
+    /// When archond last refreshed the server back to ready.
+    pub last_heal: Option<Timestamp>,
+    /// Refreshes that failed in a row since the last one that worked.
+    pub failed_refreshes: u32,
+    /// Restarts of the orchestrator, owed once the server is ready again,
+    /// that failed in a row. `0` from an archond that predates the count.
+    #[serde(default)]
+    pub failed_relinks: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AetherLinkStatus {
+    Connected {
+        daemon_version: String,
+        protocol_version: u32,
+        instance_id: String,
+    },
+    Disconnected {
+        error: String,
+        retry_at: Option<Timestamp>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorInfo {
+    pub agent: crate::aether_ids::AetherAgentId,
+    pub model: ModelRef,
+    pub effort: Effort,
+    /// Aether's agent status kind, verbatim (`ready`, `running`, ...).
+    pub status: String,
+    pub restarts: u32,
+}
+
+/// A queue item with what `archon queue list` shows about its runs. The
+/// item's own fields are flattened in, so JSON readers of `Items` read it too.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ItemSummary {
+    #[serde(flatten)]
+    pub item: QueueItem,
+    /// The stage its live run is at; `None` unless the item is running.
+    pub stage: Option<String>,
+    pub spent_usd: f64,
+    /// The newest pull request any of its runs opened.
+    pub pr_url: Option<String>,
+    /// Derived operator wait; the stored queue state remains unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<WaitingOn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
+}
+
+/// Stable read-time reason codes; these are never stored on a queue item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingReasonCode {
+    AetherDisconnected,
+    OperatorGate,
+    DependencyFailed,
+    DependencyWaiting,
+    GlobalPause,
+    LowDisk,
+    TotalBudget,
+    DailyBudget,
+    RepoPause,
+    PipelinePause,
+    Capacity,
+    NextInLine,
+    /// Dependencies recovered, but the item is still explicitly blocked.
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingReason {
+    pub code: WaitingReasonCode,
+    pub message: String,
+    pub next_action: String,
+}
+
+/// What the current run needs from the operator, and how to provide it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingOn {
+    /// `proposal`, `report`, or `question`.
+    pub subject: String,
+    pub stage: String,
+    pub question: Option<QuestionId>,
+    pub prompt: String,
+    pub next_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ItemDetail {
+    pub item: QueueItem,
+    pub runs: Vec<PipelineRun>,
+    /// Stage runs of every run, oldest first.
+    pub stages: Vec<StageRun>,
+    pub spent_usd: f64,
+    /// Operator gates of every run, oldest first.
+    #[serde(default)]
+    pub gates: Vec<OperatorGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<WaitingOn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
+}
+
+/// Characters of a stage's output one `GetStage` page holds by default.
+pub const STAGE_PAGE_CHARS: usize = 20_000;
+/// Largest page `GetStage` accepts, so a fan-out's pages fit one message.
+pub const MAX_STAGE_PAGE_CHARS: usize = 100_000;
+
+/// Which stage runs of an item's run to show. Without `stage` it lists
+/// them all; with it, the matching runs' output in full, paged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageQuery {
+    pub item: QueueItemId,
+    /// One of the item's runs; `None`: its latest. Attempts restart at 1
+    /// in each run, so an older run's attempt needs this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<PipelineRunId>,
+    pub stage: Option<String>,
+    /// `None`: the stage's latest attempt.
+    pub attempt: Option<u32>,
+    /// A fan-out slot; `None`: every slot of the attempt.
+    pub slot: Option<u32>,
+    /// Characters of each stage run's output to skip.
+    #[serde(default)]
+    pub offset: usize,
+    /// Characters per page; `None`: [`STAGE_PAGE_CHARS`].
+    pub limit: Option<usize>,
+}
+
+impl StageQuery {
+    /// Refuses selectors without a stage and pages out of bounds, naming
+    /// the argument at fault.
+    pub fn check(&self) -> Result<(), String> {
+        if self.stage.as_deref().is_some_and(|s| s.trim().is_empty()) {
+            return Err("`stage` must not be empty; omit it to list the stage runs".into());
+        }
+        let stageless = [
+            ("attempt", self.attempt.is_some()),
+            ("slot", self.slot.is_some()),
+            ("offset", self.offset > 0),
+            ("limit", self.limit.is_some()),
+        ];
+        let picked = stageless.iter().find(|(_, given)| *given);
+        if let (None, Some((key, _))) = (&self.stage, picked) {
+            return Err(format!("`{key}` needs `stage`: it picks within one stage"));
+        }
+        if self.attempt == Some(0) {
+            return Err("`attempt` counts from 1".into());
+        }
+        match self.limit {
+            Some(limit) if !(1..=MAX_STAGE_PAGE_CHARS).contains(&limit) => Err(format!(
+                "`limit` must be between 1 and {MAX_STAGE_PAGE_CHARS} characters, not {limit}"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn page_chars(&self) -> usize {
+        self.limit.unwrap_or(STAGE_PAGE_CHARS)
+    }
+}
+
+/// `GetStage`'s answer: stage runs of the item's run asked for, oldest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageDetail {
+    pub item: QueueItemId,
+    pub run: PipelineRunId,
+    /// The stage asked for; `None` for the listing.
+    pub stage: Option<String>,
+    pub stages: Vec<StageRunView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageRunView {
+    pub stage_id: String,
+    pub attempt: u32,
+    pub slot: u32,
+    pub choice: ModelChoice,
+    pub state: StageState,
+    pub verdict: Option<Verdict>,
+    pub cost_usd: f64,
+    pub aether_agent: Option<AetherAgentId>,
+    /// The stage's output, only when a stage was asked for.
+    pub output: Option<TextPage>,
+}
+
+/// Characters `offset..offset + text.chars().count()` of a longer text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextPage {
+    pub text: String,
+    pub offset: usize,
+    pub total_chars: usize,
+}
+
+impl TextPage {
+    /// The page of `full` starting `offset` characters in; empty past the end.
+    pub fn of(full: &str, offset: usize, limit: usize) -> Self {
+        assert!(limit > 0, "a page holds at least one character");
+        let total_chars = full.chars().count();
+        let text: String = full.chars().skip(offset).take(limit).collect();
+        debug_assert!(text.chars().count() <= limit);
+        Self {
+            text,
+            offset,
+            total_chars,
+        }
+    }
+
+    /// Where the next page starts, if any text is left.
+    pub fn next_offset(&self) -> Option<usize> {
+        let end = self.offset + self.text.chars().count();
+        (end < self.total_chars).then_some(end)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportPublished {
+    pub report: ReportId,
+    pub published: bool,
+    /// Lavish session URL, or the file path when Lavish is unavailable.
+    pub location: String,
+    pub run: Option<PipelineRunId>,
+}
+
+/// Where a recorded report stands (ARCHITECTURE §14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportState {
+    /// Only a file path was shown: Lavish is absent or failed to open it.
+    Unpublished,
+    /// A Lavish session is open and polled.
+    Open,
+    /// The review window went away. Its session can be resumed; only a
+    /// report an open gate waits on asks the operator whether to.
+    Disconnected,
+    Ended,
+    /// Polling failed repeatedly and was given up.
+    Stopped,
+}
+
+impl ReportState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unpublished => "unpublished",
+            Self::Open => "open",
+            Self::Disconnected => "disconnected",
+            Self::Ended => "ended",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// One recorded report, as `ListReports` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportSummary {
+    pub report: ReportId,
+    pub title: String,
+    pub path: std::path::PathBuf,
+    /// Where it was last shown: the Lavish URL or the file path. `None` for
+    /// a report recorded before locations were kept.
+    pub location: Option<String>,
+    pub state: ReportState,
+    pub item: Option<QueueItemId>,
+    /// The open "Reopen it?" question, asked only while a gate waits.
+    pub reopen_question: Option<QuestionId>,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    Incompatible,
+    Forbidden,
+    NotFound,
+    InvalidArgument,
+    InvalidTransition,
+    Policy,
+    Unavailable,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{code:?}: {message}")]
+pub struct ErrorReply {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl From<&ArchonError> for ErrorReply {
+    fn from(err: &ArchonError) -> Self {
+        let code = match err {
+            ArchonError::Invalid(_) | ArchonError::Config(_) | ArchonError::Pipeline(_) => {
+                ErrorCode::InvalidArgument
+            }
+            ArchonError::NotFound(_) => ErrorCode::NotFound,
+            ArchonError::InvalidTransition(_) => ErrorCode::InvalidTransition,
+            ArchonError::Policy(_) => ErrorCode::Policy,
+            ArchonError::Forbidden(_) => ErrorCode::Forbidden,
+            ArchonError::Unavailable(_) | ArchonError::Aether(_) => ErrorCode::Unavailable,
+            ArchonError::Store(_)
+            | ArchonError::DiskFull(_)
+            | ArchonError::Io { .. }
+            | ArchonError::Protocol(_) => ErrorCode::Internal,
+        };
+        Self {
+            code,
+            message: err.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::OperatorUsers;
+
+    #[test]
+    fn client_frames_flatten_the_command_beside_req() {
+        let frame = ClientFrame {
+            id: 7,
+            request: Request::CancelItem {
+                item: QueueItemId::new(),
+                reason: None,
+            },
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["req"], 7);
+        assert_eq!(value["cmd"], "cancel_item");
+        let back: ClientFrame = serde_json::from_value(value).unwrap();
+        assert_eq!(back, frame);
+    }
+
+    #[test]
+    fn report_states_print_as_they_are_stored() {
+        use ReportState::*;
+        for state in [Unpublished, Open, Disconnected, Ended, Stopped] {
+            let wire = serde_json::to_value(state).unwrap();
+            assert_eq!(wire, state.as_str(), "{state:?}");
+            assert_eq!(serde_json::from_value::<ReportState>(wire).unwrap(), state);
+        }
+        let reopen = Request::ReopenReport {
+            report: ReportId::new(),
+        };
+        let value = serde_json::to_value(&reopen).unwrap();
+        assert_eq!(value["cmd"], "reopen_report");
+        assert_eq!(serde_json::from_value::<Request>(value).unwrap(), reopen);
+    }
+
+    fn round_trip(patch: RepoPatch) -> (serde_json::Value, RepoPatch) {
+        let frame = ClientFrame {
+            id: 3,
+            request: Request::RepoUpdate {
+                repo: RepoRef("web".into()),
+                patch,
+            },
+        };
+        let text = serde_json::to_string(&frame).unwrap();
+        let back: ClientFrame = serde_json::from_str(&text).unwrap();
+        let Request::RepoUpdate { patch, .. } = back.request else {
+            panic!("decoded {back:?}");
+        };
+        (serde_json::from_str(&text).unwrap(), patch)
+    }
+
+    #[test]
+    fn every_repo_patch_field_survives_the_wire() {
+        use crate::autonomy::MergeMode;
+        let ceiling = AutonomyPatch {
+            merge: Some(MergeMode::Auto),
+            ..AutonomyPatch::default()
+        };
+        let patches = [
+            RepoPatch::default(),
+            RepoPatch {
+                ship: Some(ShipMode::Local),
+                ..RepoPatch::default()
+            },
+            RepoPatch {
+                base_branch: Clearable::Clear,
+                default_pipeline: Clearable::Clear,
+                autonomy_max: Some(AutonomyPatch::default()),
+                ..RepoPatch::default()
+            },
+            RepoPatch {
+                base_branch: Clearable::Set("main".into()),
+                default_pipeline: Clearable::Set("quick-pr".into()),
+                autonomy_max: Some(ceiling),
+                ..RepoPatch::default()
+            },
+        ];
+        for patch in patches {
+            let (_, back) = round_trip(patch.clone());
+            assert_eq!(back, patch);
+        }
+        let (value, _) = round_trip(RepoPatch {
+            base_branch: Clearable::Clear,
+            ..RepoPatch::default()
+        });
+        assert_eq!(value["patch"]["base_branch"], "clear");
+        assert_eq!(value["patch"]["default_pipeline"], "keep");
+    }
+
+    #[test]
+    fn a_missing_clearable_keeps_and_a_null_one_is_refused() {
+        let missing = r#"{"req":1,"cmd":"repo_update","repo":"web","patch":{}}"#;
+        let frame: ClientFrame = serde_json::from_str(missing).unwrap();
+        let Request::RepoUpdate { patch, .. } = frame.request else {
+            panic!("decoded {frame:?}");
+        };
+        assert_eq!(patch, RepoPatch::default());
+        let null = r#"{"req":1,"cmd":"repo_update","repo":"web","patch":{"base_branch":null}}"#;
+        assert!(serde_json::from_str::<ClientFrame>(null).is_err());
+        assert_eq!(Clearable::Keep.apply(Some(1)), Some(1));
+        assert_eq!(Clearable::Clear.apply(Some(1)), None);
+        assert_eq!(Clearable::Set(2).apply(None), Some(2));
+    }
+
+    #[test]
+    fn replies_are_adjacently_tagged_inside_a_result() {
+        let frame = ServerFrame::Reply {
+            id: 1,
+            result: Ok(Reply::Ok),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["frame"], "reply");
+        assert_eq!(value["result"]["Ok"]["reply"], "ok");
+        let err = ServerFrame::Reply {
+            id: 2,
+            result: Err(ErrorReply::from(&ArchonError::Policy("no".into()))),
+        };
+        let value = serde_json::to_value(&err).unwrap();
+        assert_eq!(value["result"]["Err"]["code"], "policy");
+        let refused = ErrorReply::from(&ArchonError::Forbidden("say".into()));
+        assert_eq!(refused.code, ErrorCode::Forbidden);
+    }
+
+    #[test]
+    fn item_summaries_carry_the_items_own_fields_at_the_top() {
+        let item = QueueItem {
+            id: QueueItemId::new(),
+            repo: None,
+            pipeline: "ask".into(),
+            title: "why".into(),
+            brief: "why?".into(),
+            priority: Priority::Normal,
+            dependencies: vec![],
+            tags: vec![],
+            model_plan: ModelPlan::default(),
+            model_reasons: None,
+            budget_usd: None,
+            autonomy: Default::default(),
+            origin: None,
+            fresh_retries: 0,
+            state: crate::queue::QueueState::Queued,
+            created_at: crate::now(),
+            updated_at: crate::now(),
+        };
+        let summary = ItemSummary {
+            waiting_on: None,
+            waiting_reason: None,
+            item: item.clone(),
+            stage: Some("review".into()),
+            spent_usd: 1.5,
+            pr_url: None,
+        };
+        let reply = Reply::ItemSummaries(vec![summary.clone()]);
+        let value = serde_json::to_value(&reply).unwrap();
+        let row = &value["data"][0];
+        assert_eq!(row["id"], item.id.as_str());
+        assert_eq!(row["state"]["state"], "queued");
+        assert_eq!(
+            (&row["stage"], &row["spent_usd"]),
+            (&"review".into(), &1.5.into())
+        );
+        assert_eq!(serde_json::from_value::<Reply>(value).unwrap(), reply);
+        let resolve = Request::ResolveItem {
+            prefix: "01k2".into(),
+        };
+        let value = serde_json::to_value(&resolve).unwrap();
+        assert_eq!(value["cmd"], "resolve_item");
+        assert!(!resolve.is_operator_only());
+    }
+
+    #[test]
+    fn free_space_reads_in_gib() {
+        assert_eq!(gib(0), "0.0 GiB");
+        assert_eq!(gib(10 << 30), "10.0 GiB");
+        assert_eq!(gib((3 << 30) / 2), "1.5 GiB");
+    }
+
+    #[test]
+    fn operator_only_requests_are_flagged() {
+        assert!(Request::Say { text: "hi".into() }.is_operator_only());
+        assert!(!Request::Status.is_operator_only());
+        let merge = RepoAdd {
+            path: "/r".into(),
+            name: None,
+            ship: None,
+            base_branch: None,
+            default_pipeline: None,
+            auto_merge: true,
+        };
+        assert!(Request::RepoAdd(merge).is_operator_only());
+        for operator_users in [None, Some(OperatorUsers::parse(&["octocat"]).unwrap())] {
+            let change = WatcherChange::Operators { operator_users };
+            let request = Request::ConfigureGithubWatcher { change };
+            assert!(request.is_operator_only(), "{request:?}");
+        }
+    }
+
+    fn stage_query(stage: Option<&str>) -> StageQuery {
+        StageQuery {
+            item: QueueItemId::new(),
+            run: None,
+            stage: stage.map(str::to_owned),
+            attempt: None,
+            slot: None,
+            offset: 0,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn get_stage_and_its_detail_survive_the_wire() {
+        let query = StageQuery {
+            run: Some(PipelineRunId::new()),
+            attempt: Some(2),
+            slot: Some(1),
+            offset: 40,
+            limit: Some(500),
+            ..stage_query(Some("review"))
+        };
+        let frame = ClientFrame {
+            id: 9,
+            request: Request::GetStage(query.clone()),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["cmd"], "get_stage");
+        assert_eq!(value["stage"], "review");
+        assert_eq!(value["run"], query.run.as_ref().unwrap().to_string());
+        assert_eq!(serde_json::from_value::<ClientFrame>(value).unwrap(), frame);
+        let bare = format!(r#"{{"req":1,"cmd":"get_stage","item":"{}"}}"#, query.item);
+        let ClientFrame { request, .. } = serde_json::from_str(&bare).unwrap();
+        let listing = StageQuery {
+            item: query.item.clone(),
+            ..stage_query(None)
+        };
+        assert_eq!(request, Request::GetStage(listing));
+        assert!(!request.is_operator_only(), "the orchestrator reads stages");
+
+        let view = StageRunView {
+            stage_id: "review".into(),
+            attempt: 2,
+            slot: 1,
+            choice: ModelChoice {
+                model: "codex/gpt-6-sol".parse().unwrap(),
+                effort: Effort::High,
+            },
+            state: StageState::Completed,
+            verdict: Some(Verdict::Fail),
+            cost_usd: 0.5,
+            aether_agent: None,
+            output: Some(TextPage::of("summary: findings", 9, 500)),
+        };
+        let reply = Reply::StageDetail(Box::new(StageDetail {
+            item: query.item.clone(),
+            run: PipelineRunId::new(),
+            stage: Some("review".into()),
+            stages: vec![view],
+        }));
+        let value = serde_json::to_value(&reply).unwrap();
+        assert_eq!(value["reply"], "stage_detail");
+        assert_eq!(value["data"]["stages"][0]["output"]["text"], "findings");
+        assert_eq!(serde_json::from_value::<Reply>(value).unwrap(), reply);
+    }
+
+    #[test]
+    fn stage_queries_refuse_picks_without_a_stage_and_bad_pages() {
+        assert_eq!(stage_query(None).check(), Ok(()));
+        assert_eq!(stage_query(Some("review")).check(), Ok(()));
+        let picks = [
+            StageQuery {
+                attempt: Some(1),
+                ..stage_query(None)
+            },
+            StageQuery {
+                slot: Some(0),
+                ..stage_query(None)
+            },
+            StageQuery {
+                offset: 10,
+                ..stage_query(None)
+            },
+        ];
+        for query in picks {
+            let why = query.check().unwrap_err();
+            assert!(why.contains("needs `stage`"), "{why}");
+        }
+        let zero = StageQuery {
+            attempt: Some(0),
+            ..stage_query(Some("review"))
+        };
+        assert!(zero.check().unwrap_err().contains("`attempt`"));
+        for limit in [0, MAX_STAGE_PAGE_CHARS + 1] {
+            let query = StageQuery {
+                limit: Some(limit),
+                ..stage_query(Some("review"))
+            };
+            assert!(query.check().unwrap_err().contains("`limit`"), "{limit}");
+        }
+        assert!(stage_query(Some(" ")).check().is_err());
+        assert_eq!(stage_query(None).page_chars(), STAGE_PAGE_CHARS);
+    }
+
+    #[test]
+    fn text_pages_count_characters_and_name_the_next_one() {
+        let full = "héllo wörld";
+        let first = TextPage::of(full, 0, 5);
+        assert_eq!(first.text, "héllo");
+        assert_eq!((first.total_chars, first.next_offset()), (11, Some(5)));
+        let last = TextPage::of(full, 5, 100);
+        assert_eq!(last.text, " wörld");
+        assert_eq!(last.next_offset(), None);
+        let past = TextPage::of(full, 50, 5);
+        assert!(past.text.is_empty() && past.next_offset().is_none());
+    }
+
+    #[test]
+    fn answers_and_hard_pauses_are_operator_only() {
+        let answer = Request::Answer {
+            question: QuestionId::new(),
+            text: "yes".into(),
+        };
+        assert!(answer.is_operator_only());
+        let hard = PauseTarget::Global { hard: true };
+        assert!(Request::Pause(hard.clone()).is_operator_only());
+        assert!(Request::Resume(hard).is_operator_only());
+        let soft = PauseTarget::Global { hard: false };
+        assert!(!Request::Pause(soft.clone()).is_operator_only());
+        assert!(!Request::Resume(soft).is_operator_only());
+        let repo = PauseTarget::Repo {
+            name: RepoRef("web".into()),
+        };
+        assert!(!Request::Pause(repo).is_operator_only());
+    }
+}

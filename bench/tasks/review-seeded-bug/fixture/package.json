@@ -1,0 +1,9 @@
+{
+  "name": "session-lib",
+  "version": "3.0.0-rc.1",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test"
+  }
+}

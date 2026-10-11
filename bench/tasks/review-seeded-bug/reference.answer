@@ -1,0 +1,7 @@
+Critical: signature check accepts any prefix, so tokens can be forged.
+
+`verify` in `src/tokens.js` checks `expected.startsWith(signature)`. Any prefix of the real MAC passes, including the empty string: the token `<base64url('{"user":"root","exp":9999999999999}')>.` (note the trailing dot) verifies for any secret. An attacker can forge arbitrary claims without knowing the secret — a full authentication bypass. Fix: require the exact length and compare with `crypto.timingSafeEqual` on the decoded buffers.
+
+Medium: `JSON.parse(fromBase64Url(body))` throws on a body that is not JSON, so a malformed token crashes the caller instead of returning null. Wrap it and return null.
+
+Low: the comparison is not constant-time; `timingSafeEqual` fixes that too. Tokens with extra `.` segments are silently accepted because only the first two parts are read.

@@ -1,0 +1,667 @@
+//! Queue items: the `archon queue list` rows, and the `archon queue show`
+//! page with each stage's summary and the pull request a run opened.
+
+use std::fmt::Write as _;
+
+use archon_core::Timestamp;
+use archon_core::protocol::{ItemDetail, ItemSummary};
+use archon_core::queue::QueueState;
+use archon_core::run::{
+    self, GateDecision, OperatorGate, PipelineRun, RunState, StageRun, StageState,
+};
+
+use super::{RepoNames, duration, repo_label, table};
+use crate::wrap::{sanitize, sanitize_line};
+
+/// Lines of a stage summary `archon queue show` prints without `--full`.
+const SUMMARY_LINES: usize = 4;
+/// Characters of a stage summary it prints without `--full`.
+const SUMMARY_CHARS: usize = 400;
+
+/// One line per item: id, state, stage, age, cost, repo, pipeline, then the
+/// title and the pull request, if there is one.
+pub fn items(rows: &[ItemSummary], names: &RepoNames, now: Timestamp) -> String {
+    if rows.is_empty() {
+        return "The queue is empty.".to_owned();
+    }
+    let cells: Vec<[String; 8]> = rows.iter().map(|row| item_row(row, names, now)).collect();
+    let text = table(&cells);
+    debug_assert_eq!(text.lines().count(), rows.len(), "one line per item");
+    text
+}
+
+fn item_row(row: &ItemSummary, names: &RepoNames, now: Timestamp) -> [String; 8] {
+    let item = &row.item;
+    let mut last = sanitize_line(&item.title);
+    if let Some(url) = &row.pr_url {
+        let _ = write!(last, "  {}", sanitize_line(url));
+    }
+    if let Some(wait) = &row.waiting_on {
+        let _ = write!(
+            last,
+            "  {} — next: {}",
+            sanitize_line(&wait.subject),
+            sanitize_line(&wait.next_action)
+        );
+    }
+    if row.waiting_on.is_none()
+        && let Some(reason) = &row.waiting_reason
+    {
+        let _ = write!(
+            last,
+            "  {} — next: {}",
+            sanitize_line(&reason.message),
+            sanitize_line(&reason.next_action)
+        );
+    }
+    [
+        item.id.to_string(),
+        if row.waiting_on.is_some() {
+            "awaiting approval"
+        } else {
+            item.state.kind()
+        }
+        .to_owned(),
+        row.stage
+            .as_deref()
+            .map_or_else(|| "-".to_owned(), sanitize_line),
+        duration((now - item.created_at).num_seconds()),
+        archon_core::cost::format_usd(row.spent_usd),
+        repo_label(names, item.repo.as_ref()),
+        sanitize_line(&item.pipeline),
+        last,
+    ]
+}
+
+fn state_detail(state: &QueueState) -> String {
+    match state {
+        QueueState::Blocked { reason } => format!("blocked: {}", sanitize_line(reason)),
+        QueueState::Succeeded { summary, .. } => {
+            format!("succeeded: {}", sanitize_line(summary))
+        }
+        QueueState::Failed { error, .. } => format!("failed: {}", sanitize_line(error)),
+        QueueState::Cancelled {
+            reason: Some(reason),
+        } => format!("cancelled: {}", sanitize_line(reason)),
+        other => other.kind().to_owned(),
+    }
+}
+
+/// The item, then each run with its pull request, stages and gates, then
+/// the brief. `full` prints every stage summary whole.
+pub fn item_detail(detail: &ItemDetail, names: &RepoNames, full: bool) -> String {
+    let item = &detail.item;
+    let mut out = String::new();
+    let _ = writeln!(out, "{}  {}", item.id, sanitize_line(&item.title));
+    if let Some(wait) = &detail.waiting_on {
+        let _ = writeln!(
+            out,
+            "state: awaiting approval ({})",
+            sanitize_line(&wait.subject)
+        );
+        let _ = writeln!(out, "{}", sanitize_line(&wait.prompt));
+        let _ = writeln!(out, "next: {}", sanitize_line(&wait.next_action));
+    } else {
+        let _ = writeln!(out, "state: {}", state_detail(&item.state));
+        if let Some(reason) = &detail.waiting_reason {
+            let _ = writeln!(out, "waiting: {}", sanitize_line(&reason.message));
+            let _ = writeln!(out, "next: {}", sanitize_line(&reason.next_action));
+        }
+    }
+    let _ = writeln!(
+        out,
+        "repo: {}, pipeline: {}, priority: {:?}",
+        repo_label(names, item.repo.as_ref()),
+        sanitize_line(&item.pipeline),
+        item.priority
+    );
+    if !item.dependencies.is_empty() {
+        let deps: Vec<String> = item.dependencies.iter().map(ToString::to_string).collect();
+        let _ = writeln!(out, "depends on: {}", deps.join(", "));
+    }
+    if !item.tags.is_empty() {
+        let _ = writeln!(out, "tags: {}", sanitize_line(&item.tags.join(", ")));
+    }
+    let budget = item
+        .budget_usd
+        .map_or_else(|| "default".to_owned(), archon_core::cost::format_usd);
+    let _ = writeln!(
+        out,
+        "spent: {} (budget {budget})",
+        archon_core::cost::format_usd(detail.spent_usd)
+    );
+    let _ = writeln!(out, "autonomy: {}", item.autonomy.describe());
+    if let Some(reasons) = &item.model_reasons {
+        for (stage, choices) in &item.model_plan.0 {
+            let picks: Vec<_> = choices
+                .iter()
+                .map(|c| format!("{} {}", c.model, c.effort))
+                .collect();
+            let reason = reasons
+                .get(stage)
+                .map_or(String::new(), |r| format!(" ({})", sanitize_line(r)));
+            let _ = writeln!(
+                out,
+                "plan {}: {}{reason}",
+                sanitize_line(stage),
+                picks.join(" + ")
+            );
+        }
+    }
+    for run in &detail.runs {
+        run_lines(&mut out, detail, run, full);
+    }
+    let _ = write!(out, "\n{}", sanitize(item.brief.trim_end()));
+    out
+}
+
+/// `run …: state on branch in workspace`, its pull request, then its stages
+/// (each with its summary under it) and gates, indented.
+fn run_lines(out: &mut String, detail: &ItemDetail, run: &PipelineRun, full: bool) {
+    assert_eq!(
+        run.item, detail.item.id,
+        "the run belongs to the item shown"
+    );
+    let _ = writeln!(
+        out,
+        "run {}: {} on {} in {}",
+        run.id,
+        run_state(&run.state),
+        run.branch,
+        run.workspace.display()
+    );
+    let stages: Vec<&StageRun> = detail.stages.iter().filter(|s| s.run == run.id).collect();
+    if let Some(url) = run::pr_url(stages.iter().copied()) {
+        let _ = writeln!(out, "  pr: {}", sanitize_line(url));
+    }
+    for stage in stages {
+        let _ = writeln!(out, "  {}", stage_line(stage));
+        let summary = stage.summary.as_deref().unwrap_or_default();
+        for line in summary_lines(summary, full) {
+            let _ = writeln!(out, "    {line}");
+        }
+    }
+    for gate in detail.gates.iter().filter(|g| g.run == run.id) {
+        let _ = writeln!(out, "  {}", gate_line(gate));
+    }
+}
+
+fn run_state(state: &RunState) -> String {
+    match state {
+        RunState::Running { stage_id, attempt } => {
+            format!("running {stage_id} (attempt {attempt})")
+        }
+        RunState::AwaitingOperator {
+            stage_id, subject, ..
+        } => format!(
+            "waiting after {stage_id} for the operator to approve the {}",
+            subject.noun()
+        ),
+        RunState::Succeeded { .. } => "succeeded".to_owned(),
+        RunState::Failed { stage_id, error } => {
+            format!("failed at {stage_id}: {}", sanitize_line(error))
+        }
+        RunState::Cancelled { reason } => match reason {
+            Some(reason) => format!("cancelled: {}", sanitize_line(reason)),
+            None => "cancelled".to_owned(),
+        },
+    }
+}
+
+/// `gate propose #1 (direction): approved; note: …` and where the page is.
+fn gate_line(gate: &OperatorGate) -> String {
+    let state = match (&gate.decision, &gate.withdrawn) {
+        (Some(GateDecision::Approve { note: Some(note) }), _) => format!("approved: {note}"),
+        (Some(GateDecision::Approve { note: None }), _) => "approved".to_owned(),
+        (Some(GateDecision::Revise { feedback }), _) => format!("revision requested: {feedback}"),
+        (Some(GateDecision::Reject { reason }), _) => format!("rejected: {reason}"),
+        (None, Some(reason)) => format!("withdrawn: {reason}"),
+        (None, None) => "waiting for the operator".to_owned(),
+    };
+    let state = sanitize_line(&state);
+    let page = gate
+        .location
+        .as_ref()
+        .map(|at| format!(" at {}", sanitize_line(at)))
+        .unwrap_or_default();
+    format!(
+        "gate {} #{} ({}{page}): {state}",
+        gate.stage_id,
+        gate.attempt,
+        gate.subject.noun()
+    )
+}
+
+/// `review attempt 2 slot 1: completed, verdict pass, $0.42, model (effort),
+/// agent agt_…`.
+fn stage_line(stage: &StageRun) -> String {
+    let state = match &stage.state {
+        StageState::Spawning => "spawning".to_owned(),
+        StageState::Running => "running".to_owned(),
+        StageState::Completed => "completed".to_owned(),
+        StageState::Failed { error } => format!("failed: {}", sanitize_line(error)),
+        StageState::Cancelled => "cancelled".to_owned(),
+        StageState::TimedOut => "timed out".to_owned(),
+    };
+    let verdict = stage
+        .verdict
+        .map(|v| format!(", verdict {v:?}").to_lowercase())
+        .unwrap_or_default();
+    let agent = stage
+        .aether_agent
+        .as_ref()
+        .map_or_else(|| "no agent yet".to_owned(), |a| format!("agent {a}"));
+    format!(
+        "{} attempt {} slot {}: {state}{verdict}, {}, {} ({}), {agent}",
+        stage.stage_id,
+        stage.attempt,
+        stage.fan_index,
+        archon_core::cost::format_usd(stage.cost_usd),
+        stage.choice.model,
+        stage.choice.effort,
+    )
+}
+
+/// A stage summary's lines: all of them with `full`, else the first
+/// [`SUMMARY_LINES`] within [`SUMMARY_CHARS`], and a note when clipped.
+fn summary_lines(summary: &str, full: bool) -> Vec<String> {
+    let clean = sanitize(summary.trim());
+    let all: Vec<&str> = clean.lines().collect();
+    if full {
+        return all.into_iter().map(str::to_owned).collect();
+    }
+    let mut kept = Vec::new();
+    let mut budget = SUMMARY_CHARS;
+    let mut cut = false;
+    for line in all.iter().take(SUMMARY_LINES) {
+        let chars = line.chars().count();
+        if chars > budget {
+            let head: String = line.chars().take(budget).collect();
+            kept.push(format!("{}…", head.trim_end()));
+            cut = true;
+            break;
+        }
+        budget -= chars;
+        kept.push((*line).to_owned());
+    }
+    let hidden = all.len() - kept.len();
+    if hidden > 0 || cut {
+        let more = match hidden {
+            0 => String::new(),
+            1 => "1 more line; ".to_owned(),
+            n => format!("{n} more lines; "),
+        };
+        kept.push(format!("[{more}--full shows the whole summary]"));
+    }
+    assert!(
+        kept.len() <= SUMMARY_LINES + 1,
+        "a clipped summary stays short"
+    );
+    kept
+}
+
+#[cfg(test)]
+mod tests {
+    use archon_core::aether_ids::AetherAgentId;
+    use archon_core::autonomy::Autonomy;
+    use archon_core::id::{PipelineRunId, QueueItemId, RepoId, StageRunId};
+    use archon_core::model::{Effort, ModelChoice, ModelPlan};
+    use archon_core::queue::{Priority, QueueItem};
+    use archon_core::run::{GateSubject, Verdict};
+    use chrono::TimeZone as _;
+
+    use super::super::tests::assert_inert;
+    use super::*;
+
+    fn at(hour: u32, minute: u32) -> Timestamp {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 9, 29, hour, minute, 0)
+            .unwrap()
+    }
+
+    fn queue_item(repo: Option<&RepoId>, title: &str, pipeline: &str) -> QueueItem {
+        QueueItem {
+            id: QueueItemId::new(),
+            repo: repo.cloned(),
+            pipeline: pipeline.into(),
+            title: title.into(),
+            brief: String::new(),
+            priority: Priority::Normal,
+            dependencies: vec![],
+            tags: vec![],
+            model_plan: ModelPlan::default(),
+            model_reasons: None,
+            budget_usd: None,
+            state: QueueState::Queued,
+            autonomy: Autonomy::default(),
+            origin: None,
+            fresh_retries: 0,
+            created_at: archon_core::now(),
+            updated_at: archon_core::now(),
+        }
+    }
+
+    fn summary(item: QueueItem) -> ItemSummary {
+        ItemSummary {
+            waiting_on: None,
+            waiting_reason: None,
+            item,
+            stage: None,
+            spent_usd: 0.0,
+            pr_url: None,
+        }
+    }
+
+    fn pipeline_run(item: &QueueItem, state: RunState) -> PipelineRun {
+        PipelineRun {
+            id: PipelineRunId::new(),
+            item: item.id.clone(),
+            pipeline: "quick-pr".into(),
+            shipped: false,
+            aether_run: None,
+            workspace: "/w".into(),
+            team_root: None,
+            branch: "archon/x".into(),
+            state,
+            cost_usd: 0.0,
+            started_at: at(9, 0),
+            finished_at: None,
+        }
+    }
+
+    fn stage_run(run: &PipelineRun, stage_id: &str, summary: &str) -> StageRun {
+        StageRun {
+            id: StageRunId::new(),
+            run: run.id.clone(),
+            stage_id: stage_id.into(),
+            attempt: 1,
+            fan_index: 0,
+            choice: ModelChoice {
+                model: "claude-code/opus".parse().unwrap(),
+                effort: Effort::High,
+            },
+            aether_agent: Some(AetherAgentId::parse("agt_one").unwrap()),
+            aether_task: None,
+            state: StageState::Completed,
+            verdict: None,
+            summary: Some(summary.into()),
+            structured: None,
+            cost_usd: 0.5,
+            started_at: at(9, 0),
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn items_show_stage_age_cost_and_pull_request() {
+        let repo = RepoId::new();
+        let names: RepoNames = [(repo.clone(), "api".to_owned())].into();
+        let mut running = summary(queue_item(Some(&repo), "add a greeting", "quick-pr"));
+        running.item.state = QueueState::Running {
+            run: PipelineRunId::new(),
+        };
+        running.item.created_at = at(9, 55);
+        running.stage = Some("review".into());
+        running.spent_usd = 1.2;
+        let mut shipped = summary(queue_item(Some(&repo), "fix typo", "strict-pr-review"));
+        shipped.item.state = QueueState::Succeeded {
+            run: PipelineRunId::new(),
+            summary: "done".into(),
+        };
+        shipped.item.created_at = at(7, 30);
+        shipped.spent_usd = 4.1;
+        shipped.pr_url = Some("https://github.com/o/r/pull/12".into());
+        let (a, b) = (running.item.id.clone(), shipped.item.id.clone());
+
+        let text = items(&[running, shipped], &names, at(10, 0));
+        let expected = format!(
+            "{a}  running    review  5m      $1.20  api  quick-pr          add a greeting\n\
+             {b}  succeeded  -       2h 30m  $4.10  api  strict-pr-review  fix typo  \
+             https://github.com/o/r/pull/12"
+        );
+        assert_eq!(text, expected);
+        assert_eq!(items(&[], &names, at(10, 0)), "The queue is empty.");
+    }
+
+    #[test]
+    fn operator_wait_is_the_primary_status_with_a_prompt_and_action() {
+        let mut detail = detail_with_stages();
+        detail.item.state = QueueState::Running {
+            run: detail.runs[0].id.clone(),
+        };
+        let wait = archon_core::protocol::WaitingOn {
+            subject: "proposal".into(),
+            stage: "propose".into(),
+            question: None,
+            prompt: format!("Approve this direction?\nSpoof{}", " evidence".repeat(200)),
+            next_action: "archon answer q_test approve".into(),
+        };
+        detail.waiting_on = Some(wait.clone());
+        let text = item_detail(&detail, &RepoNames::new(), false);
+        assert!(
+            text.lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("state: awaiting approval (proposal)")
+        );
+        assert_eq!(
+            text.lines().nth(2),
+            Some(sanitize_line(&wait.prompt).as_str())
+        );
+        assert_eq!(
+            text.lines().nth(3),
+            Some("next: archon answer q_test approve")
+        );
+        let mut row = summary(detail.item.clone());
+        row.waiting_on = Some(wait);
+        let listing = items(&[row], &RepoNames::new(), archon_core::now());
+        assert!(listing.contains("awaiting approval"));
+        assert!(listing.contains("proposal — next:"));
+        assert!(!listing.contains("evidence"));
+        assert!(listing.len() < 300);
+        assert!(listing.contains("archon answer q_test approve"));
+        assert_eq!(listing.lines().count(), 1);
+        let value = serde_json::to_value(&detail).unwrap();
+        assert_eq!(value["item"]["state"]["state"], "running");
+        assert_eq!(value["waiting_on"]["subject"], "proposal");
+    }
+
+    #[test]
+    fn listed_titles_cannot_rewrite_the_screen_or_fake_a_row() {
+        let spoof = "fix typo\x1b[2K\x1b[1G\nqi_FAKE  succeeded  api  quick-pr  done";
+        let mut row = summary(queue_item(None, spoof, "quick-pr"));
+        row.pr_url = Some("https://x/\x1b[2Kpull/1\nqi_FAKE".into());
+        let text = items(&[row], &RepoNames::new(), archon_core::now());
+        assert_inert(&text);
+        assert_eq!(text.lines().count(), 1, "one item, one row: {text:?}");
+        assert!(
+            text.ends_with(
+                "fix typo[2K[1G qi_FAKE  succeeded  api  quick-pr  done  \
+                 https://x/[2Kpull/1 qi_FAKE"
+            ),
+            "{text}"
+        );
+    }
+
+    fn detail_with_stages() -> ItemDetail {
+        let item = queue_item(None, "add a greeting", "quick-pr");
+        let run = pipeline_run(
+            &item,
+            RunState::Succeeded {
+                summary: "shipped".into(),
+            },
+        );
+        let long: Vec<String> = (1..=6).map(|n| format!("finding {n}")).collect();
+        let mut review = stage_run(&run, "review", &long.join("\n"));
+        review.verdict = Some(Verdict::Pass);
+        review.fan_index = 1;
+        let mut ship = stage_run(&run, "ship", "opened a pull request");
+        ship.aether_agent = None;
+        ship.structured = Some(serde_json::json!({"pr_url": "https://github.com/o/r/pull/12"}));
+        ItemDetail {
+            waiting_on: None,
+            waiting_reason: None,
+            stages: vec![review, ship],
+            runs: vec![run],
+            item,
+            spent_usd: 1.0,
+            gates: vec![],
+        }
+    }
+
+    #[test]
+    fn item_detail_shows_each_stage_its_summary_and_the_pull_request() {
+        let detail = detail_with_stages();
+        let text = item_detail(&detail, &RepoNames::new(), false);
+        let run = &detail.runs[0].id;
+        let expected = format!(
+            "run {run}: succeeded on archon/x in /w\n\
+             \x20 pr: https://github.com/o/r/pull/12\n\
+             \x20 review attempt 1 slot 1: completed, verdict pass, $0.50, \
+             claude-code/opus (high), agent agt_one\n\
+             \x20   finding 1\n\
+             \x20   finding 2\n\
+             \x20   finding 3\n\
+             \x20   finding 4\n\
+             \x20   [2 more lines; --full shows the whole summary]\n\
+             \x20 ship attempt 1 slot 0: completed, $0.50, claude-code/opus (high), \
+             no agent yet\n\
+             \x20   opened a pull request\n"
+        );
+        assert!(text.contains(&expected), "{text}");
+        assert!(text.starts_with(&format!("{}  add a greeting\n", detail.item.id)));
+
+        let full = item_detail(&detail, &RepoNames::new(), true);
+        assert!(
+            full.contains("    finding 4\n    finding 5\n    finding 6\n"),
+            "{full}"
+        );
+        assert!(!full.contains("--full"), "{full}");
+    }
+
+    #[test]
+    fn item_detail_shows_reasons_only_beside_current_plan_choices() {
+        let mut detail = detail_with_stages();
+        let choice = detail.stages[0].choice.clone();
+        detail
+            .item
+            .model_plan
+            .0
+            .insert("review".into(), vec![choice]);
+        detail.item.model_reasons = Some([("review".into(), "Check supplied fix".into())].into());
+        let text = item_detail(&detail, &RepoNames::new(), false);
+        assert!(
+            text.contains("plan review: claude-code/opus high (Check supplied fix)"),
+            "{text}"
+        );
+        assert_eq!(text.matches("Check supplied fix").count(), 1);
+    }
+
+    #[test]
+    fn long_summary_lines_are_clipped_by_characters() {
+        let long = "x".repeat(SUMMARY_CHARS + 50);
+        let lines = summary_lines(&format!("short\n{long}"), false);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "short");
+        assert_eq!(lines[1].chars().count(), SUMMARY_CHARS - "short".len() + 1);
+        assert!(lines[1].ends_with('…'));
+        assert_eq!(lines[2], "[--full shows the whole summary]");
+        assert_eq!(summary_lines(&format!("short\n{long}"), true)[1], long);
+        assert!(summary_lines("  \n ", false).is_empty());
+        assert_eq!(summary_lines("one\ntwo", false), ["one", "two"]);
+    }
+
+    #[test]
+    fn item_detail_strips_escapes_from_agent_text() {
+        let mut item = queue_item(None, "title\x1b]52;c;cm0gLXJm\x07", "quick-pr");
+        item.brief = "line one\x1b[2J\nline two\r".into();
+        item.tags = vec!["t\x1b[8m".into()];
+        item.state = QueueState::Cancelled {
+            reason: Some("gone\u{9b}2J".into()),
+        };
+        let run = pipeline_run(
+            &item,
+            RunState::Failed {
+                stage_id: "implement".into(),
+                error: "boom\x1b[1A\x1b[2K".into(),
+            },
+        );
+        let mut stage = stage_run(&run, "implement", "did it\x1b[2J\nrun x: succeeded\x07");
+        stage.structured = Some(serde_json::json!({"pr_url": "https://x\x1b[2K\n/1"}));
+        let gate = OperatorGate {
+            run: run.id.clone(),
+            item: item.id.clone(),
+            stage_id: "propose".into(),
+            attempt: 1,
+            subject: GateSubject::Proposal,
+            summary: String::new(),
+            page: None,
+            location: Some("http://lavish\x1b]8;;http://evil\x07/p/1".into()),
+            report: None,
+            question: None,
+            decision: Some(GateDecision::Reject {
+                reason: "no\nrun x: succeeded".into(),
+            }),
+            withdrawn: None,
+            opened_at: archon_core::now(),
+            decided_at: None,
+        };
+        let detail = ItemDetail {
+            waiting_on: None,
+            waiting_reason: None,
+            item,
+            runs: vec![run],
+            stages: vec![stage],
+            spent_usd: 0.0,
+            gates: vec![gate],
+        };
+        let text = item_detail(&detail, &RepoNames::new(), true);
+        assert_inert(&text);
+        assert!(text.contains("title]52;c;cm0gLXJm\n"), "{text}");
+        assert!(text.contains("state: cancelled: gone2J\n"), "{text}");
+        assert!(text.contains("tags: t[8m\n"), "{text}");
+        assert!(
+            text.contains("failed at implement: boom[1A[2K on"),
+            "{text}"
+        );
+        assert!(text.contains("  pr: https://x[2K /1\n"), "{text}");
+        assert!(
+            text.contains("    did it[2J\n    run x: succeeded\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("at http://lavish]8;;http://evil/p/1): rejected: no run x: succeeded\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("\nline one[2J\nline two"), "{text}");
+    }
+
+    #[test]
+    fn gates_say_what_was_decided() {
+        let mut gate = OperatorGate {
+            run: PipelineRunId::new(),
+            item: QueueItemId::new(),
+            stage_id: "propose".into(),
+            attempt: 1,
+            subject: GateSubject::Proposal,
+            summary: "Use a cache".into(),
+            page: None,
+            location: Some("http://lavish/p/1".into()),
+            report: None,
+            question: None,
+            decision: None,
+            withdrawn: None,
+            opened_at: archon_core::now(),
+            decided_at: None,
+        };
+        let waiting = gate_line(&gate);
+        assert_eq!(
+            waiting,
+            "gate propose #1 (direction at http://lavish/p/1): waiting for the operator"
+        );
+        gate.decision = Some(GateDecision::Revise {
+            feedback: "no cache".into(),
+        });
+        assert!(gate_line(&gate).ends_with("): revision requested: no cache"));
+    }
+}

@@ -1,0 +1,7 @@
+# Secret-scan configuration: `gitleaks detect --no-git --redact`.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures: idempotency keys built on the ULID specification's example value"
+regexes = ['''(stg|prun)_01ARZ3NDEKTSV4RRFFQ69G5FAV''']

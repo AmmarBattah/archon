@@ -1,0 +1,29 @@
+{
+  "window": 400,
+  "max_chars": 16000,
+  "groups": [
+    {
+      "name": "the price-update path never invalidates the category listing cache",
+      "all": [
+        ["updatePrice", "pricing\\.js"],
+        ["listing"],
+        ["(not|never|isn'?t|doesn'?t|does not|only|no|nothing) (\\S+ ){0,4}(invalidat|delet|evict|clear|purg|bust)", "(invalidat|delet|evict|clear|purg)\\w* only"]
+      ]
+    },
+    {
+      "name": "the ten-minute delay is the listing TTL",
+      "all": [
+        ["LISTING_TTL_SECONDS", "\\b600\\b", "(ten|10)[- ]minutes? TTL", "TTL of (ten|10) minutes"],
+        ["listing"]
+      ]
+    },
+    {
+      "name": "a fix that invalidates or versions the listing entries",
+      "all": [
+        ["fix", "should", "instead", "solution", "remed"],
+        ["listing"],
+        ["invalidat", "delet", "evict", "purg", "bust", "version", "generation"]
+      ]
+    }
+  ]
+}

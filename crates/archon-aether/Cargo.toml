@@ -1,0 +1,31 @@
+[package]
+name = "archon-aether"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Rust client for the Aether daemon protocol and the AgentBackend implementation"
+
+[dependencies]
+archon-core = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# A scripted in-process aetherd for tests of this crate and its consumers.
+fake = []
+
+[dev-dependencies]
+# Enables `fake` for this crate's own tests.
+archon-aether = { path = ".", features = ["fake"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

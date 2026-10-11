@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a change or an addition
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open an issue before a large change, so the direction is agreed
+        before you write the code. Small fixes can go straight to a pull
+        request.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: The behaviour you would like, from the user's point of view. Commands, configuration and output if you have them in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other ways to solve it, including what you do today.
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to implement this myself.

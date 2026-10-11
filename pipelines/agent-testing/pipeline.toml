@@ -1,0 +1,31 @@
+[pipeline]
+name = "agent-testing"
+description = "Agents exercise the product as users would and report defects with evidence"
+version = 1
+workspace = "worktree"
+requires_repo = true
+
+[nudges]
+tier = "balanced"
+independent_reviewers = true
+notes = "Exploratory QA of a CLI, API or UI, before or after a change. Testers find and report defects; nothing is fixed or shipped."
+
+[[stage]]
+id = "plan"
+kind = "work"
+prompt = "plan.md"
+timeout_minutes = 45
+
+[[stage]]
+id = "exercise"
+kind = "report"
+prompt = "exercise.md"
+fan_out = 2
+timeout_minutes = 120
+nudge = "Two testers on different charters; distinct models find more distinct defects."
+
+[[stage]]
+id = "report"
+kind = "report"
+prompt = "report.md"
+timeout_minutes = 45

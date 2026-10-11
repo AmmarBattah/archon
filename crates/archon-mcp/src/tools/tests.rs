@@ -1,0 +1,693 @@
+use std::collections::BTreeSet;
+
+use archon_core::autonomy::{
+    Autonomy, AutonomyPatch, AutonomyPolicy, AutonomyView, Directive, DirectiveSource, MergeMode,
+    ProposalMode, ReportMode, ReviewLevel,
+};
+use archon_core::catalog::{
+    CatalogListing, Gate, Nudges, PipelineProblem, PipelineSource, PipelineSummary, StageKind,
+    StageSummary, WorkspaceMode,
+};
+use archon_core::id::{DirectiveId, PipelineRunId, QueueItemId};
+use archon_core::mcp_tools::TOOLS;
+use archon_core::model::Effort;
+use archon_core::protocol::{PauseTarget, Request};
+use archon_core::queue::{Priority, QueueItem, QueueState};
+use serde_json::json;
+
+use super::*;
+
+pub(super) fn qi() -> String {
+    QueueItemId::new().to_string()
+}
+
+pub(super) fn plan() -> Value {
+    json!({
+        "implement": [{"model": "claude-code/claude-opus-5-5", "effort": "high"}],
+        "review": [
+            {"model": {"provider": "codex", "model": "gpt-6-sol"}, "effort": "xhigh"},
+            {"model": "claude-code/claude-sonnet-5", "effort": "max"}
+        ]
+    })
+}
+
+/// Valid arguments for each tool that together use every declared property.
+pub(super) fn samples() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "message_orchestrator",
+            json!({"text": "a blocker", "kind": "escalation"}),
+        ),
+        ("list_pipelines", json!({"repo": "web"})),
+        ("list_repos", json!({})),
+        ("model_policy", json!({"repo": "web"})),
+        (
+            "list_queue",
+            json!({"states": ["queued", "failed"], "repo": "web", "pipeline": "quick-pr", "tag": "auth", "limit": 20}),
+        ),
+        ("get_item", json!({"item": qi()})),
+        (
+            "get_stage",
+            json!({"item": qi(), "run": PipelineRunId::new().to_string(), "stage": "review", "attempt": 2, "slot": 1, "offset": 20000, "limit": 5000}),
+        ),
+        ("get_stage", json!({"item": qi()})),
+        ("queue_status", Value::Null),
+        (
+            "model_evidence",
+            json!({"repo": "web", "pipeline": "quick-pr", "stage": "implement", "since": "30d"}),
+        ),
+        (
+            "cost_report",
+            json!({"since": "2026-09-01", "until": "1d", "by": "model"}),
+        ),
+        (
+            "register_repo",
+            json!({"path": "/srv/web", "name": "web", "ship": "local", "base_branch": "main", "default_pipeline": "quick-pr"}),
+        ),
+        (
+            "enqueue",
+            json!({
+                "repo": "web", "pipeline": "default-pr-review", "title": "Fix login redirect",
+                "brief": "Users land on /404 after login.", "priority": "high", "depends_on": [qi()],
+                "tags": ["auth"], "model_plan": plan(), "model_reasons": {"implement": "Apply supplied fix"}, "budget_usd": 5.0, "idempotency_key": "fix-login-1",
+                "autonomy": {"review": "standard", "proposal": "lavish", "report": "with-pr", "merge": "manual", "tools": "guarded"},
+                "origin": {"repository": "acme/web", "number": 42}
+            }),
+        ),
+        (
+            "update_item",
+            json!({"item": qi(), "priority": "low", "model_plan": plan(), "model_reasons": {"implement": "Apply supplied fix"}, "tags": [], "add_depends_on": [qi()], "budget_usd": 2.5, "brief_append": "Do Y."}),
+        ),
+        ("cancel_item", json!({"item": qi(), "reason": "superseded"})),
+        (
+            "retry_item",
+            json!({"item": qi(), "model_plan": plan(), "model_reasons": {"implement": "Retry with more reasoning"}, "fresh": true, "brief_append": "Do Y."}),
+        ),
+        ("pause", json!({"scope": "repo", "name": "web"})),
+        ("resume", json!({"scope": "pipeline", "name": "quick-pr"})),
+        (
+            "notify",
+            json!({"kind": "decision", "text": "Split the work in two.", "item": qi()}),
+        ),
+        (
+            "ask_operator",
+            json!({"text": "Ship to prod?", "item": qi(), "options": ["yes", "no"]}),
+        ),
+        (
+            "publish_report",
+            json!({"title": "E2E run", "path": "/srv/web/.archon/reports/e2e.html", "item": qi()}),
+        ),
+        ("autonomy_policy", json!({"repo": "web"})),
+        (
+            "set_directive",
+            json!({"text": "merge docs fixes yourself", "expires_in_hours": 12}),
+        ),
+        (
+            "clear_directive",
+            json!({"directive": DirectiveId::new().to_string()}),
+        ),
+        ("clear_directive", json!({"all": true})),
+        (
+            "github_reply",
+            json!({"repository": "Acme/Web", "number": 42, "body": "Queued as qi_1."}),
+        ),
+    ]
+}
+
+fn refusal(tool: &str, arguments: Value) -> String {
+    match to_request(tool, arguments) {
+        Err(ToolError(text)) => text,
+        Ok(request) => panic!("{tool} accepted invalid arguments as {request:?}"),
+    }
+}
+
+#[test]
+fn every_tool_name_has_exactly_one_definition() {
+    let defined: Vec<&str> = definitions().iter().map(|d| d.name).collect();
+    let listed: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
+    assert_eq!(defined, listed, "same tools, same order, no extras");
+    for tool in TOOLS {
+        let definition = definition(tool.name).expect("defined");
+        assert_eq!(definition.read_only, tool.read_only(), "{}", tool.name);
+    }
+}
+
+#[test]
+fn definitions_fit_aethers_limits_and_are_self_consistent() {
+    for definition in definitions() {
+        let name = definition.name;
+        let properties: BTreeSet<&str> = definition.properties().collect();
+        assert!(
+            definition.required().all(|r| properties.contains(r)),
+            "{name}"
+        );
+        assert!(definition.description.chars().count() < 4_000, "{name}");
+        assert!(
+            definition.input_schema.to_string().len() < 64 * 1024,
+            "{name}"
+        );
+        let listed = definition.to_mcp();
+        assert_eq!(listed["name"], name);
+        assert_eq!(listed["annotations"]["readOnlyHint"], definition.read_only);
+        let public = name == "github_reply";
+        assert_eq!(listed["annotations"]["openWorldHint"], public, "{name}");
+        assert!(
+            listed["inputSchema"]["additionalProperties"] == false,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn samples_map_every_declared_argument_and_never_operator_only_requests() {
+    let mut exercised: BTreeSet<(&str, String)> = BTreeSet::new();
+    for (tool, arguments) in samples() {
+        let keys: Vec<String> = arguments
+            .as_object()
+            .map_or(vec![], |o| o.keys().cloned().collect());
+        let request = to_request(tool, arguments).unwrap_or_else(|e| panic!("{tool}: {e}"));
+        assert!(!request.is_operator_only(), "{tool} built {request:?}");
+        exercised.extend(keys.into_iter().map(|k| (tool, k)));
+    }
+    for definition in definitions() {
+        for property in definition.properties() {
+            let key = (definition.name, property.to_owned());
+            assert!(exercised.contains(&key), "no sample uses {key:?}");
+        }
+    }
+}
+
+/// The watcher, its allowlists and its operator logins are the operator's
+/// alone: no tool asks archond for the watcher, changes it, or takes logins.
+#[test]
+fn no_tool_can_change_the_github_watcher_or_set_its_operator_logins() {
+    let sampled: BTreeSet<&str> = samples().iter().map(|(tool, _)| *tool).collect();
+    let listed: BTreeSet<&str> = TOOLS.iter().map(|t| t.name).collect();
+    assert_eq!(sampled, listed, "every tool is exercised below");
+    for (tool, arguments) in samples() {
+        let request = to_request(tool, arguments).unwrap_or_else(|e| panic!("{tool}: {e}"));
+        let watcher = matches!(
+            request,
+            Request::ConfigureGithubWatcher { .. } | Request::GithubWatcher
+        );
+        assert!(!watcher, "{tool} reaches the watcher with {request:?}");
+    }
+    let lists = ["operator_users", "operators", "allowed_users", "watcher"];
+    for definition in definitions() {
+        let name = definition.name;
+        assert!(!name.contains("watcher") && !name.contains("operators"));
+        for property in definition.properties() {
+            assert!(!lists.contains(&property), "{name} takes `{property}`");
+        }
+        let schema = definition.input_schema.to_string();
+        assert!(!schema.contains("operator_users"), "{name}: {schema}");
+    }
+    let smuggled = json!({
+        "repository": "o/r", "number": 7, "body": "done", "operator_users": ["octocat"],
+    });
+    let text = refusal("github_reply", smuggled);
+    assert!(
+        text.contains("unknown argument(s) `operator_users`"),
+        "{text}"
+    );
+}
+
+#[test]
+fn register_repo_never_turns_on_auto_merge() {
+    let Ok(Request::RepoAdd(add)) = to_request("register_repo", json!({"path": "/srv/web"})) else {
+        panic!("register_repo maps to RepoAdd");
+    };
+    assert!(!add.auto_merge);
+    let text = refusal(
+        "register_repo",
+        json!({"path": "/srv/web", "auto_merge": true}),
+    );
+    assert!(
+        text.contains("unknown argument(s) `auto_merge`") && text.contains("accepted: "),
+        "{text}"
+    );
+}
+
+#[test]
+fn enqueue_maps_its_fields_and_both_model_spellings() {
+    let (_, arguments) = samples()
+        .into_iter()
+        .find(|(t, _)| *t == "enqueue")
+        .unwrap();
+    let Ok(Request::Enqueue(request)) = to_request("enqueue", arguments) else {
+        panic!("enqueue maps to Enqueue");
+    };
+    assert_eq!(request.pipeline.as_deref(), Some("default-pr-review"));
+    assert_eq!(request.priority, Priority::High);
+    let review = request
+        .model_plan
+        .choices_for("review")
+        .expect("review stage");
+    assert_eq!(review[0].model.to_string(), "codex/gpt-6-sol");
+    assert_eq!(review[0].effort, Effort::XHigh);
+    assert_eq!(request.idempotency_key.as_deref(), Some("fix-login-1"));
+    let origin = request.origin.expect("the GitHub thread is kept");
+    assert_eq!(origin.to_string(), "acme/web#42");
+}
+
+#[test]
+fn github_reply_names_one_thread_and_never_its_own_marker() {
+    let request = to_request(
+        "github_reply",
+        json!({"repository": "Acme/Web", "number": 7, "body": "On it."}),
+    )
+    .unwrap();
+    let Request::GithubReply { thread, body } = &request else {
+        panic!("github_reply maps to GithubReply: {request:?}");
+    };
+    assert_eq!(thread.to_string(), "acme/web#7");
+    assert_eq!(body, "On it.", "archond appends the marker, not the proxy");
+    assert!(!request.is_operator_only(), "the orchestrator may reply");
+    let url = refusal(
+        "github_reply",
+        json!({"repository": "https://github.com/a/b", "number": 1, "body": "x"}),
+    );
+    assert!(
+        url.contains("`repository`") && url.contains("owner/name"),
+        "{url}"
+    );
+    let zero = refusal(
+        "github_reply",
+        json!({"repository": "a/b", "number": 0, "body": "x"}),
+    );
+    assert!(zero.contains("`number`"), "{zero}");
+    let origin = json!({"title": "t", "brief": "b", "model_plan": plan(),
+                        "origin": {"repository": "a/b", "number": 1, "url": "x"}});
+    let unknown = refusal("enqueue", origin);
+    assert!(unknown.contains("`origin`"), "{unknown}");
+}
+
+#[test]
+fn enqueue_passes_autonomy_through_and_may_omit_the_pipeline() {
+    let arguments = json!({
+        "repo": "web", "title": "Harden login", "brief": "b", "model_plan": plan(),
+        "autonomy": {"review": "strict", "report": "before-pr"}
+    });
+    let Ok(Request::Enqueue(request)) = to_request("enqueue", arguments) else {
+        panic!("enqueue maps to Enqueue");
+    };
+    assert_eq!(request.pipeline, None, "the review knob picks the family");
+    let expected = AutonomyPatch {
+        review: Some(ReviewLevel::Strict),
+        report: Some(ReportMode::BeforePr),
+        ..AutonomyPatch::default()
+    };
+    assert_eq!(request.autonomy, expected);
+    let unknown = refusal(
+        "enqueue",
+        json!({"title": "t", "brief": "b", "model_plan": plan(), "autonomy": {"merge": "always"}}),
+    );
+    assert!(unknown.contains("`autonomy`"), "{unknown}");
+}
+
+#[test]
+fn clear_directive_needs_exactly_one_target() {
+    let neither = refusal("clear_directive", json!({}));
+    assert!(neither.contains("`all: true`"), "{neither}");
+    let both = json!({"directive": DirectiveId::new().to_string(), "all": true});
+    let both = refusal("clear_directive", both);
+    assert!(both.contains("`all`"), "{both}");
+    let every = to_request("clear_directive", json!({"all": true})).unwrap();
+    assert_eq!(every, Request::ClearDirective { directive: None });
+    let hours = refusal("set_directive", json!({"text": "t", "expires_in_hours": 0}));
+    assert!(hours.contains("`expires_in_hours`"), "{hours}");
+}
+
+#[test]
+fn argument_errors_name_the_argument_and_the_fix() {
+    let missing = refusal("enqueue", json!({"pipeline": "quick-pr"}));
+    assert!(
+        missing.contains("`title`, `brief`, `model_plan`"),
+        "{missing}"
+    );
+    let bad_model = refusal(
+        "enqueue",
+        json!({"pipeline": "p", "title": "t", "brief": "b", "model_plan": {"implement": [{"model": "opus", "effort": "high"}]}}),
+    );
+    assert!(
+        bad_model.contains("`model_plan`") && bad_model.contains("provider/model"),
+        "{bad_model}"
+    );
+    let two_lines = refusal(
+        "enqueue",
+        json!({"pipeline": "p", "title": "a\nb", "brief": "b", "model_plan": plan()}),
+    );
+    assert!(two_lines.contains("single line"), "{two_lines}");
+    let relative = refusal("register_repo", json!({"path": "web"}));
+    assert!(relative.contains("absolute path"), "{relative}");
+    let bad_id = refusal("get_item", json!({"item": "item-7"}));
+    assert!(
+        bad_id.contains("`item`") && bad_id.contains("qi"),
+        "{bad_id}"
+    );
+    let state = refusal("list_queue", json!({"states": ["done"]}));
+    assert!(
+        state.contains("\"done\"") && state.contains("succeeded"),
+        "{state}"
+    );
+    let not_object = refusal("list_repos", json!(["x"]));
+    assert!(not_object.contains("must be a JSON object"), "{not_object}");
+}
+
+#[test]
+fn semantic_checks_refuse_what_the_schema_cannot_express() {
+    let nothing = refusal("update_item", json!({"item": qi()}));
+    assert!(nothing.contains("nothing to change"), "{nothing}");
+    let global_name = refusal("pause", json!({"scope": "global", "name": "web"}));
+    assert!(global_name.contains("omitted"), "{global_name}");
+    let no_name = refusal("resume", json!({"scope": "repo"}));
+    assert!(
+        no_name.contains("required when scope is `repo`"),
+        "{no_name}"
+    );
+    let budget = refusal("update_item", json!({"item": qi(), "budget_usd": -1}));
+    assert!(budget.contains("positive"), "{budget}");
+    let empty_plan = refusal("retry_item", json!({"item": qi(), "model_plan": {}}));
+    assert!(empty_plan.contains("every stage"), "{empty_plan}");
+    let blank_amendment = refusal("retry_item", json!({"item": qi(), "brief_append": " "}));
+    assert!(
+        blank_amendment.contains("`brief_append`"),
+        "{blank_amendment}"
+    );
+    let not_bool = refusal("retry_item", json!({"item": qi(), "fresh": "yes"}));
+    assert!(not_bool.contains("`fresh`"), "{not_bool}");
+    let blank = refusal("notify", json!({"kind": "decision", "text": "  "}));
+    assert!(blank.contains("`text`"), "{blank}");
+    let global = to_request("pause", json!({"scope": "global"})).unwrap();
+    assert_eq!(global, Request::Pause(PauseTarget::Global { hard: false }));
+    let resume = to_request("resume", json!({"scope": "global"})).unwrap();
+    assert_eq!(resume, Request::Resume(PauseTarget::Global { hard: false }));
+    assert!(!global.is_operator_only() && !resume.is_operator_only());
+}
+
+#[test]
+fn retries_default_to_the_old_worktree_and_amendments_alone_are_a_change() {
+    let id = qi();
+    let item = QueueItemId::parse(&id).unwrap();
+    let plain = to_request("retry_item", json!({"item": id})).unwrap();
+    let expected = Request::RetryItem {
+        item: item.clone(),
+        model_plan: None,
+        model_reasons: None,
+        fresh: false,
+        brief_append: None,
+    };
+    assert_eq!(plain, expected);
+    let fresh = to_request(
+        "retry_item",
+        json!({"item": qi(), "fresh": true, "brief_append": "Do Y."}),
+    )
+    .unwrap();
+    assert!(
+        matches!(&fresh, Request::RetryItem { fresh: true, brief_append: Some(text), .. } if text == "Do Y."),
+        "{fresh:?}"
+    );
+    let amended = to_request(
+        "update_item",
+        json!({"item": qi(), "brief_append": "Do Y."}),
+    )
+    .unwrap();
+    let Request::UpdateItem { patch, .. } = amended else {
+        panic!("{amended:?}");
+    };
+    assert_eq!(patch.brief_append.as_deref(), Some("Do Y."));
+    assert_eq!(patch.model_plan, None);
+}
+
+pub(super) fn item(state: QueueState) -> QueueItem {
+    QueueItem {
+        id: QueueItemId::new(),
+        repo: None,
+        pipeline: "ask".into(),
+        title: "Why is CI slow?".into(),
+        brief: "b".into(),
+        priority: Priority::Normal,
+        dependencies: vec![],
+        tags: vec![],
+        model_plan: Default::default(),
+        model_reasons: None,
+        budget_usd: None,
+        autonomy: Default::default(),
+        origin: None,
+        fresh_retries: 0,
+        state,
+        created_at: archon_core::now(),
+        updated_at: archon_core::now(),
+    }
+}
+
+#[test]
+fn rendered_items_carry_their_id_state_and_reason() {
+    let queued = item(QueueState::Queued);
+    let text = render("enqueue", &Reply::Item(queued.clone()));
+    assert!(
+        text.starts_with("Enqueued ") && text.contains(queued.id.as_str()),
+        "{text}"
+    );
+    let blocked = item(QueueState::Blocked {
+        reason: "dependency failed".into(),
+    });
+    let text = render("list_queue", &Reply::Items(vec![queued, blocked]));
+    assert!(
+        text.starts_with("2 items:") && text.contains("[blocked]"),
+        "{text}"
+    );
+    assert!(text.contains("dependency failed"), "{text}");
+    assert_eq!(render("list_queue", &Reply::Items(vec![])), "No items.");
+}
+
+#[test]
+fn rendered_catalog_shows_what_a_model_plan_needs() {
+    let stage = |id: &str, kind, fan_out, gate| StageSummary {
+        id: id.into(),
+        kind,
+        fan_out,
+        gate,
+        timeout_minutes: 60,
+        nudge: None,
+        loops_to: None,
+        max_loops: 0,
+        roles: Vec::new(),
+    };
+    let catalog = CatalogListing {
+        pipelines: vec![PipelineSummary {
+            name: "strict-pr-review".into(),
+            description: "Three reviews.".into(),
+            source: PipelineSource::Builtin,
+            path: None,
+            workspace: WorkspaceMode::Worktree,
+            requires_repo: true,
+            nudges: Nudges {
+                independent_reviewers: true,
+                ..Default::default()
+            },
+            stages: vec![
+                stage("implement", StageKind::Work, 1, Gate::None),
+                stage("review", StageKind::Review, 3, Gate::AllPass),
+                StageSummary {
+                    roles: vec!["api".into(), "ui".into()],
+                    ..stage("build", StageKind::Team, 2, Gate::None)
+                },
+            ],
+        }],
+        problems: vec![PipelineProblem {
+            name: "broken".into(),
+            source: PipelineSource::User,
+            path: None,
+            error: "stage ids must be unique".into(),
+        }],
+    };
+    let text = render("list_pipelines", &Reply::Catalog(catalog));
+    assert!(
+        text.contains("stage implement (work, timeout 60m)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("stage review (review, fan_out 3, gate all_pass"),
+        "{text}"
+    );
+    assert!(
+        text.contains("stage build (team, roles api, ui, timeout 60m)"),
+        "{text}"
+    );
+    assert!(text.contains("independent reviewers"), "{text}");
+    assert!(
+        text.contains("Unusable pipeline broken (user): stage ids must be unique"),
+        "{text}"
+    );
+}
+
+#[test]
+fn rendered_autonomy_names_defaults_ceiling_and_directives() {
+    let mut ceiling = Autonomy::default_ceiling();
+    ceiling.merge = MergeMode::Auto;
+    let directive = Directive::new(
+        "merge docs fixes yourself",
+        DirectiveSource::Operator,
+        None,
+        archon_core::now(),
+    )
+    .unwrap();
+    let view = AutonomyView {
+        repo: Some("web".into()),
+        policy: AutonomyPolicy {
+            default: Autonomy {
+                proposal: ProposalMode::Lavish,
+                ..Autonomy::default()
+            },
+            ceiling,
+        },
+        directives: vec![directive.clone()],
+    };
+    let text = render("autonomy_policy", &Reply::Autonomy(Box::new(view)));
+    assert!(
+        text.starts_with("Autonomy for repo web: defaults "),
+        "{text}"
+    );
+    assert!(
+        text.contains("defaults review=standard, proposal=lavish")
+            && text.contains("the ceiling allows review=strict|standard|none")
+            && text.contains("merge=manual|auto"),
+        "{text}"
+    );
+    assert!(
+        text.contains(directive.id.as_str()) && text.contains("merge docs fixes"),
+        "{text}"
+    );
+    let recorded = render("set_directive", &Reply::Directive(directive));
+    assert!(recorded.contains("until it is cleared"), "{recorded}");
+    assert_eq!(
+        render("clear_directive", &Reply::Cleared(2)),
+        "Cleared 2 directive(s)."
+    );
+}
+
+#[test]
+fn get_item_shows_recorded_reasons_next_to_choices_and_omits_missing_reasons() {
+    use archon_core::protocol::{ItemDetail, Reply};
+    let mut item = item(QueueState::Queued);
+    item.model_plan = serde_json::from_value(plan()).unwrap();
+    item.model_reasons = Some([("implement".into(), "Apply supplied fix".into())].into());
+    let mut detail = ItemDetail {
+        waiting_on: None,
+        waiting_reason: None,
+        item,
+        runs: vec![],
+        stages: vec![],
+        spent_usd: 0.0,
+        gates: vec![],
+    };
+    let text = render("get_item", &Reply::ItemDetail(Box::new(detail.clone())));
+    assert!(
+        text.contains("implement = claude-code/claude-opus-5-5 high (Apply supplied fix)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("review = codex/gpt-6-sol x_high + claude-code/claude-sonnet-5 max"),
+        "{text}"
+    );
+    detail.item.model_reasons = None;
+    let text = render("get_item", &Reply::ItemDetail(Box::new(detail)));
+    assert!(!text.contains("Apply supplied fix"));
+}
+
+#[test]
+fn list_queue_and_get_item_expose_stable_waiting_reasons_in_text_and_json() {
+    use archon_core::protocol::{ItemDetail, ItemSummary, WaitingReason, WaitingReasonCode};
+    assert!(matches!(
+        to_request("list_queue", json!({})).unwrap(),
+        Request::ListItemSummaries(_)
+    ));
+    let item = item(QueueState::Queued);
+    let wait = WaitingReason {
+        code: WaitingReasonCode::TotalBudget,
+        message: "Total budget reached ($5.00 / $5.00)".into(),
+        next_action: "archon queue caps --budget-total 6.00".into(),
+    };
+    let replies = [
+        (
+            "list_queue",
+            Reply::ItemSummaries(vec![ItemSummary {
+                item: item.clone(),
+                stage: None,
+                spent_usd: 0.0,
+                pr_url: None,
+                waiting_on: None,
+                waiting_reason: Some(wait.clone()),
+            }]),
+        ),
+        (
+            "get_item",
+            Reply::ItemDetail(Box::new(ItemDetail {
+                item,
+                runs: vec![],
+                stages: vec![],
+                spent_usd: 0.0,
+                gates: vec![],
+                waiting_on: None,
+                waiting_reason: Some(wait.clone()),
+            })),
+        ),
+    ];
+    for (tool, reply) in replies {
+        let text = render(tool, &reply);
+        assert!(text.contains("total_budget"), "{text}");
+        assert!(text.contains(&wait.message), "{text}");
+        assert!(text.contains(&wait.next_action), "{text}");
+        let wire = serde_json::to_value(reply).unwrap();
+        let row = if tool == "list_queue" {
+            &wire["data"][0]
+        } else {
+            &wire["data"]
+        };
+        assert_eq!(row["waiting_reason"]["code"], "total_budget");
+    }
+}
+
+#[test]
+fn dependency_titles_are_escaped_in_waiting_text() {
+    use archon_core::protocol::{ItemDetail, ItemSummary, WaitingReason, WaitingReasonCode};
+    let item = item(QueueState::Blocked {
+        reason: "dependency".into(),
+    });
+    let wait = WaitingReason {
+        code: WaitingReasonCode::DependencyFailed,
+        message: "Dependency qi_dep (legacy\ntitle\u{001b}[31m) failed".into(),
+        next_action: "archon queue retry qi_dep".into(),
+    };
+    let replies = [
+        (
+            "list_queue",
+            Reply::ItemSummaries(vec![ItemSummary {
+                item: item.clone(),
+                stage: None,
+                spent_usd: 0.0,
+                pr_url: None,
+                waiting_on: None,
+                waiting_reason: Some(wait.clone()),
+            }]),
+        ),
+        (
+            "get_item",
+            Reply::ItemDetail(Box::new(ItemDetail {
+                item,
+                runs: vec![],
+                stages: vec![],
+                spent_usd: 0.0,
+                gates: vec![],
+                waiting_on: None,
+                waiting_reason: Some(wait),
+            })),
+        ),
+    ];
+    for (tool, reply) in replies {
+        let text = render(tool, &reply);
+        assert!(!text.contains('\u{001b}'), "{text:?}");
+        assert!(text.contains("legacy\\ntitle\\u{1b}[31m"), "{text:?}");
+    }
+}

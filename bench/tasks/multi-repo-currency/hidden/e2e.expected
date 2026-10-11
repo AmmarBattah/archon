@@ -1,0 +1,5 @@
+account,currency,total_cents
+rent,USD,-120000
+salary,USD,310050
+travel,EUR,-5000
+travel,GBP,-1200

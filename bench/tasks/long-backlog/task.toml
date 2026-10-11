@@ -1,0 +1,12 @@
+id = "long-backlog"
+title = "Work through a four-ticket backlog in a Python task tracker"
+prompt = """
+`BACKLOG.md` in this `tasktracker` repository lists four independent \
+tickets (TT-101 to TT-104). Implement all of them, following each ticket's \
+acceptance criteria exactly. Keep the existing tests passing \
+(`python3 -m unittest discover -s tests -t .`), add tests for what you \
+build, use only the standard library, and commit each ticket separately.
+"""
+timeout_minutes = 60
+pipeline = "default-pr-review"
+tags = ["long", "multi-step", "python", "single-repo"]

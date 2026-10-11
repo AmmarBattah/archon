@@ -1,0 +1,14 @@
+{
+  "name": "archon-graphic",
+  "private": true,
+  "type": "module",
+  "description": "Builds docs/assets/archon_graphic.{svg,png} from archon_graphic.src.svg",
+  "scripts": {
+    "fonts": "./fetch-fonts.sh",
+    "build": "node build.mjs",
+    "render": "./render.sh"
+  },
+  "dependencies": {
+    "opentype.js": "^1.3.4"
+  }
+}

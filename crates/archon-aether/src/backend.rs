@@ -1,0 +1,482 @@
+//! `AgentBackend` over a live Aether connection (ARCHITECTURE §4.5).
+
+use std::sync::Arc;
+
+use archon_core::aether_ids::{AetherAgentId, AetherTaskId};
+use archon_core::error::ArchonError;
+use archon_core::policy::ModelPolicy;
+use archon_core::ports::{AgentBackend, CreatedNode, RunNodeRequest, SpawnRequest, SpawnedAgent};
+use archon_core::run::StageOutcome;
+use async_trait::async_trait;
+
+use crate::client::AetherClient;
+use crate::link::AetherLink;
+use crate::wire::{
+    Agent, AgentConfig, ApprovalPolicy, CreateAgent, NetworkPolicy, Scope, Task, TaskStatus,
+    ToolExposure,
+};
+
+/// Aether agent states in which an agent can still act or take children.
+/// Everything else (`completed`, `failed`, `cancelled`, `imported`) is final.
+pub const LIVE_STATES: &[&str] = &["created", "ready", "running", "waiting", "blocked"];
+
+#[derive(Debug)]
+pub struct AetherBackend {
+    link: Arc<AetherLink>,
+    /// Re-checked at spawn so a plan persisted under an older policy is
+    /// refused (ARCHITECTURE §7.4).
+    policy: ModelPolicy,
+}
+
+impl AetherBackend {
+    pub fn new(link: Arc<AetherLink>, policy: ModelPolicy) -> Self {
+        Self { link, policy }
+    }
+}
+
+/// The agent's `status.state`; `unknown` when Aether sent something else.
+pub fn agent_state(agent: &Agent) -> String {
+    agent
+        .status
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+pub fn agent_is_live(agent: &Agent) -> bool {
+    LIVE_STATES.contains(&agent_state(agent).as_str())
+}
+
+/// The exact `create_agent` for a stage agent. `network` is the request's
+/// persisted one (its run node's, which a child may not widen), or Aether's
+/// default for a record that predates it. Stage agents are headless, so
+/// nothing is gated: under `[approval] default = "ask"` a gated call would
+/// wait for nobody.
+pub fn stage_create_agent(request: &SpawnRequest, network: NetworkPolicy) -> CreateAgent {
+    assert!(
+        request.network.is_none_or(|stated| stated == network),
+        "a persisted network is sent as stored"
+    );
+    assert!(
+        !request.idempotency_key.is_empty(),
+        "stage agents are always created under an idempotency key"
+    );
+    assert!(
+        request.workspace.is_absolute(),
+        "workspace must be absolute: {}",
+        request.workspace.display()
+    );
+    let tools = match request.hidden_tools.is_empty() {
+        true => ToolExposure::All,
+        false => ToolExposure::Except {
+            names: request.hidden_tools.iter().cloned().collect(),
+        },
+    };
+    CreateAgent {
+        role: request.role.clone(),
+        name: Some(request.name.clone()),
+        objective: Some(request.objective.clone()),
+        model: Some(request.choice.model.clone()),
+        scope: Some(Scope {
+            workspace_root: Some(request.workspace.clone()),
+            repository: request.repository.clone(),
+            network,
+            labels: request.labels.clone(),
+        }),
+        parent: request.parent.clone(),
+        config: Some(AgentConfig {
+            instructions: Some(request.instructions.clone()),
+            effort: Some(request.choice.effort),
+            cost_budget: request
+                .cost_budget_usd
+                .filter(|_| request.aether_cost_budget != Some(false)),
+            deadline: request.deadline,
+            tools,
+            long_lived: false,
+            leaf: request.leaf,
+        }),
+        approval: Some(ApprovalPolicy::none()),
+        run: request.attach_run.clone(),
+        start: true,
+        idempotency_key: Some(request.idempotency_key.clone()),
+    }
+}
+
+/// The exact `create_agent` for a pipeline run's node: a root with no
+/// objective and `start: false`, so Aether never schedules it. Its scope is
+/// the run's worktree with the network the request recorded, and its
+/// approval gates nothing, so every stage agent (same worktree and network,
+/// `require_for: []`) narrows it and can be its child. Archon's tools are
+/// hidden: should an operator ever restart a retired node in Aether, the
+/// agent that results cannot act for the orchestrator.
+pub fn run_node_create_agent(request: &RunNodeRequest) -> CreateAgent {
+    assert!(
+        !request.idempotency_key.is_empty(),
+        "run nodes are always created under an idempotency key"
+    );
+    assert!(
+        request.workspace.is_absolute(),
+        "workspace must be absolute: {}",
+        request.workspace.display()
+    );
+    assert!(!request.name.trim().is_empty(), "a run node has a name");
+    CreateAgent {
+        role: request.role.clone(),
+        name: Some(request.name.clone()),
+        objective: None,
+        model: Some(request.model.clone()),
+        scope: Some(Scope {
+            workspace_root: Some(request.workspace.clone()),
+            repository: request.repository.clone(),
+            network: request.network,
+            labels: request.labels.clone(),
+        }),
+        parent: None,
+        config: Some(AgentConfig {
+            instructions: None,
+            effort: None,
+            cost_budget: None,
+            deadline: None,
+            tools: ToolExposure::Except {
+                names: archon_core::mcp_tools::qualified_names()
+                    .into_iter()
+                    .collect(),
+            },
+            long_lived: false,
+            leaf: false,
+        }),
+        approval: Some(ApprovalPolicy::none()),
+        run: request.attach_run.clone(),
+        start: false,
+        idempotency_key: Some(request.idempotency_key.clone()),
+    }
+}
+
+/// `None` while the task is open.
+pub fn task_outcome(task: &Task) -> Option<StageOutcome> {
+    match &task.status {
+        TaskStatus::Queued | TaskStatus::Assigned | TaskStatus::Active => None,
+        TaskStatus::Blocked { .. } => None,
+        TaskStatus::Completed { result } => Some(StageOutcome::Completed {
+            summary: result.summary.clone(),
+            structured: result.structured.clone(),
+        }),
+        TaskStatus::Failed { error, .. } => Some(StageOutcome::Failed {
+            error: error.clone(),
+            infra: false,
+        }),
+        TaskStatus::Cancelled { reason } => Some(StageOutcome::Cancelled {
+            reason: reason.clone(),
+        }),
+    }
+}
+
+/// Task from `agent.current_task`, run from `get_task`, which also proves
+/// the task exists and belongs to this agent.
+async fn spawned_from(
+    client: &AetherClient,
+    agent: Agent,
+    key: &str,
+) -> Result<SpawnedAgent, ArchonError> {
+    let task_id = agent.current_task.clone().ok_or_else(|| {
+        ArchonError::Aether(format!(
+            "create_agent (key {key}) returned agent {} without a task",
+            agent.id
+        ))
+    })?;
+    let task = client.get_task(&task_id).await?;
+    if task.owner.as_ref().is_some_and(|owner| *owner != agent.id) {
+        return Err(ArchonError::Protocol(format!(
+            "task {task_id} of agent {} is owned by {:?}",
+            agent.id, task.owner
+        )));
+    }
+    Ok(SpawnedAgent {
+        agent: agent.id,
+        task: task_id,
+        run: task.run,
+    })
+}
+
+#[async_trait]
+impl AgentBackend for AetherBackend {
+    async fn spawn(&self, mut request: SpawnRequest) -> Result<SpawnedAgent, ArchonError> {
+        self.policy.check(&request.choice)?;
+        if request.cost_budget_usd.is_some() && request.aether_cost_budget.is_none() {
+            self.prepare_spawn(&mut request, true).await?;
+        }
+        let client = self.link.client()?;
+        let network = match request.network {
+            Some(stated) => stated,
+            // A record from before the network was persisted: sent as that
+            // daemon sent it, with Aether's default of the moment.
+            None => client.daemon_defaults().await?.network_default,
+        };
+        let agent = client
+            .create_agent(stage_create_agent(&request, network))
+            .await?;
+        spawned_from(&client, agent, &request.idempotency_key).await
+    }
+
+    async fn prepare_spawn(
+        &self,
+        request: &mut SpawnRequest,
+        count_estimated_cost: bool,
+    ) -> Result<(), ArchonError> {
+        if request.cost_budget_usd.is_none() {
+            return Ok(());
+        }
+        self.policy.check(&request.choice)?;
+        let reports_cost = match request.aether_cost_budget {
+            Some(stored) => stored,
+            None => {
+                let client = self.link.client()?;
+                let models = client.list_models().await?;
+                let providers = client.providers().await?;
+                let model = models.iter().find(|info| {
+                    info.model.provider == request.choice.model.provider
+                        && (info.model.model == request.choice.model.model
+                            || info.aliases.contains(&request.choice.model.model))
+                });
+                let provider = providers
+                    .iter()
+                    .find(|info| info.provider == request.choice.model.provider);
+                // v14 to v17 expose no reports_cost flag. Mirror Aether's protocol rule:
+                // engines differ even when they carry a price; HTTP needs a price.
+                // Missing metadata never proves a hard cap is enforceable. Archon
+                // then requires estimates and refuses unaccounted usage in the pump.
+                match provider.map(|info| info.protocol.as_str()) {
+                    Some("claude-code") => true,
+                    Some("codex") | None => false,
+                    Some(_) => {
+                        provider.is_some_and(|info| info.engine == Some(false))
+                            && model.is_some_and(|info| info.capabilities.cost.is_some())
+                    }
+                }
+            }
+        };
+        if !reports_cost && !count_estimated_cost {
+            return Err(ArchonError::Policy(format!(
+                "cannot enforce the dollar budget for {}: Aether cost reporting is \
+                 unavailable or unconfirmed and limits.count_estimated_cost is disabled; \
+                 enable subscription estimates or choose a cost-reporting model",
+                request.choice.model
+            )));
+        }
+        request.aether_cost_budget = Some(reports_cost);
+        Ok(())
+    }
+
+    async fn create_run_node(&self, request: RunNodeRequest) -> Result<CreatedNode, ArchonError> {
+        let client = self.link.client()?;
+        let agent = client.create_agent(run_node_create_agent(&request)).await?;
+        let key = &request.idempotency_key;
+        if agent.current_task.is_some() {
+            return Err(ArchonError::Protocol(format!(
+                "run node {} (key {key}) was given a task; it must stay passive",
+                agent.id
+            )));
+        }
+        let run = agent.run.ok_or_else(|| {
+            ArchonError::Protocol(format!("run node {} (key {key}) has no run", agent.id))
+        })?;
+        Ok(CreatedNode {
+            agent: agent.id,
+            run,
+        })
+    }
+
+    async fn network_default(&self) -> Result<NetworkPolicy, ArchonError> {
+        let defaults = self.link.client()?.daemon_defaults().await?;
+        Ok(defaults.network_default)
+    }
+
+    async fn is_live(&self, agent: &AetherAgentId) -> Result<bool, ArchonError> {
+        match self.link.client()?.get_agent(agent).await {
+            Ok(found) => Ok(agent_is_live(&found)),
+            Err(ArchonError::NotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn cancel(&self, agent: &AetherAgentId, reason: &str) -> Result<(), ArchonError> {
+        self.link.client()?.cancel(agent, reason).await
+    }
+
+    async fn task_outcome(&self, task: &AetherTaskId) -> Result<Option<StageOutcome>, ArchonError> {
+        let task = self.link.client()?.get_task(task).await?;
+        Ok(task_outcome(&task))
+    }
+
+    async fn send_message(
+        &self,
+        to: &AetherAgentId,
+        content: &str,
+        idempotency_key: &str,
+    ) -> Result<(), ArchonError> {
+        self.link
+            .client()?
+            .send_message(to, content, idempotency_key)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use archon_core::model::{Effort, ModelChoice};
+
+    fn node_id() -> AetherAgentId {
+        AetherAgentId::parse("agt_node").unwrap()
+    }
+
+    fn request() -> SpawnRequest {
+        SpawnRequest {
+            idempotency_key: "stg_01".into(),
+            role: "archon-stage:quick-pr/implement".into(),
+            name: "implement · add a greeting".into(),
+            objective: "do it".into(),
+            instructions: "contract".into(),
+            choice: ModelChoice {
+                model: "claude-code/claude-opus-5-5".parse().unwrap(),
+                effort: Effort::High,
+            },
+            workspace: "/work/tree".into(),
+            repository: Some("repo".into()),
+            labels: [("archon.item".to_owned(), "qi_1".to_owned())].into(),
+            hidden_tools: vec!["mcp__archon__enqueue".into()],
+            leaf: true,
+            cost_budget_usd: Some(5.0),
+            aether_cost_budget: None,
+            deadline: None,
+            attach_run: None,
+            parent: Some(node_id()),
+            network: Some(NetworkPolicy::Denied),
+        }
+    }
+
+    fn node_request() -> RunNodeRequest {
+        RunNodeRequest {
+            idempotency_key: "prun_01:node:1".into(),
+            role: "archon-run:quick-pr".into(),
+            name: "add a greeting".into(),
+            model: "claude-code/claude-opus-5-5".parse().unwrap(),
+            workspace: "/work/tree".into(),
+            repository: Some("repo".into()),
+            network: NetworkPolicy::Denied,
+            labels: [("archon.item".to_owned(), "qi_1".to_owned())].into(),
+            attach_run: None,
+        }
+    }
+
+    #[test]
+    fn stage_agents_are_keyed_children_of_the_run_node_with_archon_tools_hidden() {
+        let create = stage_create_agent(&request(), NetworkPolicy::Denied);
+        assert_eq!(create.idempotency_key.as_deref(), Some("stg_01"));
+        assert_eq!(create.parent, Some(node_id()));
+        assert_eq!(create.name.as_deref(), Some("implement · add a greeting"));
+        let config = create.config.unwrap();
+        assert!(config.leaf && !config.long_lived);
+        assert_eq!(config.effort, Some(Effort::High));
+        assert!(
+            matches!(config.tools, ToolExposure::Except { ref names } if names.contains("mcp__archon__enqueue"))
+        );
+    }
+
+    #[test]
+    fn a_stage_without_a_node_is_still_a_root() {
+        let mut req = request();
+        req.parent = None;
+        req.network = None;
+        let create = stage_create_agent(&req, NetworkPolicy::Allowed);
+        assert!(create.parent.is_none());
+        let frame = serde_json::to_value(&create).unwrap();
+        assert!(frame.get("parent").is_none(), "absent, not null");
+        assert_eq!(frame["scope"]["network"], "allowed");
+    }
+
+    #[test]
+    fn stage_agents_state_network_and_gate_nothing() {
+        for network in [NetworkPolicy::Allowed, NetworkPolicy::Denied] {
+            let mut req = request();
+            req.network = Some(network);
+            let create = stage_create_agent(&req, network);
+            assert_eq!(create.scope.as_ref().map(|s| s.network), Some(network));
+            assert_eq!(create.approval, Some(ApprovalPolicy::none()));
+            let frame = serde_json::to_value(&create).unwrap();
+            assert_eq!(frame["approval"]["require_for"], serde_json::json!([]));
+        }
+        let mut req = request();
+        req.network = Some(NetworkPolicy::Allowed);
+        let allowed = serde_json::to_value(stage_create_agent(&req, NetworkPolicy::Allowed));
+        assert_eq!(allowed.unwrap()["scope"]["network"], "allowed");
+    }
+
+    #[test]
+    #[should_panic(expected = "sent as stored")]
+    fn a_persisted_network_is_never_overridden() {
+        stage_create_agent(&request(), NetworkPolicy::Allowed);
+    }
+
+    #[test]
+    fn run_nodes_are_passive_keyed_roots_that_stages_can_narrow() {
+        let node = run_node_create_agent(&node_request());
+        assert_eq!(node.idempotency_key.as_deref(), Some("prun_01:node:1"));
+        assert!(node.parent.is_none() && node.objective.is_none());
+        assert!(!node.start, "never scheduled: no turns, no spend");
+        assert_eq!(node.name.as_deref(), Some("add a greeting"));
+        let config = node.config.as_ref().unwrap();
+        assert!(!config.leaf, "a leaf could not take stage agents");
+        assert!(!config.long_lived && config.instructions.is_none());
+        let ToolExposure::Except { names } = &config.tools else {
+            panic!("a node hides Archon's tools: {:?}", config.tools);
+        };
+        assert!(names.contains("mcp__archon__enqueue"));
+        assert_eq!(names.len(), archon_core::mcp_tools::qualified_names().len());
+        let frame = serde_json::to_value(&node).unwrap();
+        assert_eq!(frame["start"], false);
+        assert_eq!(
+            frame["scope"]["network"], "denied",
+            "as the request recorded"
+        );
+        assert!(frame.get("objective").is_none());
+        let stage = stage_create_agent(&request(), NetworkPolicy::Denied);
+        let (node_scope, stage_scope) = (node.scope.unwrap(), stage.scope.unwrap());
+        assert_eq!(node_scope.workspace_root, stage_scope.workspace_root);
+        assert_eq!(node_scope.repository, stage_scope.repository);
+        assert_eq!(node_scope.network, stage_scope.network);
+        assert_eq!(node.approval, stage.approval, "equal gates narrow");
+    }
+
+    #[test]
+    fn liveness_follows_the_status_state() {
+        let mut agent: Agent = serde_json::from_value(crate::fake::agent("agt_1", None)).unwrap();
+        for state in LIVE_STATES {
+            agent.status = serde_json::json!({"state": state});
+            assert!(agent_is_live(&agent), "{state}");
+        }
+        for state in ["completed", "failed", "cancelled", "imported", "bogus"] {
+            agent.status = serde_json::json!({"state": state});
+            assert!(!agent_is_live(&agent), "{state}");
+        }
+        agent.status = serde_json::json!({});
+        assert_eq!(agent_state(&agent), "unknown");
+    }
+
+    #[test]
+    #[should_panic(expected = "absolute")]
+    fn relative_workspaces_are_a_bug() {
+        let mut req = request();
+        req.workspace = "relative".into();
+        stage_create_agent(&req, NetworkPolicy::Denied);
+    }
+
+    #[test]
+    #[should_panic(expected = "absolute")]
+    fn relative_node_workspaces_are_a_bug() {
+        let mut req = node_request();
+        req.workspace = "relative".into();
+        run_node_create_agent(&req);
+    }
+}

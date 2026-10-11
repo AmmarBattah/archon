@@ -1,0 +1,32 @@
+[package]
+name = "archon-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Benchmarks: Archon vs plain Aether vs claude -p vs codex exec"
+publish.workspace = true
+
+[[bin]]
+name = "archon-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+archon-aether = { workspace = true }
+archon-client = { workspace = true }
+archon-core = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+archon-aether = { workspace = true, features = ["fake"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

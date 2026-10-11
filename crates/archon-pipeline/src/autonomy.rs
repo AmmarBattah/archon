@@ -1,0 +1,266 @@
+//! The autonomy knobs applied to a pipeline (ARCHITECTURE §18): the stages
+//! `proposal` and `report` insert when the pipeline declares none, and the
+//! stages whose output waits for the operator.
+
+use archon_core::autonomy::{Autonomy, ProposalMode, ReportMode, ReviewLevel};
+use archon_core::catalog::{Gate, StageKind};
+use archon_core::error::ArchonError;
+use archon_core::run::GateSubject;
+
+use crate::spec::{PipelineSpec, StageSpec};
+
+pub const PROPOSE_STAGE: &str = "propose";
+pub const REPORT_STAGE: &str = "report";
+/// File names of the shared prompts inside a run's frozen snapshot.
+pub const PROPOSE_PROMPT: &str = "archon-propose.md";
+pub const REPORT_PROMPT: &str = "archon-report.md";
+const PROPOSE_TEMPLATE: &str = include_str!("../../../pipelines/_shared/propose.md");
+const REPORT_TEMPLATE: &str = include_str!("../../../pipelines/_shared/report.md");
+const INSERTED_TIMEOUT_MINUTES: u32 = 45;
+
+/// Whether the pipeline delivers a change: it has a ship stage.
+pub fn ships(spec: &PipelineSpec) -> bool {
+    ship_index(spec).is_some()
+}
+
+fn ship_index(spec: &PipelineSpec) -> Option<usize> {
+    spec.file
+        .stages
+        .iter()
+        .position(|s| s.kind == StageKind::Ship)
+}
+
+/// The review level a pipeline's gates amount to: gated tests and gated
+/// reviews are strict, either one alone standard, neither none.
+pub fn review_level(spec: &PipelineSpec) -> ReviewLevel {
+    let gated = |kind: StageKind| {
+        spec.file
+            .stages
+            .iter()
+            .any(|s| s.kind == kind && s.gate != Gate::None)
+    };
+    match (gated(StageKind::Review), gated(StageKind::Test)) {
+        (true, true) => ReviewLevel::Strict,
+        (true, false) | (false, true) => ReviewLevel::Standard,
+        (false, false) => ReviewLevel::None,
+    }
+}
+
+/// The pipeline's propose stage, which is always first when present.
+pub fn propose_stage(spec: &PipelineSpec) -> Option<&StageSpec> {
+    let first = spec.file.stages.first()?;
+    (first.kind == StageKind::Propose).then_some(first)
+}
+
+/// The change report: the last report stage before the ship stage.
+pub fn change_report_stage(spec: &PipelineSpec) -> Option<&StageSpec> {
+    let ship = ship_index(spec)?;
+    spec.file.stages[..ship]
+        .iter()
+        .rev()
+        .find(|s| s.kind == StageKind::Report)
+}
+
+/// `spec` with the stages `autonomy` needs and the pipeline does not
+/// declare: `propose` first, and `report` right before ship.
+pub fn augment(spec: &PipelineSpec, autonomy: &Autonomy) -> Result<PipelineSpec, ArchonError> {
+    let mut out = spec.clone();
+    let wants_proposal = autonomy.proposal == ProposalMode::Lavish;
+    if wants_proposal && propose_stage(spec).is_none() {
+        require_ship(spec, "proposal")?;
+        let stage = inserted(PROPOSE_STAGE, StageKind::Propose, PROPOSE_PROMPT);
+        insert(&mut out, 0, stage, PROPOSE_TEMPLATE)?;
+    }
+    if autonomy.report != ReportMode::Off && change_report_stage(spec).is_none() {
+        require_ship(spec, "report")?;
+        let at = ship_index(&out).expect("require_ship checked a ship stage");
+        let stage = inserted(REPORT_STAGE, StageKind::Report, REPORT_PROMPT);
+        insert(&mut out, at, stage, REPORT_TEMPLATE)?;
+    }
+    out.validate(spec.name())?;
+    assert!(out.file.stages.len() <= spec.file.stages.len() + 2);
+    Ok(out)
+}
+
+fn require_ship(spec: &PipelineSpec, knob: &str) -> Result<(), ArchonError> {
+    if ships(spec) {
+        return Ok(());
+    }
+    Err(ArchonError::Invalid(format!(
+        "{knob} applies only to pipelines that ship; {:?} has no ship stage",
+        spec.name()
+    )))
+}
+
+fn inserted(id: &str, kind: StageKind, prompt: &str) -> StageSpec {
+    StageSpec {
+        id: id.to_owned(),
+        kind,
+        prompt: prompt.to_owned(),
+        fan_out: 1,
+        gate: Gate::None,
+        timeout_minutes: INSERTED_TIMEOUT_MINUTES,
+        allow_delegation: false,
+        nudge: None,
+        on_fail: None,
+        roles: Vec::new(),
+        role_prompts: Default::default(),
+    }
+}
+
+fn insert(
+    spec: &mut PipelineSpec,
+    at: usize,
+    stage: StageSpec,
+    template: &str,
+) -> Result<(), ArchonError> {
+    if spec.stage(&stage.id).is_some() {
+        return Err(ArchonError::Pipeline(format!(
+            "pipeline {:?} already has a stage {:?} that is not a {:?} stage; rename it to use this knob",
+            spec.name(),
+            stage.id,
+            stage.kind
+        )));
+    }
+    if spec.prompts.contains_key(&stage.prompt) {
+        return Err(ArchonError::Pipeline(format!(
+            "pipeline {:?} has its own prompt file {:?}, which Archon reserves",
+            spec.name(),
+            stage.prompt
+        )));
+    }
+    assert!(at <= spec.file.stages.len(), "insert position in range");
+    spec.prompts
+        .insert(stage.prompt.clone(), template.to_owned());
+    spec.file.stages.insert(at, stage);
+    Ok(())
+}
+
+/// The stages whose passing output waits for the operator.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperatorGates {
+    /// The propose stage, when `proposal = lavish`.
+    pub proposal: Option<String>,
+    /// The change report stage, when `report = before-pr`.
+    pub report: Option<String>,
+}
+
+impl OperatorGates {
+    /// Gates for an augmented `spec`; knobs whose stage is missing gate
+    /// nothing, as [`augment`] has refused those already.
+    pub fn for_run(spec: &PipelineSpec, autonomy: &Autonomy) -> Self {
+        let proposal = (autonomy.proposal == ProposalMode::Lavish)
+            .then(|| propose_stage(spec).map(|s| s.id.clone()))
+            .flatten();
+        let report = (autonomy.report == ReportMode::BeforePr)
+            .then(|| change_report_stage(spec).map(|s| s.id.clone()))
+            .flatten();
+        Self { proposal, report }
+    }
+
+    pub fn subject(&self, stage_id: &str) -> Option<GateSubject> {
+        if self.proposal.as_deref() == Some(stage_id) {
+            return Some(GateSubject::Proposal);
+        }
+        if self.report.as_deref() == Some(stage_id) {
+            return Some(GateSubject::Report);
+        }
+        None
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.proposal.is_none() && self.report.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Catalog;
+
+    fn builtin_spec(name: &str) -> PipelineSpec {
+        Catalog::builtin().get(name).expect("built-in").clone()
+    }
+
+    fn knobs(proposal: ProposalMode, report: ReportMode) -> Autonomy {
+        Autonomy {
+            proposal,
+            report,
+            ..Autonomy::default()
+        }
+    }
+
+    #[test]
+    fn builtin_review_levels_match_their_family() {
+        for level in [
+            ReviewLevel::None,
+            ReviewLevel::Standard,
+            ReviewLevel::Strict,
+        ] {
+            let spec = builtin_spec(level.pipeline());
+            assert_eq!(review_level(&spec), level, "{}", level.pipeline());
+            assert!(ships(&spec));
+        }
+        assert!(!ships(&builtin_spec("ask")));
+    }
+
+    #[test]
+    fn knobs_insert_propose_first_and_report_before_ship() {
+        let spec = builtin_spec("default-pr-review");
+        let both = augment(&spec, &knobs(ProposalMode::Lavish, ReportMode::BeforePr)).unwrap();
+        let ids: Vec<&str> = both.file.stages.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["propose", "implement", "review", "report", "ship"]);
+        assert!(both.prompts.contains_key(PROPOSE_PROMPT));
+        let gates =
+            OperatorGates::for_run(&both, &knobs(ProposalMode::Lavish, ReportMode::BeforePr));
+        assert_eq!(gates.subject("propose"), Some(GateSubject::Proposal));
+        assert_eq!(gates.subject("report"), Some(GateSubject::Report));
+        let with_pr = knobs(ProposalMode::Off, ReportMode::WithPr);
+        let plain = augment(&spec, &with_pr).unwrap();
+        assert_eq!(plain.file.stages.len(), 4);
+        assert!(
+            OperatorGates::for_run(&plain, &with_pr).is_empty(),
+            "with-pr never waits"
+        );
+    }
+
+    #[test]
+    fn shared_page_prompts_scale_detail_without_changing_their_contracts() {
+        for (template, path) in [
+            (PROPOSE_TEMPLATE, ".archon/reports/proposal/index.html"),
+            (REPORT_TEMPLATE, ".archon/reports/change/index.html"),
+        ] {
+            for required in ["Goal", "Approach", "Risk", "Acceptance check", "Open"] {
+                assert!(template.contains(required), "missing {required} in prompt");
+            }
+            assert!(template.contains("few lines"));
+            assert!(template.contains(path));
+            assert!(template.contains("structured"));
+        }
+        assert!(PROPOSE_TEMPLATE.contains("previous proposal"));
+        assert!(REPORT_TEMPLATE.contains("review verdicts"));
+    }
+
+    #[test]
+    fn an_augmented_manifest_round_trips_through_toml() {
+        let spec = builtin_spec("strict-pr-review");
+        let both = augment(&spec, &knobs(ProposalMode::Lavish, ReportMode::BeforePr)).unwrap();
+        let text = toml::to_string(&both.file).unwrap();
+        let back: crate::spec::PipelineFile = toml::from_str(&text).unwrap();
+        assert_eq!(back, both.file);
+        assert_eq!(back.stages.len(), spec.file.stages.len() + 2);
+    }
+
+    #[test]
+    fn declared_stages_are_not_duplicated_and_non_shipping_pipelines_refuse() {
+        let spec = builtin_spec("default-pr-review");
+        let wanted = knobs(ProposalMode::Lavish, ReportMode::WithPr);
+        let once = augment(&spec, &wanted).unwrap();
+        let twice = augment(&once, &wanted).unwrap();
+        assert_eq!(once.file.stages, twice.file.stages);
+        let ask = builtin_spec("ask");
+        let err = augment(&ask, &wanted).unwrap_err().to_string();
+        assert!(err.contains("only to pipelines that ship"), "{err}");
+        assert_eq!(augment(&ask, &Autonomy::default()).unwrap(), ask);
+    }
+}

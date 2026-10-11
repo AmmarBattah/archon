@@ -1,0 +1,16 @@
+[pipeline]
+name = "ask"
+description = "Answer a question about a repository (or in general) without changing anything"
+version = 1
+workspace = "repo-readonly"
+requires_repo = false
+
+[nudges]
+tier = "balanced"
+notes = "Read-only research; step up to the strongest tier for deep architectural questions."
+
+[[stage]]
+id = "answer"
+kind = "work"
+prompt = "answer.md"
+timeout_minutes = 45

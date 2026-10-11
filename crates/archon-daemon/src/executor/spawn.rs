@@ -1,0 +1,905 @@
+//! Reserving and issuing stage agents. A reservation stores the exact
+//! `SpawnRequest` in `kv` and then persists a `spawning` stage run, so every
+//! `create_agent` for that stage run is byte-identical under one key. The
+//! run node it is parented under and its network are bound, and the bound
+//! request stored, the first time it is issued and before anything reaches
+//! Aether.
+
+use std::collections::BTreeMap;
+use std::time::Instant;
+
+use archon_aether::wire;
+use archon_core::Timestamp;
+use archon_core::aether_ids::AetherRunId;
+use archon_core::autonomy::ToolsMode;
+use archon_core::error::ArchonError;
+use archon_core::id::{PipelineRunId, StageRunId};
+use archon_core::ports::{SpawnRequest, SpawnedAgent};
+use archon_core::queue::QueueItem;
+use archon_core::run::{PipelineRun, StageOutcome, StageRun, StageState};
+use archon_pipeline::SpawnPlan;
+use archon_pipeline::spec::MAX_TIMEOUT_MINUTES;
+use archon_queue::Store;
+use serde::{Deserialize, Serialize};
+
+use super::{FollowUp, RunTable, finish, naming, run_node, settle, team};
+use crate::context::DaemonContext;
+use crate::disk::{self, FullDisk};
+use crate::resolve::{self, RepoEnv};
+
+const REQUEST_KEY_PREFIX: &str = "spawn_request:";
+/// `Protocol`, `Io` or Aether `internal` failures of one `create_agent`
+/// before the stage fails.
+const MAX_TRANSPORT_ERRORS: u32 = 5;
+/// Failures of one `create_agent` on a full disk before the stage and its
+/// run fail. Each waits out a disk-full hold, so they are minutes apart;
+/// the cap ends the loop when the full disk is one Archon cannot see.
+const MAX_DISK_FULL_SPAWNS: u32 = 5;
+
+/// The persisted spawn of one stage run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredSpawn {
+    pub request: SpawnRequest,
+    pub timeout_minutes: u32,
+    #[serde(default)]
+    pub parent: ParentBinding,
+    /// A team slot's worker; its worktree is `request.workspace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<StoredWorker>,
+}
+
+/// The branch a team slot's worker worktree must have checked out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoredWorker {
+    pub role: String,
+    pub branch: String,
+}
+
+/// Whether `request.parent` is final. Aether fingerprints the whole
+/// `create_agent` frame under its key, so once a request may have reached
+/// Aether its parent can never change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParentBinding {
+    /// The parent in the request is what Aether was, or will be, sent. A
+    /// record from before run nodes existed has no field and is bound to
+    /// no parent: Aether may already hold that stage agent as a root.
+    #[default]
+    Bound,
+    /// Reserved and never issued: bound to the run's node at first issue.
+    Pending,
+}
+
+fn request_key(id: &StageRunId) -> String {
+    format!("{REQUEST_KEY_PREFIX}{id}")
+}
+
+pub(crate) fn load_spawn(store: &Store, id: &StageRunId) -> Result<StoredSpawn, ArchonError> {
+    let raw = store
+        .kv_get(&request_key(id))?
+        .ok_or_else(|| ArchonError::NotFound(format!("spawn request of stage run {id}")))?;
+    let stored: StoredSpawn = serde_json::from_str(&raw)
+        .map_err(|e| ArchonError::Store(format!("spawn request of stage run {id}: {e}")))?;
+    assert_eq!(
+        stored.request.idempotency_key,
+        id.as_str(),
+        "spawn request stored under another stage run"
+    );
+    Ok(stored)
+}
+
+fn save_spawn(store: &mut Store, id: &StageRunId, spawn: &StoredSpawn) -> Result<(), ArchonError> {
+    assert_eq!(spawn.request.idempotency_key, id.as_str());
+    store.kv_set(&request_key(id), &serde_json::to_string(spawn)?)
+}
+
+/// Delete the stored requests of stage runs that settled, since nothing
+/// reads a request once its stage is terminal, and of stage runs never
+/// recorded (a crash inside `reserve_one`). Returns how many went.
+pub(crate) fn prune_settled_requests(store: &mut Store) -> Result<usize, ArchonError> {
+    let mut pruned = 0;
+    for (key, _) in store.kv_prefix(REQUEST_KEY_PREFIX)? {
+        let raw = key
+            .strip_prefix(REQUEST_KEY_PREFIX)
+            .expect("ranged by prefix");
+        let id = StageRunId::parse(raw)
+            .map_err(|e| ArchonError::Store(format!("spawn request key {key}: {e}")))?;
+        let settled = match store.stage_run(&id) {
+            Ok(stage) => stage.state.is_terminal(),
+            Err(ArchonError::NotFound(_)) => true,
+            Err(error) => return Err(error),
+        };
+        if settled {
+            store.kv_delete(&key)?;
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
+/// Whether no `create_agent` was ever sent for stage run `id`: its spawn is
+/// not bound yet, or missing, which `claim` settles without Aether.
+pub(super) fn never_sent(store: &Store, id: &StageRunId) -> Result<bool, ArchonError> {
+    match load_spawn(store, id) {
+        Ok(spawn) => {
+            let pending = spawn.parent == ParentBinding::Pending;
+            assert!(
+                !pending || spawn.request.parent.is_none(),
+                "an unbound spawn names no node"
+            );
+            Ok(pending)
+        }
+        Err(ArchonError::NotFound(_)) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// The Aether run each `spawning` stage's agent joins, for the stages
+/// whose create may have reached Aether already; `None` where that run is
+/// not known yet. A stage not yet bound to its node was never sent.
+pub(crate) fn runs_awaiting_spawn(store: &Store) -> Result<Vec<Option<AetherRunId>>, ArchonError> {
+    let mut runs = Vec::new();
+    for stage in store.live_stage_runs()? {
+        if stage.state != StageState::Spawning {
+            continue;
+        }
+        let spawn = match load_spawn(store, &stage.id) {
+            Ok(spawn) => spawn,
+            // `claim` fails such a stage before anything is sent.
+            Err(ArchonError::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        if spawn.parent == ParentBinding::Pending {
+            assert!(spawn.request.parent.is_none(), "unbound yet names a node");
+            continue;
+        }
+        let joins = match &spawn.request.parent {
+            // Its node's run, recorded with the node before it was bound.
+            Some(_) => store.run(&stage.run)?.aether_run,
+            // A root from before run nodes: the run it attached to, if any.
+            None => spawn.request.attach_run.clone(),
+        };
+        runs.push(joins);
+    }
+    Ok(runs)
+}
+
+/// The stage deadline: exactly `timeout_minutes` after `start`. Pipelines
+/// load only with `1..=MAX_TIMEOUT_MINUTES`, so nothing is clamped here.
+pub(crate) fn deadline(start: Timestamp, timeout_minutes: u32) -> Timestamp {
+    assert!(
+        (1..=MAX_TIMEOUT_MINUTES).contains(&timeout_minutes),
+        "pipeline validation bounds timeout_minutes, got {timeout_minutes}"
+    );
+    let timeout = chrono::Duration::minutes(i64::from(timeout_minutes));
+    let deadline = start
+        .checked_add_signed(timeout)
+        .expect("30 days past a stage's start is a representable time");
+    debug_assert!(deadline > start);
+    deadline
+}
+
+/// What is left of the item's budget (its own, else the per-item cap);
+/// `None` when neither is set.
+pub(crate) fn budget_left(
+    store: &Store,
+    item: &QueueItem,
+    per_item_cap: f64,
+    estimates: bool,
+) -> Result<Option<f64>, ArchonError> {
+    let budget = item.budget_usd.unwrap_or(per_item_cap);
+    assert!(budget.is_finite() && budget >= 0.0, "budgets are validated");
+    if budget == 0.0 {
+        return Ok(None);
+    }
+    let spent = store.spend_for_item(&item.id, estimates)?;
+    Ok(Some(budget - spent))
+}
+
+/// Why the run cannot take more agents.
+struct Exhausted {
+    stage: String,
+    error: String,
+}
+
+/// Move up to `slots` pending spawns of `run` into `spawning` stage runs.
+pub(super) async fn reserve(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    run: &PipelineRunId,
+    slots: u32,
+) -> Result<FollowUp, ArchonError> {
+    assert!(slots > 0, "the planner grants at least one slot");
+    let Some(queue) = table.pending.get_mut(run) else {
+        return Ok(FollowUp::default());
+    };
+    let take = queue.len().min(slots as usize);
+    let plans: Vec<SpawnPlan> = queue.drain(..take).collect();
+    if queue.is_empty() {
+        table.pending.remove(run);
+    }
+    let per_item_cap = resolve::caps(ctx).await.budget_usd_per_item;
+    let reserved = {
+        let mut store = ctx.store.lock().await;
+        reserve_plans(ctx, &mut store, run, plans, per_item_cap)?
+    };
+    match reserved {
+        Ok(ids) => Ok(FollowUp {
+            issue: ids,
+            ..FollowUp::default()
+        }),
+        Err(exhausted) => {
+            let run = ctx.store.lock().await.run(run)?;
+            finish::fail_run(ctx, table, run, exhausted.stage, exhausted.error, true).await
+        }
+    }
+}
+
+fn reserve_plans(
+    ctx: &DaemonContext,
+    store: &mut Store,
+    run_id: &PipelineRunId,
+    plans: Vec<SpawnPlan>,
+    per_item_cap: f64,
+) -> Result<Result<Vec<StageRunId>, Exhausted>, ArchonError> {
+    let run = store.run(run_id)?;
+    if run.state.is_terminal() || plans.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    let item = store.item(&run.item)?;
+    let repo = item
+        .repo
+        .as_ref()
+        .map(|id| store.repo(&resolve::repo_ref(id)))
+        .transpose()?;
+    let estimates = ctx.config.limits.count_estimated_cost;
+    let budget = budget_left(store, &item, per_item_cap, estimates)?;
+    if let Some(left) = budget.filter(|left| *left <= 0.0) {
+        let error = format!(
+            "BLOCKED: the item's budget is used up ({} over); raise it with update_item or retry",
+            archon_core::cost::format_usd(-left)
+        );
+        let stage = plans[0].stage_id.clone();
+        return Ok(Err(Exhausted { stage, error }));
+    }
+    let existing = store.stage_runs(run_id)?;
+    let mut ids = Vec::new();
+    for plan in plans {
+        // The driver only emits empty slots; a filled one means a bug upstream.
+        if existing.iter().any(|s| same_slot(s, &plan)) {
+            tracing::error!(run = %run_id, stage = plan.stage_id, fan = plan.fan_index, "slot already has a stage run; not spawning it twice");
+            continue;
+        }
+        let target = Target {
+            run: &run,
+            item: &item,
+            repo_name: repo.as_ref().map(|r| r.name.as_str()),
+        };
+        let share = slot_budget(budget, &plan);
+        ids.push(reserve_one(
+            store,
+            &target,
+            &plan,
+            share,
+            archon_core::now(),
+            None,
+        )?);
+    }
+    Ok(Ok(ids))
+}
+
+fn same_slot(stage: &StageRun, plan: &SpawnPlan) -> bool {
+    stage.stage_id == plan.stage_id
+        && stage.attempt == plan.attempt
+        && stage.fan_index == plan.fan_index
+}
+
+pub(super) fn same_slot_as(a: &StageRun, b: &StageRun) -> bool {
+    a.run == b.run
+        && a.stage_id == b.stage_id
+        && a.attempt == b.attempt
+        && a.fan_index == b.fan_index
+}
+
+/// The run a spawn belongs to.
+struct Target<'a> {
+    run: &'a PipelineRun,
+    item: &'a QueueItem,
+    repo_name: Option<&'a str>,
+}
+
+/// Persist the exact request, then the `spawning` stage run that owns it,
+/// with the slot's `budget`. `retry` numbers an infrastructure replacement
+/// of the slot.
+fn reserve_one(
+    store: &mut Store,
+    target: &Target<'_>,
+    plan: &SpawnPlan,
+    budget: Option<f64>,
+    now: Timestamp,
+    retry: Option<usize>,
+) -> Result<StageRunId, ArchonError> {
+    let id = StageRunId::new();
+    let request = build_request(target, plan, &id, budget, now, retry);
+    let spawn = StoredSpawn {
+        request,
+        timeout_minutes: plan.timeout_minutes,
+        parent: ParentBinding::Pending,
+        team: plan.team.as_ref().map(|slot| StoredWorker {
+            role: slot.role.clone(),
+            branch: slot.branch.clone(),
+        }),
+    };
+    save_spawn(store, &id, &spawn)?;
+    let stage = StageRun {
+        id: id.clone(),
+        run: target.run.id.clone(),
+        stage_id: plan.stage_id.clone(),
+        attempt: plan.attempt,
+        fan_index: plan.fan_index,
+        choice: plan.choice.clone(),
+        aether_agent: None,
+        aether_task: None,
+        state: StageState::Spawning,
+        verdict: None,
+        summary: None,
+        structured: None,
+        cost_usd: 0.0,
+        started_at: now,
+        finished_at: None,
+    };
+    store.upsert_stage_run(&stage)?;
+    Ok(id)
+}
+
+/// A team slot's share of what is left: the remainder split evenly across
+/// the stage's slots, so the roles together cannot overspend it.
+fn slot_budget(budget: Option<f64>, plan: &SpawnPlan) -> Option<f64> {
+    assert!(plan.fan_count >= 1, "a stage has at least one slot");
+    assert!(
+        budget.is_none_or(f64::is_finite),
+        "budgets are finite amounts"
+    );
+    match plan.team {
+        Some(_) => budget.map(|left| left / f64::from(plan.fan_count)),
+        None => budget,
+    }
+}
+
+/// Stage agents are headless, so the backend creates them with an approval
+/// policy that gates nothing (`stage_create_agent`); `yolo` also lets them
+/// delegate. The name is for people; the labels carry the exact identity.
+fn build_request(
+    target: &Target<'_>,
+    plan: &SpawnPlan,
+    id: &StageRunId,
+    budget: Option<f64>,
+    now: Timestamp,
+    retry: Option<usize>,
+) -> SpawnRequest {
+    let (run, item) = (target.run, target.item);
+    assert!(run.workspace.is_absolute(), "run workspaces are absolute");
+    let workspace = match &plan.team {
+        Some(slot) => slot.workspace.clone(),
+        None => run.workspace.clone(),
+    };
+    assert!(
+        run.team_root
+            .as_ref()
+            .is_none_or(|root| workspace.starts_with(root)),
+        "a team run's agents work under its team directory"
+    );
+    let labels: BTreeMap<String, String> = [
+        ("archon.item", item.id.to_string()),
+        ("archon.run", run.id.to_string()),
+        ("archon.stage", plan.stage_id.clone()),
+        ("archon.stage_run", id.to_string()),
+        ("archon.attempt", plan.attempt.to_string()),
+        ("archon.fan", plan.fan_index.to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    SpawnRequest {
+        idempotency_key: id.as_str().to_owned(),
+        role: format!("archon-stage:{}/{}", run.pipeline, plan.stage_id),
+        name: naming::stage_agent_name(&item.id, plan, retry, &item.title),
+        objective: plan.prompt.clone(),
+        instructions: plan.instructions.clone(),
+        choice: plan.choice.clone(),
+        workspace,
+        repository: target.repo_name.map(str::to_owned),
+        labels,
+        hidden_tools: hidden_tools(item.autonomy.tools),
+        // Delegated workspaces are full copies (77 GB seen once), so the
+        // item's `tools`, not the pipeline, decides; see `StageSpec::allow_delegation`.
+        leaf: item.autonomy.tools != ToolsMode::Yolo,
+        cost_budget_usd: budget,
+        aether_cost_budget: None,
+        deadline: Some(deadline(now, plan.timeout_minutes)),
+        attach_run: run.aether_run.clone(),
+        parent: None,
+        network: None,
+    }
+}
+
+/// Messaging stays available in every mode; other mutations are hidden.
+fn hidden_tools(tools: ToolsMode) -> Vec<String> {
+    let hidden = match tools {
+        ToolsMode::Guarded => archon_core::mcp_tools::qualified_names(),
+        ToolsMode::Yolo => archon_core::mcp_tools::mutating_names(),
+    };
+    assert!(
+        !hidden.is_empty(),
+        "stage agents never act for the orchestrator"
+    );
+    hidden
+        .into_iter()
+        .filter(|name| name != &archon_core::mcp_tools::qualified("message_orchestrator"))
+        .collect()
+}
+
+/// A replacement for a stage run lost to an infrastructure failure: the
+/// slot's plan under a fresh key, deadline and budget, started strictly
+/// after `failed` so it supersedes it. `None` when the budget, or a team
+/// slot's share of it, is used up.
+pub(super) fn reserve_replacement(
+    ctx: &DaemonContext,
+    store: &mut Store,
+    failed: &StageRun,
+    plan: &SpawnPlan,
+    retry: usize,
+    per_item_cap: f64,
+) -> Result<Option<StageRunId>, ArchonError> {
+    assert!(
+        same_slot(failed, plan),
+        "a replacement fills the failed slot"
+    );
+    assert!(retry >= 1, "retries are counted from one");
+    let run = store.run(&failed.run)?;
+    assert!(!run.state.is_terminal(), "replacements join live runs only");
+    let item = store.item(&run.item)?;
+    let estimates = ctx.config.limits.count_estimated_cost;
+    let budget = budget_left(store, &item, per_item_cap, estimates)?;
+    if budget.is_some_and(|left| left <= 0.0) {
+        return Ok(None);
+    }
+    let repo = item
+        .repo
+        .as_ref()
+        .map(|id| store.repo(&resolve::repo_ref(id)))
+        .transpose()?;
+    let target = Target {
+        run: &run,
+        item: &item,
+        repo_name: repo.as_ref().map(|r| r.name.as_str()),
+    };
+    let Some(budget) = replacement_budget(store, failed, plan, budget, estimates)? else {
+        return Ok(None);
+    };
+    let started = archon_core::now().max(failed.started_at + chrono::Duration::microseconds(1));
+    let id = reserve_one(store, &target, plan, budget, started, Some(retry))?;
+    Ok(Some(id))
+}
+
+/// A replacement's budget, from what is `left` of the item's: a team slot
+/// keeps what its failed agent left of its share, since its siblings hold
+/// theirs. `None` when that share is used up.
+fn replacement_budget(
+    store: &Store,
+    failed: &StageRun,
+    plan: &SpawnPlan,
+    left: Option<f64>,
+    estimates: bool,
+) -> Result<Option<Option<f64>>, ArchonError> {
+    assert!(
+        left.is_none_or(|left| left > 0.0),
+        "only a live budget is split"
+    );
+    if plan.team.is_none() {
+        return Ok(Some(left));
+    }
+    let Some(granted) = load_spawn(store, &failed.id)?.request.cost_budget_usd else {
+        return Ok(Some(slot_budget(left, plan)));
+    };
+    assert!(granted.is_finite(), "budgets are finite amounts");
+    let spent = match &failed.aether_agent {
+        Some(agent) => store.spend_for_agent(agent, estimates)?,
+        None => 0.0,
+    };
+    let unspent = granted - spent.max(failed.cost_usd);
+    if unspent <= 0.0 {
+        return Ok(None);
+    }
+    let share = left.map_or(unspent, |left| left.min(unspent));
+    debug_assert!(share > 0.0 && share <= granted);
+    Ok(Some(Some(share)))
+}
+
+/// A stage run claimed for one `create_agent`.
+struct Claim {
+    stage: StageRun,
+    spawn: StoredSpawn,
+    /// The effective model policy's verdict on the request, taken now.
+    allowed: Result<(), ArchonError>,
+    run_finished: bool,
+    /// A team slot's worktree, made ready before its agent is created.
+    worker: Option<team::Worker>,
+}
+
+impl Claim {
+    /// Nothing was ever sent for it and its run is over: settle it without
+    /// Aether instead of creating an agent only to cancel it.
+    fn unsent_for_finished_run(&self) -> bool {
+        self.run_finished && self.spawn.parent == ParentBinding::Pending
+    }
+}
+
+/// How a claim attempt ended.
+enum Claimed {
+    /// Another task is issuing it, or it is no longer `spawning`.
+    Skip,
+    Issue(Box<Claim>),
+    /// It could not be issued and was settled as failed instead.
+    Settled(Box<FollowUp>),
+}
+
+/// Issue `create_agent` for one `spawning` stage run unless another task
+/// already is. Safe to repeat: the stage run id is the idempotency key.
+pub(super) async fn issue(ctx: &DaemonContext, id: &StageRunId) -> Result<FollowUp, ArchonError> {
+    let claim = match claim(ctx, id).await? {
+        Claimed::Skip => return Ok(FollowUp::default()),
+        Claimed::Settled(follow) => return Ok(*follow),
+        Claimed::Issue(claim) => claim,
+    };
+    let unsent = claim.unsent_for_finished_run();
+    let Claim {
+        stage,
+        spawn,
+        allowed,
+        worker,
+        ..
+    } = *claim;
+    // Only a spawn never sent prepares its worktree: once its request may
+    // have reached Aether, a live agent may be working in it.
+    let prepare = allowed.is_ok() && !unsent && spawn.parent == ParentBinding::Pending;
+    if let Some(worker) = worker.filter(|_| prepare)
+        && let Err(error) = team::ready_worker(ctx, worker).await
+    {
+        let mut table = ctx.runs.lock().await;
+        let was_claimed = table.in_flight.remove(id);
+        assert!(was_claimed, "stage run {id} was prepared without a claim");
+        let error = format!("preparing the role's worktree failed: {error}");
+        return refuse(ctx, &mut table, &stage, error).await;
+    }
+    let result = match allowed {
+        Ok(()) if unsent => None,
+        Ok(()) => Some(spawn_bound(ctx, &stage, spawn).await),
+        Err(refusal) => Some(Err(refusal)),
+    };
+    let mut table = ctx.runs.lock().await;
+    let was_claimed = table.in_flight.remove(id);
+    assert!(was_claimed, "stage run {id} was issued without a claim");
+    match result {
+        Some(result) => record(ctx, &mut table, &stage, result).await,
+        None => cancel_unsent(ctx, &mut table, &stage).await,
+    }
+}
+
+/// Every new stage agent is a child of its run's node (§4.5). The node is
+/// bound the first time the spawn is issued, and the bound request is
+/// stored before it is sent, so every retry repeats the frame Aether
+/// fingerprints under the key. Its network is the narrower of the node's
+/// and Aether's default now: it may not widen its parent, nor exceed a
+/// default the operator tightened mid-run. A request bound already,
+/// including one stored before run nodes existed, is sent as stored.
+async fn spawn_bound(
+    ctx: &DaemonContext,
+    stage: &StageRun,
+    mut spawn: StoredSpawn,
+) -> Result<SpawnedAgent, ArchonError> {
+    if spawn.request.cost_budget_usd.is_some() {
+        let unresolved = spawn.request.aether_cost_budget.is_none();
+        ctx.backend
+            .prepare_spawn(&mut spawn.request, ctx.config.limits.count_estimated_cost)
+            .await?;
+        if unresolved {
+            save_spawn(&mut *ctx.store.lock().await, &stage.id, &spawn)?;
+        }
+    }
+    if spawn.parent == ParentBinding::Pending {
+        assert!(
+            spawn.request.parent.is_none() && spawn.request.network.is_none(),
+            "a pending binding names no parent and no network"
+        );
+        let default = ctx.backend.network_default().await?;
+        let model = &spawn.request.choice.model;
+        let node = run_node::ensure(ctx, &stage.run, model, default).await?;
+        let network = node.network.narrower(default);
+        spawn.request.parent = Some(node.agent);
+        spawn.request.network = Some(network);
+        spawn.parent = ParentBinding::Bound;
+        save_spawn(&mut *ctx.store.lock().await, &stage.id, &spawn)?;
+    }
+    ctx.backend.spawn(spawn.request).await
+}
+
+/// A `spawning` stage of a finished run with no agent: its create was
+/// never sent, or Aether refused it.
+async fn cancel_unsent(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    stage: &StageRun,
+) -> Result<FollowUp, ArchonError> {
+    assert_eq!(
+        stage.state,
+        StageState::Spawning,
+        "only a spawn is cancelled unsent"
+    );
+    tracing::info!(stage = %stage.id, "run finished before its stage agent was created; not creating it");
+    let outcome = StageOutcome::Cancelled {
+        reason: Some(format!("pipeline run {} finished", stage.run)),
+    };
+    let mut follow = settle::settle_locked(ctx, table, &stage.id, outcome).await?;
+    // It may have been the run's last live stage: let `stop_run` retire the node.
+    follow.stop.push(stage.run.clone());
+    Ok(follow)
+}
+
+async fn claim(ctx: &DaemonContext, id: &StageRunId) -> Result<Claimed, ArchonError> {
+    let mut table = ctx.runs.lock().await;
+    if table.in_flight.contains(id) {
+        return Ok(Claimed::Skip);
+    }
+    let (stage, spawn, repo, run) = {
+        let store = ctx.store.lock().await;
+        let stage = store.stage_run(id)?;
+        if stage.state != StageState::Spawning {
+            return Ok(Claimed::Skip);
+        }
+        let run = store.run(&stage.run)?;
+        let item = store.item(&run.item)?;
+        let repo = item
+            .repo
+            .as_ref()
+            .map(|r| store.repo(&resolve::repo_ref(r)))
+            .transpose()?;
+        (stage, load_spawn(&store, id), repo, run)
+    };
+    let spawn = match spawn {
+        Ok(spawn) => spawn,
+        Err(ArchonError::NotFound(what)) => {
+            let error = format!("cannot spawn: {what} is missing from the store");
+            let refused = StageOutcome::Failed {
+                error,
+                infra: false,
+            };
+            let follow = settle::settle_locked(ctx, &mut table, id, refused).await?;
+            return Ok(Claimed::Settled(Box::new(follow)));
+        }
+        Err(e) => return Err(e),
+    };
+    let worker = spawn.team.as_ref().map(|slot| team::Worker {
+        item: run.item.clone(),
+        run: run.id.clone(),
+        repo_path: repo.as_ref().map(|r| r.path.clone()),
+        run_tree: run.workspace.clone(),
+        path: spawn.request.workspace.clone(),
+        branch: slot.branch.clone(),
+        start: run.branch.clone(),
+    });
+    let allowed = RepoEnv::new(repo)
+        .map_err(|e| ArchonError::Policy(format!("repository model policy unreadable: {e}")))
+        .and_then(|env| env.policy(&ctx.config).check(&spawn.request.choice));
+    table.in_flight.insert(id.clone());
+    Ok(Claimed::Issue(Box::new(Claim {
+        stage,
+        spawn,
+        allowed,
+        run_finished: run.state.is_terminal(),
+        worker,
+    })))
+}
+
+async fn record(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    stage: &StageRun,
+    result: Result<SpawnedAgent, ArchonError>,
+) -> Result<FollowUp, ArchonError> {
+    let error = match result {
+        Ok(spawned) => {
+            table.spawn_errors.remove(&stage.id);
+            ctx.disk.agent_created();
+            return spawned_ok(ctx, stage, spawned).await;
+        }
+        Err(error) => error,
+    };
+    match error {
+        ArchonError::Unavailable(why) => {
+            tracing::info!(stage = %stage.id, %why, "create_agent unanswered; retrying under the same key");
+            Ok(FollowUp::default())
+        }
+        error if error.is_store() => Err(error),
+        error if disk::is_disk_full(&error.to_string()) => {
+            disk_full(ctx, table, stage, error).await
+        }
+        ArchonError::Protocol(_) | ArchonError::Io { .. } => {
+            retry_or_refuse(ctx, table, stage, error).await
+        }
+        error if wire::is_internal(&error) => retry_or_refuse(ctx, table, stage, error).await,
+        ArchonError::Policy(_) => policy_refusal(ctx, table, stage, error).await,
+        other => {
+            refuse(
+                ctx,
+                table,
+                stage,
+                format!("Aether refused create_agent: {other}"),
+            )
+            .await
+        }
+    }
+}
+
+/// A transport failure, or a failure inside Aether (`internal`): retried
+/// under the same key up to [`MAX_TRANSPORT_ERRORS`] times, then refused.
+async fn retry_or_refuse(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    stage: &StageRun,
+    error: ArchonError,
+) -> Result<FollowUp, ArchonError> {
+    assert!(!error.is_store(), "a store failure is never retried here");
+    assert_eq!(stage.state, StageState::Spawning, "only a spawn is retried");
+    let errors = table.spawn_errors.entry(stage.id.clone()).or_default();
+    errors.transport += 1;
+    if errors.transport < MAX_TRANSPORT_ERRORS {
+        tracing::warn!(stage = %stage.id, %error, "create_agent failed; retrying under the same key");
+        return Ok(FollowUp::default());
+    }
+    table.spawn_errors.remove(&stage.id);
+    refuse(
+        ctx,
+        table,
+        stage,
+        format!("create_agent kept failing: {error}"),
+    )
+    .await
+}
+
+/// `create_agent` failed on a full disk: dispatch holds until space is
+/// free, and the sweep then issues it again under the same key, up to
+/// [`MAX_DISK_FULL_SPAWNS`] times before the stage fails with a `Blocker`.
+/// A finished run needs no agent: its stage is settled `cancelled` at once,
+/// which is safe as Aether refused the create and it is never sent again.
+async fn disk_full(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    stage: &StageRun,
+    error: ArchonError,
+) -> Result<FollowUp, ArchonError> {
+    assert!(!error.is_store(), "a store failure is never retried here");
+    assert_eq!(stage.state, StageState::Spawning, "only a spawn is retried");
+    let error = error.to_string();
+    ctx.disk
+        .report_full(&error, FullDisk::Aether, Instant::now());
+    if ctx.store.lock().await.run(&stage.run)?.state.is_terminal() {
+        tracing::info!(stage = %stage.id, %error, "create_agent of a finished run hit a full disk; not retrying it");
+        table.spawn_errors.remove(&stage.id);
+        return cancel_unsent(ctx, table, stage).await;
+    }
+    let errors = table.spawn_errors.entry(stage.id.clone()).or_default();
+    errors.disk_full += 1;
+    let failures = errors.disk_full;
+    if failures < MAX_DISK_FULL_SPAWNS {
+        tracing::warn!(stage = %stage.id, %error, failures, "create_agent hit a full disk; it waits for space");
+        return Ok(FollowUp::poke());
+    }
+    table.spawn_errors.remove(&stage.id);
+    let message = format!(
+        "create_agent failed on a full disk {failures} times ({error}). Archon's own disk \
+         had room each time it retried, so the full disk is likely Aether's: free space \
+         there, then retry the item"
+    );
+    fail_stage_and_run(ctx, table, stage, message).await
+}
+
+/// A refused spawn fails the stage; the driver decides what that means.
+async fn refuse(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    stage: &StageRun,
+    error: String,
+) -> Result<FollowUp, ArchonError> {
+    tracing::warn!(stage = %stage.id, %error, "stage spawn refused");
+    let outcome = StageOutcome::Failed {
+        error,
+        infra: false,
+    };
+    settle::settle_locked(ctx, table, &stage.id, outcome).await
+}
+
+/// A model outside the policy never reaches Aether: the stage and its run
+/// fail with a `Blocker`, since only the operator can resolve it.
+async fn policy_refusal(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    stage: &StageRun,
+    error: ArchonError,
+) -> Result<FollowUp, ArchonError> {
+    assert!(matches!(error, ArchonError::Policy(_)));
+    let message = format!("stage {} refused at spawn: {error}", stage.stage_id);
+    fail_stage_and_run(ctx, table, stage, message).await
+}
+
+/// Fail a spawning stage and its run with a `Blocker`, as only the operator
+/// can resolve why its agent cannot be created. A run already finished is
+/// stopped instead, which retires it once no stage is left.
+async fn fail_stage_and_run(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    stage: &StageRun,
+    message: String,
+) -> Result<FollowUp, ArchonError> {
+    assert!(!message.trim().is_empty(), "a failed stage says why");
+    let run = {
+        let mut store = ctx.store.lock().await;
+        let mut failed = store.stage_run(&stage.id)?;
+        if failed.state.is_terminal() {
+            return Ok(FollowUp::default());
+        }
+        failed.state = StageState::Failed {
+            error: message.clone(),
+        };
+        failed.finished_at = Some(archon_core::now());
+        store.upsert_stage_run(&failed)?;
+        store.run(&stage.run)?
+    };
+    assert_eq!(run.id, stage.run, "the stage run belongs to its run");
+    if run.state.is_terminal() {
+        return Ok(FollowUp {
+            stop: vec![run.id],
+            poke: true,
+            ..FollowUp::default()
+        });
+    }
+    finish::fail_run(ctx, table, run, stage.stage_id.clone(), message, true).await
+}
+
+/// Record the agent and task; a finished run stops the new agent at once.
+async fn spawned_ok(
+    ctx: &DaemonContext,
+    stage: &StageRun,
+    spawned: SpawnedAgent,
+) -> Result<FollowUp, ArchonError> {
+    let mut store = ctx.store.lock().await;
+    let mut current = store.stage_run(&stage.id)?;
+    if current.state != StageState::Spawning {
+        tracing::error!(stage = %stage.id, agent = %spawned.agent, "spawned agent for a settled stage run; cancelling it");
+        let reason = "stage run already settled".to_owned();
+        return Ok(FollowUp {
+            cancel_agents: vec![(spawned.agent, reason)],
+            ..FollowUp::default()
+        });
+    }
+    current.aether_agent = Some(spawned.agent);
+    current.aether_task = Some(spawned.task.clone());
+    current.state = StageState::Running;
+    store.upsert_stage_run(&current)?;
+    let mut run = store.run(&stage.run)?;
+    if run.state.is_terminal() {
+        return Ok(FollowUp {
+            stop: vec![run.id],
+            ..FollowUp::default()
+        });
+    }
+    if run.aether_run.is_none() {
+        run.aether_run = Some(spawned.run);
+        store.update_run(&run)?;
+    }
+    Ok(FollowUp {
+        check: vec![(current.id, spawned.task)],
+        roster: vec![run.id],
+        ..FollowUp::default()
+    })
+}

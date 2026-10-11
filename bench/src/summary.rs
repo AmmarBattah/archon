@@ -1,0 +1,445 @@
+//! Aggregation of `results.jsonl` into `summary.md` and the chart-ready
+//! `chart.json`: mean ± sample stdev per metric, success rate and pass@k.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::Path;
+
+use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
+
+use crate::metrics::{Arm, RunManifest, TrialResult};
+
+/// Mean and sample standard deviation of `n` values (stdev 0 when n = 1).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Stat {
+    pub n: usize,
+    pub mean: f64,
+    pub stdev: f64,
+}
+
+impl Stat {
+    pub fn of(values: &[f64]) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "non-finite metric in {values:?}"
+        );
+        let n = values.len();
+        let mean = values.iter().sum::<f64>() / n as f64;
+        let variance = if n < 2 {
+            0.0
+        } else {
+            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64
+        };
+        Some(Self {
+            n,
+            mean,
+            stdev: variance.sqrt(),
+        })
+    }
+}
+
+/// Unbiased pass@k (Chen et al. 2021): the chance that at least one of k
+/// trials drawn without replacement from n, of which c passed, passes.
+pub fn pass_at_k(n: u32, c: u32, k: u32) -> f64 {
+    assert!(c <= n, "{c} passes out of {n} trials");
+    assert!((1..=n).contains(&k), "k = {k} must be within 1..={n}");
+    if n - c < k {
+        return 1.0;
+    }
+    let all_fail: f64 = ((n - c + 1)..=n)
+        .map(|i| 1.0 - f64::from(k) / f64::from(i))
+        .product();
+    1.0 - all_fail
+}
+
+/// One arm over a set of trials (a whole run, or one task).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Aggregate {
+    pub arm: Arm,
+    pub model: String,
+    /// Graded trials: infrastructure failures are not among them.
+    pub trials: u32,
+    pub successes: u32,
+    /// Infrastructure failures left out of every other field.
+    pub infra: u32,
+    pub timeouts: u32,
+    pub success_rate: f64,
+    /// Mean over tasks of per-task pass@1 and pass@k.
+    pub pass_at_1: f64,
+    pub pass_at_k: f64,
+    pub score: Stat,
+    pub wall_secs: Stat,
+    pub input_tokens: Option<Stat>,
+    pub output_tokens: Option<Stat>,
+    pub cost_usd: Option<Stat>,
+    pub operator_messages: Stat,
+}
+
+impl Aggregate {
+    /// `all` must be for `arm`; pass@k is per task, then averaged. `None`
+    /// when no trial was graded (every one was an infrastructure failure).
+    pub fn of(arm: Arm, all: &[&TrialResult], k: u32) -> Option<Self> {
+        assert!(
+            all.iter().all(|r| r.arm == arm),
+            "mixed arms in one aggregate"
+        );
+        let results: Vec<&TrialResult> = all
+            .iter()
+            .copied()
+            .filter(|r| !r.is_infra_failure())
+            .collect();
+        let first = results.first()?;
+        let mut per_task: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
+        for r in &results {
+            let entry = per_task.entry(r.task.as_str()).or_default();
+            entry.0 += 1;
+            entry.1 += u32::from(r.success);
+        }
+        let tasks = per_task.len() as f64;
+        let pass = |k: u32| {
+            per_task
+                .values()
+                .map(|&(n, c)| pass_at_k(n, c, k.min(n)))
+                .sum::<f64>()
+                / tasks
+        };
+        let count =
+            |f: &dyn Fn(&TrialResult) -> bool| results.iter().filter(|r| f(r)).count() as u32;
+        let values = |f: &dyn Fn(&TrialResult) -> Option<f64>| {
+            results.iter().filter_map(|r| f(r)).collect::<Vec<_>>()
+        };
+        let trials = results.len() as u32;
+        let successes = count(&|r| r.success);
+        assert!(successes <= trials, "more passes than graded trials");
+        Some(Self {
+            arm,
+            model: first.model.clone(),
+            trials,
+            successes,
+            infra: (all.len() - results.len()) as u32,
+            timeouts: count(&|r| r.timed_out),
+            success_rate: f64::from(successes) / f64::from(trials),
+            pass_at_1: pass(1),
+            pass_at_k: pass(k),
+            score: Stat::of(&values(&|r| Some(trial_score(r))))?,
+            wall_secs: Stat::of(&values(&|r| Some(r.wall_secs)))?,
+            input_tokens: Stat::of(&values(&|r| r.input_tokens.map(|t| t as f64))),
+            output_tokens: Stat::of(&values(&|r| r.output_tokens.map(|t| t as f64))),
+            cost_usd: Stat::of(&values(&TrialResult::effective_cost_usd)),
+            operator_messages: Stat::of(&values(&|r| Some(f64::from(r.operator_messages))))?,
+        })
+    }
+}
+
+/// The grader's partial score, else 1 or 0 from its verdict.
+pub fn trial_score(result: &TrialResult) -> f64 {
+    result
+        .score
+        .unwrap_or(if result.success { 1.0 } else { 0.0 })
+}
+
+/// Everything `summary.md`, `chart.json` and the HTML report show.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Summary {
+    pub manifest: Option<RunManifest>,
+    /// pass@k's k: the fewest graded trials any (task, arm) cell has.
+    pub k: u32,
+    pub arms: Vec<Aggregate>,
+    /// Task id → one aggregate per arm with a graded trial of it (none when
+    /// every trial of the task was an infrastructure failure).
+    pub tasks: BTreeMap<String, Vec<Aggregate>>,
+    /// Infrastructure failures, left out of every aggregate.
+    pub infra: Vec<InfraFailure>,
+}
+
+/// One trial left out of the aggregates, and why.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InfraFailure {
+    pub task: String,
+    pub arm: Arm,
+    pub trial: u32,
+    pub error: String,
+}
+
+impl Summary {
+    pub fn build(results: &[TrialResult], manifest: Option<RunManifest>) -> anyhow::Result<Self> {
+        ensure!(!results.is_empty(), "no trial results to summarize");
+        let mut cells: BTreeMap<(&str, Arm), Vec<&TrialResult>> = BTreeMap::new();
+        for r in results {
+            cells.entry((r.task.as_str(), r.arm)).or_default().push(r);
+        }
+        let k = cells
+            .values()
+            .map(|c| c.iter().filter(|r| !r.is_infra_failure()).count() as u32)
+            .filter(|&graded| graded > 0)
+            .min()
+            .context("no trial was graded: every one is an infrastructure failure")?;
+        let mut tasks: BTreeMap<String, Vec<Aggregate>> = BTreeMap::new();
+        for ((task, arm), trials) in &cells {
+            let row = tasks.entry((*task).to_owned()).or_default();
+            row.extend(Aggregate::of(*arm, trials, k));
+        }
+        let infra = results
+            .iter()
+            .filter(|r| r.is_infra_failure())
+            .map(|r| InfraFailure {
+                task: r.task.clone(),
+                arm: r.arm,
+                trial: r.trial,
+                error: r.error.clone().expect("an infra failure carries its error"),
+            })
+            .collect();
+        let arms = Arm::ALL
+            .into_iter()
+            .filter_map(|arm| {
+                let all: Vec<&TrialResult> = results.iter().filter(|r| r.arm == arm).collect();
+                Aggregate::of(arm, &all, k)
+            })
+            .collect();
+        Ok(Self {
+            manifest,
+            k,
+            arms,
+            tasks,
+            infra,
+        })
+    }
+}
+
+pub fn read_results(path: &Path) -> anyhow::Result<Vec<TrialResult>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, line)| {
+            serde_json::from_str(line)
+                .with_context(|| format!("{}:{}: bad result line", path.display(), i + 1))
+        })
+        .collect()
+}
+
+pub fn read_manifest(dir: &Path) -> anyhow::Result<Option<RunManifest>> {
+    let path = dir.join("run.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
+    ))
+}
+
+/// Write `summary.md` and `chart.json` next to `results.jsonl`.
+pub fn write_summary(dir: &Path) -> anyhow::Result<Summary> {
+    let results = read_results(&dir.join("results.jsonl"))?;
+    let summary = Summary::build(&results, read_manifest(dir)?)?;
+    std::fs::write(dir.join("summary.md"), render_markdown(&summary)?)?;
+    std::fs::write(
+        dir.join("chart.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
+    Ok(summary)
+}
+
+pub fn render_markdown(summary: &Summary) -> anyhow::Result<String> {
+    let mut out = String::from("# Archon benchmark\n\n");
+    if let Some(m) = &summary.manifest {
+        render_manifest(&mut out, m)?;
+    }
+    let k = summary.k;
+    writeln!(out, "## Per arm\n")?;
+    writeln!(
+        out,
+        "| Arm | Model | Trials | Success | pass@1 | pass@{k} | Score | Wall s | Input tok | Output tok | Cost $ | Operator msgs | Infra | Timeouts |"
+    )?;
+    writeln!(
+        out,
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    )?;
+    for a in &summary.arms {
+        writeln!(
+            out,
+            "| {} | `{}` | {} | {}/{} ({}) | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            a.arm,
+            a.model,
+            a.trials,
+            a.successes,
+            a.trials,
+            percent(a.success_rate),
+            percent(a.pass_at_1),
+            percent(a.pass_at_k),
+            stat(&a.score, 2),
+            stat(&a.wall_secs, 0),
+            opt_stat(a.input_tokens.as_ref(), 0, a.trials),
+            opt_stat(a.output_tokens.as_ref(), 0, a.trials),
+            opt_stat(a.cost_usd.as_ref(), 2, a.trials),
+            stat(&a.operator_messages, 1),
+            a.infra,
+            a.timeouts
+        )?;
+    }
+    render_task_table(&mut out, summary)?;
+    render_infra(&mut out, &summary.infra)?;
+    out.push_str(METHOD_NOTES);
+    Ok(out)
+}
+
+fn render_manifest(out: &mut String, m: &RunManifest) -> anyhow::Result<()> {
+    let finished = m
+        .finished_at
+        .map_or_else(|| "unfinished".to_owned(), |t| t.to_rfc3339());
+    writeln!(
+        out,
+        "- Run `{}`: {} → {}",
+        m.stamp,
+        m.started_at.to_rfc3339(),
+        finished
+    )?;
+    writeln!(
+        out,
+        "- Archon commit: `{}`",
+        m.archon_commit.as_deref().unwrap_or("unknown")
+    )?;
+    writeln!(
+        out,
+        "- Effort: `{}`; trials per task and arm: {}; parallel: {}",
+        m.effort, m.trials, m.parallel
+    )?;
+    for (arm, model) in &m.models {
+        writeln!(out, "- Model `{arm}`: `{model}`")?;
+    }
+    for (program, version) in &m.versions {
+        writeln!(out, "- Version `{program}`: `{version}`")?;
+    }
+    writeln!(
+        out,
+        "- Trials: {} planned, {} completed, {} skipped; spent ${:.2} of ${:.2}{}",
+        m.planned,
+        m.completed,
+        m.skipped,
+        m.spent_usd,
+        m.max_usd,
+        if m.unpriced_trials > 0 {
+            format!(" ({} trials unpriced)", m.unpriced_trials)
+        } else {
+            String::new()
+        }
+    )?;
+    if let Some(reason) = &m.stopped_reason {
+        writeln!(out, "- **Stopped early:** {reason}")?;
+    }
+    out.push('\n');
+    Ok(())
+}
+
+fn render_task_table(out: &mut String, summary: &Summary) -> anyhow::Result<()> {
+    let arms: Vec<Arm> = summary.arms.iter().map(|a| a.arm).collect();
+    writeln!(
+        out,
+        "\n## Per task\n\nEach cell: passes/trials · wall s · cost $ · operator msgs (mean ± stdev).\n"
+    )?;
+    let header: Vec<String> = arms.iter().map(ToString::to_string).collect();
+    writeln!(out, "| Task | {} |", header.join(" | "))?;
+    writeln!(out, "|---|{}", "---|".repeat(arms.len()))?;
+    for (task, cells) in &summary.tasks {
+        let row: Vec<String> = arms
+            .iter()
+            .map(|arm| {
+                cells
+                    .iter()
+                    .find(|c| c.arm == *arm)
+                    .map_or_else(|| "—".to_owned(), cell_text)
+            })
+            .collect();
+        writeln!(out, "| {task} | {} |", row.join(" | "))?;
+    }
+    Ok(())
+}
+
+fn render_infra(out: &mut String, infra: &[InfraFailure]) -> anyhow::Result<()> {
+    if infra.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "\n## Infrastructure failures\n\nLeft out of every number above.\n"
+    )?;
+    for f in infra {
+        let error: String = f.error.chars().take(INFRA_ERROR_CHARS).collect();
+        let cut = if f.error.chars().count() > INFRA_ERROR_CHARS {
+            "…"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "- {} / {} #{}: {}{cut}",
+            f.task,
+            f.arm,
+            f.trial,
+            error.replace('\n', " ")
+        )?;
+    }
+    Ok(())
+}
+
+fn cell_text(c: &Aggregate) -> String {
+    format!(
+        "{}/{} · {} · {} · {}",
+        c.successes,
+        c.trials,
+        stat(&c.wall_secs, 0),
+        opt_stat(c.cost_usd.as_ref(), 2, c.trials),
+        stat(&c.operator_messages, 1)
+    )
+}
+
+/// How much of an infrastructure failure's error `summary.md` quotes.
+const INFRA_ERROR_CHARS: usize = 200;
+
+fn percent(x: f64) -> String {
+    format!("{:.0}%", x * 100.0)
+}
+
+fn stat(s: &Stat, decimals: usize) -> String {
+    format!("{:.*} ± {:.*}", decimals, s.mean, decimals, s.stdev)
+}
+
+/// A metric only some trials reported (tokens, cost) says over how many.
+fn opt_stat(s: Option<&Stat>, decimals: usize, trials: u32) -> String {
+    let Some(s) = s else {
+        return "—".to_owned();
+    };
+    assert!(
+        s.n <= trials as usize,
+        "{} values from {trials} trials",
+        s.n
+    );
+    if s.n < trials as usize {
+        return format!("{} (n={})", stat(s, decimals), s.n);
+    }
+    stat(s, decimals)
+}
+
+const METHOD_NOTES: &str = "
+## Method
+
+- Every arm gets the same task prompt, effort and time limit, and the same model where the harness allows; `codex` runs its own model. Every arm runs with its tool permission prompts bypassed.
+- `claude` keeps Claude Code's built-in subagents (the Task tool); the `aether` arm is a single leaf agent without delegation.
+- Each trial starts from a fresh copy of the fixtures in an unguessably named directory outside the Archon checkout, with a one-commit git history. Hidden tests, reference solutions and rubrics are copied in only at grade time, into a separate copy the agent never sees, after the agent and every process it started have stopped. Agent processes do not inherit environment variables pointing at the checkout. There is no OS sandbox: an agent that searched the whole home directory could still find the checkout.
+- Success is the hidden grader's verdict. Test graders restore the visible tests from the task, not from the agent's repository, and require the runner's own summary to report no failures and a minimum number of passing tests. Rubric graders need related facts close together and cap the answer length.
+- A failed trial with a harness error (the arm could not run cleanly: a provider limit, a crash, a grading failure) is an infrastructure failure. It is left out of pass rates and every metric, counted under Infra and listed with its error.
+- Wall time runs from handing over the prompt until the arm finished; Archon's daemon start-up (recorded as `setup_secs`) and the quiet window used to detect that Archon finished are excluded.
+- Input tokens include cache reads and writes. Cost is billed dollars when reported, else Aether's estimate or `--price` list prices. `(n=…)` marks a metric only that many trials reported.
+- Operator messages are what the operator had to read: one final result for `claude`/`codex`, the assistant messages of the Aether agent, and the default-visible chat lines for Archon.
+- Values are mean ± sample standard deviation over graded trials. pass@k uses the unbiased estimator per task, averaged over tasks, with k the fewest graded trials any (task, arm) cell has.
+";
+
+#[cfg(test)]
+mod tests;

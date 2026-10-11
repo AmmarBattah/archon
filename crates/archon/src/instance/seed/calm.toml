@@ -1,0 +1,8 @@
+version = 1
+label = "Calm"
+description = "Archon coordination and decisions without tool detail"
+density = "compact"
+show = ["user_text", "assistant_text", "delegation", "agent_message", "completion", "status", "question", "approval", "error"]
+
+[scope]
+role = "archon-orchestrator"

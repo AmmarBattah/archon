@@ -1,0 +1,25 @@
+id = "multi-repo-pagination"
+title = "Add cursor pagination to an API and its client (two repositories)"
+prompt = """
+`GET /items` in the `inventory-api` repository returns every item in one \
+response, which no longer scales. Add cursor pagination and update the \
+`inventory-client` repository to use it:
+
+- API: `GET /items` accepts optional query parameters `limit` (an integer \
+1..100, default 20) and `cursor` (an opaque string taken from a previous \
+response). The body becomes `{"items": [...], "next_cursor": <string or \
+null>}`: items stay ordered by `id`, and `next_cursor` is null on the last \
+page. An invalid `limit` or `cursor` gets status 400 with body \
+`{"error": "..."}`.
+- Client: `listItems(transport)` must still resolve to every item, in order, \
+by following `next_cursor` until it is null (or absent), passing the cursor \
+back unchanged. The first request sends no cursor.
+- Update each repository's README to document the change, and keep each \
+repository's tests passing (`python3 -m unittest` and `npm test`).
+
+Commit in both repositories.
+"""
+timeout_minutes = 30
+pipeline = "default-pr-review"
+repos = ["inventory-api", "inventory-client"]
+tags = ["feature", "multi-repo", "python", "node"]

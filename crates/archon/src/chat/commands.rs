@@ -1,0 +1,249 @@
+//! Parsing chat input lines: plain text goes to the orchestrator, `/…`
+//! lines are slash commands (ARCHITECTURE §12). Pure.
+
+use archon_core::protocol::{PauseTarget, RepoRef};
+
+use crate::questions::QuestionRef;
+
+pub const HELP: &str = "\
+Type a message and press Enter to talk to the orchestrator.
+  /a [n] <text>           answer question n, or the newest open question
+  /answer <n|id> <text>   answer question n (a number picks one of its options)
+  /questions              list open questions
+  /status                 daemon, Aether, queue and spend
+  /queue [state ...]      the queue, e.g. /queue running failed
+  /item <id>              one queue item (its id or the id's start)
+  /pause [hard | repo <name> | pipeline <name>]
+  /resume [hard | repo <name> | pipeline <name>]
+  /progress               show or hide progress notes (also /verbose)
+  /help                   this list
+  /quit                   leave (also Ctrl-D, or Ctrl-C twice)
+Start a line with // to send a message that begins with /.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatInput {
+    Empty,
+    Say(String),
+    Command(SlashCommand),
+    /// A malformed command, with what to tell the operator.
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommand {
+    Help,
+    Quit,
+    ToggleProgress,
+    Answer { question: QuestionRef, text: String },
+    AnswerNewest { text: String },
+    Questions,
+    Status,
+    Queue { states: Vec<String> },
+    Item(String),
+    Pause(PauseTarget),
+    Resume(PauseTarget),
+}
+
+pub fn parse_line(line: &str) -> ChatInput {
+    let line = line.trim();
+    if line.is_empty() {
+        return ChatInput::Empty;
+    }
+    if let Some(escaped) = line.strip_prefix("//") {
+        return ChatInput::Say(format!("/{escaped}"));
+    }
+    let Some(command) = line.strip_prefix('/') else {
+        return ChatInput::Say(line.to_owned());
+    };
+    let (name, rest) = split_word(command);
+    match parse_command(&name.to_ascii_lowercase(), rest) {
+        Ok(command) => ChatInput::Command(command),
+        Err(message) => ChatInput::Invalid(message),
+    }
+}
+
+fn parse_command(name: &str, rest: &str) -> Result<SlashCommand, String> {
+    let no_args = |command: SlashCommand| match rest.is_empty() {
+        true => Ok(command),
+        false => Err(format!("/{name} takes no arguments")),
+    };
+    match name {
+        "help" | "h" | "?" => no_args(SlashCommand::Help),
+        "quit" | "exit" | "q" => no_args(SlashCommand::Quit),
+        "progress" | "verbose" => no_args(SlashCommand::ToggleProgress),
+        "questions" => no_args(SlashCommand::Questions),
+        "status" => no_args(SlashCommand::Status),
+        "queue" => Ok(SlashCommand::Queue {
+            states: rest.split_whitespace().map(str::to_owned).collect(),
+        }),
+        "item" => match split_word(rest) {
+            (id, "") if !id.is_empty() => Ok(SlashCommand::Item(id.to_owned())),
+            _ => Err("usage: /item <id>".to_owned()),
+        },
+        "a" => parse_short_answer(rest),
+        "answer" => parse_answer(rest),
+        "pause" => parse_pause_target(rest, "pause").map(SlashCommand::Pause),
+        "resume" => parse_pause_target(rest, "resume").map(SlashCommand::Resume),
+        other => Err(format!("unknown command /{other}; /help lists them")),
+    }
+}
+
+/// `/a 3 yes` answers Q3; `/a yes` (or a lone `/a 2`, option 2) answers the
+/// newest open question.
+fn parse_short_answer(rest: &str) -> Result<SlashCommand, String> {
+    if rest.is_empty() {
+        return Err("usage: /a [n] <text>".to_owned());
+    }
+    let (first, text) = split_word(rest);
+    match QuestionRef::parse(first) {
+        Ok(question) if !text.is_empty() => Ok(SlashCommand::Answer {
+            question,
+            text: text.to_owned(),
+        }),
+        _ => Ok(SlashCommand::AnswerNewest {
+            text: rest.to_owned(),
+        }),
+    }
+}
+
+fn parse_answer(rest: &str) -> Result<SlashCommand, String> {
+    const USAGE: &str = "usage: /answer <n|id> <text>";
+    let (question, text) = split_word(rest);
+    if question.is_empty() || text.is_empty() {
+        return Err(USAGE.to_owned());
+    }
+    let question = QuestionRef::parse(question).map_err(|e| format!("{e}; {USAGE}"))?;
+    Ok(SlashCommand::Answer {
+        question,
+        text: text.to_owned(),
+    })
+}
+
+fn parse_pause_target(rest: &str, verb: &str) -> Result<PauseTarget, String> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    match words.as_slice() {
+        [] => Ok(PauseTarget::Global { hard: false }),
+        ["hard"] => Ok(PauseTarget::Global { hard: true }),
+        ["repo", name] => Ok(PauseTarget::Repo {
+            name: RepoRef((*name).to_owned()),
+        }),
+        ["pipeline", name] => Ok(PauseTarget::Pipeline {
+            name: (*name).to_owned(),
+        }),
+        _ => Err(format!(
+            "usage: /{verb} [hard | repo <name> | pipeline <name>]"
+        )),
+    }
+}
+
+/// The first whitespace-separated word and the trimmed remainder.
+fn split_word(text: &str) -> (&str, &str) {
+    let text = text.trim();
+    match text.split_once(char::is_whitespace) {
+        Some((word, rest)) => (word, rest.trim()),
+        None => (text, ""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use archon_core::id::QuestionId;
+
+    use super::*;
+
+    #[test]
+    fn plain_lines_are_messages_and_blank_lines_nothing() {
+        assert_eq!(
+            parse_line("  hello there "),
+            ChatInput::Say("hello there".into())
+        );
+        assert_eq!(parse_line("   "), ChatInput::Empty);
+        assert_eq!(
+            parse_line("//etc/hosts is odd"),
+            ChatInput::Say("/etc/hosts is odd".into())
+        );
+    }
+
+    #[test]
+    fn answers_take_a_number_or_an_id() {
+        assert_eq!(
+            parse_line("/answer 2 go with option b"),
+            ChatInput::Command(SlashCommand::Answer {
+                question: QuestionRef::Number(2),
+                text: "go with option b".into()
+            })
+        );
+        let id = QuestionId::new();
+        let parsed = parse_line(&format!("/answer {id} yes"));
+        assert_eq!(
+            parsed,
+            ChatInput::Command(SlashCommand::Answer {
+                question: QuestionRef::Id(id),
+                text: "yes".into()
+            })
+        );
+        assert_eq!(
+            parse_line("/a 1"),
+            ChatInput::Command(SlashCommand::AnswerNewest { text: "1".into() })
+        );
+        assert_eq!(
+            parse_line("/a 3 no, keep the old API"),
+            ChatInput::Command(SlashCommand::Answer {
+                question: QuestionRef::Number(3),
+                text: "no, keep the old API".into()
+            })
+        );
+        assert_eq!(
+            parse_line("/a sounds good"),
+            ChatInput::Command(SlashCommand::AnswerNewest {
+                text: "sounds good".into()
+            })
+        );
+        assert!(matches!(parse_line("/answer 2"), ChatInput::Invalid(_)));
+        assert!(matches!(
+            parse_line("/answer zero yes"),
+            ChatInput::Invalid(_)
+        ));
+        assert!(matches!(parse_line("/a"), ChatInput::Invalid(_)));
+    }
+
+    #[test]
+    fn pause_and_resume_scopes() {
+        assert_eq!(
+            parse_line("/pause"),
+            ChatInput::Command(SlashCommand::Pause(PauseTarget::Global { hard: false }))
+        );
+        assert_eq!(
+            parse_line("/resume hard"),
+            ChatInput::Command(SlashCommand::Resume(PauseTarget::Global { hard: true }))
+        );
+        assert_eq!(
+            parse_line("/pause repo api"),
+            ChatInput::Command(SlashCommand::Pause(PauseTarget::Repo {
+                name: RepoRef("api".into())
+            }))
+        );
+        assert!(matches!(parse_line("/pause repo"), ChatInput::Invalid(_)));
+    }
+
+    #[test]
+    fn simple_commands_and_unknown_ones() {
+        assert_eq!(parse_line("/QUIT"), ChatInput::Command(SlashCommand::Quit));
+        assert_eq!(
+            parse_line("/verbose"),
+            ChatInput::Command(SlashCommand::ToggleProgress)
+        );
+        assert_eq!(
+            parse_line("/queue running failed"),
+            ChatInput::Command(SlashCommand::Queue {
+                states: vec!["running".into(), "failed".into()]
+            })
+        );
+        assert!(matches!(parse_line("/status now"), ChatInput::Invalid(_)));
+        assert!(matches!(parse_line("/item"), ChatInput::Invalid(_)));
+        let ChatInput::Invalid(message) = parse_line("/frobnicate") else {
+            panic!("unknown commands are refused");
+        };
+        assert!(message.contains("/help"));
+    }
+}

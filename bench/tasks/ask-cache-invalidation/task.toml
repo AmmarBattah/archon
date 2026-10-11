@@ -1,0 +1,13 @@
+id = "ask-cache-invalidation"
+title = "Answer a debugging question about stale prices (no code change)"
+prompt = """
+Support keeps reporting that after a merchant changes a price, the category \
+pages of the storefront show the old price for up to about ten minutes, while \
+the product page updates immediately. Investigate the `catalog-service` code \
+in this repository and explain the root cause: which code path is \
+responsible, why the delay is what it is, and what the fix would be. Do not \
+change any code; answer in your final message.
+"""
+timeout_minutes = 15
+pipeline = "ask"
+tags = ["ask", "node", "single-repo", "answer"]

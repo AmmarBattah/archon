@@ -1,0 +1,31 @@
+[pipeline]
+name = "e2e-testing"
+description = "Set up the product, run end-to-end scenarios, and publish a report with screenshots"
+version = 1
+workspace = "worktree"
+requires_repo = true
+
+[nudges]
+tier = "balanced"
+notes = "Scripted end-to-end journeys with screenshots. The e2e gate fails only on environment faults, which loop back to setup once; product defects pass the gate and land in the report, so a succeeded run can still list failed scenarios."
+
+[[stage]]
+id = "setup"
+kind = "work"
+prompt = "setup.md"
+timeout_minutes = 60
+
+[[stage]]
+id = "e2e"
+kind = "test"
+prompt = "e2e.md"
+gate = "all_pass"
+timeout_minutes = 120
+on_fail = { goto = "setup", max_loops = 1 }
+
+[[stage]]
+id = "report"
+kind = "report"
+prompt = "report.md"
+timeout_minutes = 45
+nudge = "Write HTML plus screenshots under .archon/reports/ and list them in structured.reports."

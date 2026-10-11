@@ -1,0 +1,952 @@
+//! Shared fixtures: a daemon context over temp directories, a scripted
+//! agent backend, and a temp git repository carrying a test pipeline.
+#![allow(dead_code)]
+
+pub mod team;
+pub mod team_worktree;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+use archon_aether::AetherLink;
+use archon_core::Timestamp;
+use archon_core::aether_ids::{AetherAgentId, AetherRunId, AetherTaskId};
+use archon_core::config::Config;
+use archon_core::error::ArchonError;
+use archon_core::id::{PipelineRunId, QueueItemId};
+use archon_core::model::{Effort, ModelChoice, ModelPlan};
+use archon_core::notify::{FeedEntry, NotificationKind};
+use archon_core::ports::{
+    AgentBackend, CreatedNode, NetworkPolicy, RunNodeRequest, SpawnRequest, SpawnedAgent,
+};
+use archon_core::protocol::{ClientKind, EnqueueRequest, Reply, RepoAdd, RepoRef, Request};
+use archon_core::queue::{QueueItem, QueueState};
+use archon_core::repo::{Repo, ShipMode};
+use archon_core::run::{PipelineRun, StageOutcome, StageRun, StageState};
+use archon_daemon::context::{DaemonContext, DaemonPaths};
+use archon_daemon::disk::DiskWatch;
+use archon_daemon::executor::RunTable;
+use archon_daemon::feed::ReplyTracker;
+use archon_daemon::triggers::TriggerQueue;
+use archon_daemon::{dispatcher, executor, handlers};
+use archon_lavish::Lavish;
+use archon_queue::Store;
+use async_trait::async_trait;
+use tokio::sync::{Mutex, Notify, broadcast};
+
+/// The test pipeline, kept in the repository so no user pipeline shadows it:
+/// `implement` → `review` (two agents, all must pass, loops once) → `ship`.
+pub const PIPELINE: &str = "wp5-review";
+pub const REPO_NAME: &str = "demo";
+pub const MODEL: &str = "claude-code/claude-sonnet-5";
+pub const REVIEW_MODEL: &str = "codex/gpt-5";
+
+const PIPELINE_TOML: &str = r#"[pipeline]
+name = "wp5-review"
+description = "test pipeline"
+version = 1
+workspace = "worktree"
+requires_repo = true
+
+[[stage]]
+id = "implement"
+kind = "work"
+prompt = "implement.md"
+timeout_minutes = 30
+
+[[stage]]
+id = "review"
+kind = "review"
+prompt = "review.md"
+fan_out = 2
+gate = "all_pass"
+timeout_minutes = 30
+on_fail = { goto = "implement", max_loops = 1 }
+
+[[stage]]
+id = "ship"
+kind = "ship"
+prompt = "ship.md"
+timeout_minutes = 90
+"#;
+
+const PROMPTS: [(&str, &str); 3] = [
+    (
+        "implement.md",
+        include_str!("../../../../pipelines/default-pr-review/implement.md"),
+    ),
+    (
+        "review.md",
+        include_str!("../../../../pipelines/default-pr-review/review.md"),
+    ),
+    (
+        "ship.md",
+        include_str!("../../../../pipelines/default-pr-review/ship.md"),
+    ),
+];
+
+/// A daemon context over a temp directory with a registered repository.
+pub struct Harness {
+    pub ctx: Arc<DaemonContext>,
+    pub backend: Arc<FakeBackend>,
+    pub repo: PathBuf,
+    pub dir: tempfile::TempDir,
+    /// What the context's disk probe reads as free, on every path; plenty
+    /// unless a test fills the fake disk.
+    pub free_bytes: Arc<AtomicU64>,
+}
+
+impl Harness {
+    /// Default config with the scripted backend.
+    pub async fn new() -> Self {
+        Self::with_config(Config::default()).await
+    }
+
+    pub async fn with_config(config: Config) -> Self {
+        let backend = Arc::new(FakeBackend::default());
+        let used = backend.clone();
+        Self::build(config, backend, move |_| used).await
+    }
+
+    /// The scripted backend with Lavish, e.g. the fake `lavish-axi`.
+    pub async fn with_lavish(config: Config, lavish: Lavish) -> Self {
+        let backend = Arc::new(FakeBackend::default());
+        let used = backend.clone();
+        Self::assemble(config, backend, move |_| used, Some(lavish)).await
+    }
+
+    /// `make` receives the context's Aether link (for `AetherBackend`);
+    /// `fake` is the handle tests inspect when `make` returns it.
+    pub async fn build(
+        config: Config,
+        fake: Arc<FakeBackend>,
+        make: impl FnOnce(Arc<AetherLink>) -> Arc<dyn AgentBackend>,
+    ) -> Self {
+        Self::assemble(config, fake, make, None).await
+    }
+
+    async fn assemble(
+        mut config: Config,
+        fake: Arc<FakeBackend>,
+        make: impl FnOnce(Arc<AetherLink>) -> Arc<dyn AgentBackend>,
+        lavish: Option<Lavish>,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical tempdir");
+        if config.github.binary == Path::new("gh") {
+            config.github.binary = root.join("fake-gh");
+            std::fs::write(
+                &config.github.binary,
+                r#"#!/bin/sh
+[ "$1 $2 $3 $5 $6 $7 $8 $9" = "pr list --head --state open --limit 2 --json" ] || exit 2
+[ "$4" = "$(git branch --show-current)" ] || exit 3
+printf '[{"url":"https://github.com/o/r/pull/1","number":1,"headRefName":"%s","state":"OPEN"}]' "$4"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                &config.github.binary,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let repo = init_repo(&root.join("repo"));
+        let aether = Arc::new(AetherLink::new());
+        let backend = make(aether.clone());
+        let free_bytes = Arc::new(AtomicU64::new(u64::MAX));
+        let disk = fake_disk(&free_bytes);
+        let ctx = context(&root, config, aether, backend, lavish, disk);
+        let harness = Self {
+            ctx: Arc::new(ctx),
+            backend: fake,
+            repo,
+            dir,
+            free_bytes,
+        };
+        harness.add_repo().await;
+        harness
+    }
+
+    async fn add_repo(&self) -> Repo {
+        let add = RepoAdd {
+            path: self.repo.clone(),
+            name: Some(REPO_NAME.into()),
+            ship: Some(ShipMode::Pr),
+            base_branch: Some("main".into()),
+            default_pipeline: Some(PIPELINE.into()),
+            auto_merge: false,
+        };
+        match self.cli(Request::RepoAdd(add)).await {
+            Ok(Reply::Repo(repo)) => repo,
+            other => panic!("repo add: {other:?}"),
+        }
+    }
+
+    pub async fn cli(&self, request: Request) -> Result<Reply, ArchonError> {
+        handlers::handle(&self.ctx, ClientKind::ArchonCli, request).await
+    }
+
+    /// Enqueue `title` on the test pipeline with [`plan`].
+    pub async fn enqueue(&self, title: &str) -> QueueItem {
+        self.enqueue_with(title, plan()).await.expect("enqueue")
+    }
+
+    pub async fn enqueue_with(
+        &self,
+        title: &str,
+        model_plan: ModelPlan,
+    ) -> Result<QueueItem, ArchonError> {
+        self.enqueue_in(PIPELINE, title, model_plan).await
+    }
+
+    /// Enqueue into `pipeline`, one of the repository's.
+    pub async fn enqueue_in(
+        &self,
+        pipeline: &str,
+        title: &str,
+        model_plan: ModelPlan,
+    ) -> Result<QueueItem, ArchonError> {
+        let request = EnqueueRequest {
+            repo: Some(RepoRef(REPO_NAME.into())),
+            pipeline: Some(pipeline.into()),
+            title: title.into(),
+            brief: format!("brief for {title}"),
+            priority: Default::default(),
+            depends_on: Vec::new(),
+            tags: Vec::new(),
+            model_plan,
+            model_reasons: None,
+            budget_usd: None,
+            idempotency_key: None,
+            autonomy: Default::default(),
+            origin: None,
+        };
+        match self.cli(Request::Enqueue(request)).await? {
+            Reply::Item(item) => Ok(item),
+            other => panic!("enqueue replied {other:?}"),
+        }
+    }
+
+    pub async fn item(&self, id: &QueueItemId) -> QueueItem {
+        self.ctx.store.lock().await.item(id).expect("item")
+    }
+
+    pub async fn state(&self, id: &QueueItemId) -> QueueState {
+        self.item(id).await.state
+    }
+
+    /// Every stage run of the item's runs, oldest run first.
+    pub async fn stages(&self, id: &QueueItemId) -> Vec<StageRun> {
+        let store = self.ctx.store.lock().await;
+        let mut stages = Vec::new();
+        for run in store.runs_for_item(id).expect("runs") {
+            stages.extend(store.stage_runs(&run.id).expect("stage runs"));
+        }
+        stages
+    }
+
+    pub async fn live_stages(&self) -> Vec<StageRun> {
+        self.ctx
+            .store
+            .lock()
+            .await
+            .live_stage_runs()
+            .expect("live stages")
+    }
+
+    /// Running stage agents, oldest first.
+    pub async fn running(&self) -> Vec<StageRun> {
+        let mut running: Vec<StageRun> = self
+            .live_stages()
+            .await
+            .into_iter()
+            .filter(|s| s.state == StageState::Running)
+            .collect();
+        running.sort_by_key(|s| (s.started_at, s.fan_index));
+        running
+    }
+
+    /// Settle every running stage agent with the outcome `answer` picks;
+    /// returns the stage runs settled.
+    pub async fn settle_running(
+        &self,
+        answer: impl Fn(&StageRun) -> StageOutcome,
+    ) -> Vec<StageRun> {
+        let running = self.running().await;
+        for stage in &running {
+            let agent = stage
+                .aether_agent
+                .clone()
+                .expect("running stages have an agent");
+            executor::stage_settled(&self.ctx, &agent, answer(stage))
+                .await
+                .expect("stage settles");
+        }
+        running
+    }
+
+    pub async fn dispatch(&self) {
+        dispatcher::dispatch_once(&self.ctx)
+            .await
+            .expect("dispatch pass");
+    }
+
+    /// The item's only run.
+    pub async fn run(&self, id: &QueueItemId) -> PipelineRun {
+        let mut runs = self.ctx.store.lock().await.runs_for_item(id).expect("runs");
+        assert_eq!(runs.len(), 1, "one run for {id}");
+        runs.remove(0)
+    }
+
+    /// Simulate a crash and restart: a fresh context (empty run table) over
+    /// the same store and directories, sharing the backend.
+    pub fn restart(&mut self) {
+        let root = self.dir.path().canonicalize().expect("canonical tempdir");
+        let config = self.ctx.config.clone();
+        let backend = self.ctx.backend.clone();
+        assert_eq!(
+            Arc::strong_count(&self.ctx),
+            1,
+            "nothing else holds the old daemon"
+        );
+        let lavish = self.ctx.lavish.clone();
+        let disk = fake_disk(&self.free_bytes);
+        let link = Arc::new(AetherLink::new());
+        let ctx = context(&root, config, link, backend, lavish, disk);
+        self.ctx = Arc::new(ctx);
+    }
+
+    /// Set what the fake disk has free.
+    pub fn set_free_bytes(&self, bytes: u64) {
+        self.free_bytes.store(bytes, Ordering::SeqCst);
+    }
+
+    /// Notification texts of `kind` in the feed, oldest first.
+    pub async fn notices(&self, kind: NotificationKind) -> Vec<String> {
+        let feed = self
+            .ctx
+            .store
+            .lock()
+            .await
+            .feed_after(0, 10_000)
+            .expect("feed");
+        feed.into_iter()
+            .filter_map(|item| match item.entry {
+                FeedEntry::Notification(n) if n.kind == kind => Some(n.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `kv` value of the store.
+    pub async fn kv(&self, key: &str) -> Option<String> {
+        self.ctx.store.lock().await.kv_get(key).expect("kv")
+    }
+
+    /// Write `<repo>/.archon/config.toml`.
+    pub fn repo_config(&self, toml: &str) {
+        std::fs::write(self.repo.join(".archon/config.toml"), toml).expect("repo config");
+    }
+
+    /// Add a repository pipeline `name` whose stages use the test prompts.
+    pub fn add_pipeline(&self, name: &str, toml: &str) {
+        assert!(
+            toml.contains(&format!("name = \"{name}\"")),
+            "the TOML names {name}"
+        );
+        write_pipeline(&self.repo, name, toml);
+    }
+}
+
+/// A disk watch whose every path has `free` bytes free; a disk-full hold
+/// ends as soon as space is back.
+pub fn fake_disk(free: &Arc<AtomicU64>) -> DiskWatch {
+    let free = free.clone();
+    let probe = Arc::new(move |_: &Path| Ok(free.load(Ordering::SeqCst)));
+    DiskWatch::new(probe, std::time::Duration::ZERO)
+}
+
+/// Build a context like `archon_daemon::run` does, rooted at `root`.
+pub fn context(
+    root: &Path,
+    config: Config,
+    aether: Arc<AetherLink>,
+    backend: Arc<dyn AgentBackend>,
+    lavish: Option<Lavish>,
+    disk: DiskWatch,
+) -> DaemonContext {
+    let data_dir = root.join("data");
+    let paths = DaemonPaths {
+        socket: root.join("archond.sock"),
+        store: data_dir.join("archon.db"),
+        worktrees: root.join("worktrees"),
+        orchestrator_workspace: data_dir.join("orchestrator"),
+        scratch: data_dir.join("scratch"),
+        reports: data_dir.join("reports"),
+        logs: data_dir.join("logs"),
+        archon_bin: PathBuf::from("/usr/bin/false"),
+        data_dir,
+    };
+    for dir in [
+        &paths.data_dir,
+        &paths.worktrees,
+        &paths.scratch,
+        &paths.reports,
+    ] {
+        std::fs::create_dir_all(dir).expect("create dir");
+    }
+    let store = Store::open(&paths.store).expect("store");
+    let (feed, _) = broadcast::channel(1024);
+    let dispatch = Arc::new(Notify::new());
+    DaemonContext {
+        config,
+        paths,
+        store: Mutex::new(store),
+        aether,
+        backend,
+        feed,
+        dispatch: dispatch.clone(),
+        runs: Mutex::new(RunTable::default()),
+        replies: Mutex::new(ReplyTracker::default()),
+        answering: Mutex::new(()),
+        report_files: Arc::new(Mutex::new(())),
+        triggers: TriggerQueue::default(),
+        caps_override: Mutex::new(None),
+        lavish,
+        supervisor: archon_daemon::supervisor::Supervisor::default(),
+        github: archon_daemon::github::GithubState::default(),
+        started_at: archon_core::now(),
+        disk,
+        standby: OnceLock::new(),
+        gc: Mutex::new(None),
+        collecting: archon_daemon::gc::Collecting::new(dispatch),
+    }
+}
+
+/// A git repository on `main` with one commit and the test pipeline.
+pub fn init_repo(path: &Path) -> PathBuf {
+    write_pipeline(path, PIPELINE, PIPELINE_TOML);
+    std::fs::write(path.join("README.md"), "demo\n").expect("readme");
+    git(path, &["init", "--quiet", "--initial-branch=main"]);
+    // The daemon's own git (team merges) runs with the repository's config.
+    git(path, &["config", "user.name", "Archon Test"]);
+    git(path, &["config", "user.email", "test@archon.invalid"]);
+    git(path, &["config", "commit.gpgsign", "false"]);
+    git(path, &["add", "."]);
+    git(path, &["commit", "--quiet", "-m", "initial"]);
+    path.to_owned()
+}
+
+/// What `ensure_worker` committed for a role, which it must have.
+pub fn committed(
+    kept: Option<archon_daemon::worktree::team::KeptWork>,
+) -> archon_daemon::worktree::team::SavedWork {
+    match kept {
+        Some(archon_daemon::worktree::team::KeptWork::Committed(saved)) => saved,
+        other => panic!("expected leftovers committed, got {other:?}"),
+    }
+}
+
+/// `<repo>/.archon/pipelines/<name>/` with `toml` and the test prompts.
+fn write_pipeline(repo: &Path, name: &str, toml: &str) {
+    let pipeline = repo.join(".archon/pipelines").join(name);
+    std::fs::create_dir_all(&pipeline).expect("pipeline dir");
+    std::fs::write(pipeline.join("pipeline.toml"), toml).expect("pipeline.toml");
+    for (file, text) in PROMPTS {
+        std::fs::write(pipeline.join(file), text).expect("prompt");
+    }
+}
+
+/// `git` with a throwaway identity, isolated from the user's config.
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=Archon Test",
+            "-c",
+            "user.email=test@archon.invalid",
+        ])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf-8")
+        .trim()
+        .to_owned()
+}
+
+pub fn choice(model: &str, effort: Effort) -> ModelChoice {
+    ModelChoice {
+        model: model.parse().expect("model ref"),
+        effort,
+    }
+}
+
+/// One implementer, two different reviewers, one shipper.
+pub fn plan() -> ModelPlan {
+    let mut stages = BTreeMap::new();
+    stages.insert("implement".into(), vec![choice(MODEL, Effort::High)]);
+    stages.insert(
+        "review".into(),
+        vec![
+            choice(REVIEW_MODEL, Effort::Medium),
+            choice(MODEL, Effort::Low),
+        ],
+    );
+    stages.insert("ship".into(), vec![choice(MODEL, Effort::Low)]);
+    ModelPlan(stages)
+}
+
+pub fn completed(summary: &str) -> StageOutcome {
+    StageOutcome::Completed {
+        summary: summary.into(),
+        structured: None,
+    }
+}
+
+pub fn verdict(pass: bool) -> StageOutcome {
+    let word = if pass { "pass" } else { "fail" };
+    StageOutcome::Completed {
+        summary: format!("reviewed\nVERDICT: {word}"),
+        structured: Some(serde_json::json!({"verdict": word, "findings": []})),
+    }
+}
+
+/// An `AgentBackend` that records requests and answers from a script.
+/// Like Aether, a repeated idempotency key returns the same agent only for
+/// the same request (Aether fingerprints the frame) and refuses a different
+/// one, a child may not state a wider network than its parent, and a
+/// cancelled agent is no longer live. A stage agent ends with its task as
+/// far as the fake knows: `is_live` reports one live only while a test
+/// holds it in its turn (`hold_turn`, until `end_turn`), while a node is
+/// live until cancelled or killed.
+#[derive(Default)]
+pub struct FakeBackend {
+    state: StdMutex<FakeState>,
+}
+
+#[derive(Default)]
+struct FakeState {
+    /// Aether's `[network] default` is `denied`; `allowed`, as Aether
+    /// ships, until a test says otherwise.
+    network_denied: bool,
+    /// Stage agents a test holds in their turn after their task settled.
+    in_turn: BTreeSet<AetherAgentId>,
+    requests: Vec<SpawnRequest>,
+    by_key: BTreeMap<String, SpawnedAgent>,
+    failures: VecDeque<ArchonError>,
+    cancel_failures: VecDeque<ArchonError>,
+    outcome_failures: VecDeque<ArchonError>,
+    lost_replies: u32,
+    outcomes: BTreeMap<AetherTaskId, StageOutcome>,
+    cancelled: Vec<AetherAgentId>,
+    next: u32,
+    /// The request each key was created with; a replay must repeat it.
+    recorded: BTreeMap<String, SpawnRequest>,
+    /// Every `create_run_node` call, including repeats.
+    node_requests: Vec<RunNodeRequest>,
+    node_by_key: BTreeMap<String, CreatedNode>,
+    node_recorded: BTreeMap<String, RunNodeRequest>,
+    node_failures: VecDeque<ArchonError>,
+    lost_node_replies: u32,
+    /// Agents `is_live` reports dead: cancelled ones and those `kill` took.
+    dead: BTreeSet<AetherAgentId>,
+    /// Every `is_live` call, in order.
+    live_checks: Vec<AetherAgentId>,
+    next_node: u32,
+    /// Messages delivered, once per key, in order: key, recipient, content.
+    delivered: Vec<(String, AetherAgentId, String)>,
+    /// Every `send_message` call's key, including repeats and refused ones.
+    message_calls: Vec<String>,
+    message_failures: VecDeque<ArchonError>,
+}
+
+impl FakeState {
+    fn knows(&self, agent: &AetherAgentId) -> bool {
+        self.is_stage_agent(agent) || self.is_node(agent)
+    }
+
+    fn network_default(&self) -> NetworkPolicy {
+        match self.network_denied {
+            true => NetworkPolicy::Denied,
+            false => NetworkPolicy::Allowed,
+        }
+    }
+
+    fn is_stage_agent(&self, agent: &AetherAgentId) -> bool {
+        self.by_key.values().any(|s| s.agent == *agent)
+    }
+
+    fn is_node(&self, agent: &AetherAgentId) -> bool {
+        self.node_by_key.values().any(|n| n.agent == *agent)
+    }
+
+    /// The network a node's request stated.
+    fn node_network(&self, node: &AetherAgentId) -> Option<NetworkPolicy> {
+        let (key, _) = self.node_by_key.iter().find(|(_, n)| n.agent == *node)?;
+        Some(self.node_recorded[key].network)
+    }
+
+    /// The Aether run of a node, which its children join.
+    fn node_run(&self, node: &AetherAgentId) -> Option<AetherRunId> {
+        let created = self.node_by_key.values().find(|n| n.agent == *node)?;
+        Some(created.run.clone())
+    }
+}
+
+/// Aether's `invalid_argument` for a key replayed with another frame.
+fn conflict(key: &str) -> ArchonError {
+    ArchonError::Invalid(format!(
+        "aether: idempotency_key `{key}` already created an agent; a different request needs a new key"
+    ))
+}
+
+/// Aether's `invalid_argument` for a child scope wider than its parent's.
+fn widens(parent: &AetherAgentId) -> ArchonError {
+    ArchonError::Invalid(format!(
+        "aether: child scope must narrow its parent's: {parent} denies the network"
+    ))
+}
+
+impl FakeBackend {
+    fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The next `spawn` calls fail with these errors, in order.
+    pub fn fail_next(&self, error: ArchonError) {
+        self.state().failures.push_back(error);
+    }
+
+    /// The next `cancel` calls fail with these errors, in order.
+    pub fn fail_next_cancel(&self, error: ArchonError) {
+        self.state().cancel_failures.push_back(error);
+    }
+
+    /// The next `task_outcome` calls fail with these errors, in order.
+    pub fn fail_next_outcome(&self, error: ArchonError) {
+        self.state().outcome_failures.push_back(error);
+    }
+
+    /// The next `spawn` creates its agent but the reply is lost
+    /// (`Unavailable`), like Aether acting before the daemon crashed.
+    pub fn lose_next_reply(&self) {
+        self.state().lost_replies += 1;
+    }
+
+    /// Every `spawn` call, including repeats and refused ones.
+    pub fn requests(&self) -> Vec<SpawnRequest> {
+        self.state().requests.clone()
+    }
+
+    /// Distinct agents created (one per idempotency key).
+    pub fn created(&self) -> usize {
+        self.state().by_key.len()
+    }
+
+    pub fn cancelled(&self) -> Vec<AetherAgentId> {
+        self.state().cancelled.clone()
+    }
+
+    /// `task_outcome` reports this for `task` from now on.
+    pub fn settle_task(&self, task: &AetherTaskId, outcome: StageOutcome) {
+        self.state().outcomes.insert(task.clone(), outcome);
+    }
+
+    /// The next `create_run_node` calls fail with these errors, in order.
+    pub fn fail_next_node(&self, error: ArchonError) {
+        self.state().node_failures.push_back(error);
+    }
+
+    /// The next `create_run_node` creates its node but the reply is lost
+    /// (`Unavailable`).
+    pub fn lose_next_node_reply(&self) {
+        self.state().lost_node_replies += 1;
+    }
+
+    /// Aether recorded `key` from a daemon that created stage agents as
+    /// roots: the frame it holds names no parent and no network, so only a
+    /// replay without them is the same request, and the agent sits in a
+    /// run of its own. That daemon created no run node either.
+    pub fn recorded_as_root(&self, key: &str) {
+        let mut state = self.state();
+        let recorded = state.recorded.get_mut(key).expect("a created key");
+        recorded.parent = None;
+        recorded.network = None;
+        let root = AetherRunId::parse("run_root").expect("run id");
+        state.by_key.get_mut(key).expect("a created key").run = root;
+        state.node_by_key.clear();
+        state.node_recorded.clear();
+        state.node_requests.clear();
+    }
+
+    /// Every `create_run_node` call, including repeats.
+    pub fn node_requests(&self) -> Vec<RunNodeRequest> {
+        self.state().node_requests.clone()
+    }
+
+    /// Distinct run nodes created (one per idempotency key).
+    pub fn nodes_created(&self) -> usize {
+        self.state().node_by_key.len()
+    }
+
+    /// Run node ids in creation order.
+    pub fn node_ids(&self) -> Vec<AetherAgentId> {
+        let state = self.state();
+        let mut ids: Vec<&AetherAgentId> = state.node_by_key.values().map(|n| &n.agent).collect();
+        ids.sort();
+        ids.into_iter().cloned().collect()
+    }
+
+    /// Every agent `is_live` was asked about, in order, since the last
+    /// `take_live_checks`.
+    pub fn take_live_checks(&self) -> Vec<AetherAgentId> {
+        std::mem::take(&mut self.state().live_checks)
+    }
+
+    /// Aether forgot `agent`: `is_live` reports it dead from now on.
+    pub fn kill(&self, agent: &AetherAgentId) {
+        let mut state = self.state();
+        assert!(state.knows(agent), "kill knows only created agents");
+        state.dead.insert(agent.clone());
+    }
+
+    /// `network_default` reports `network` from now on: Aether's
+    /// `[network] default` changed, as after a restart with a new config.
+    pub fn set_network_default(&self, network: NetworkPolicy) {
+        self.state().network_denied = network == NetworkPolicy::Denied;
+    }
+
+    /// The stage agent keeps running after its task settles, as an engine
+    /// agent does while it ends its turn: `is_live` reports it live until
+    /// `end_turn`, `cancel` or `kill`.
+    pub fn hold_turn(&self, agent: &AetherAgentId) {
+        let mut state = self.state();
+        assert!(state.is_stage_agent(agent), "only stage agents take turns");
+        state.in_turn.insert(agent.clone());
+    }
+
+    /// The next `send_message` calls fail with these errors, in order.
+    pub fn fail_next_message(&self, error: ArchonError) {
+        self.state().message_failures.push_back(error);
+    }
+
+    /// Messages delivered, once per idempotency key, oldest first.
+    pub fn messages(&self) -> Vec<(AetherAgentId, String)> {
+        let state = self.state();
+        state
+            .delivered
+            .iter()
+            .map(|(_, to, content)| (to.clone(), content.clone()))
+            .collect()
+    }
+
+    /// Every `send_message` call's idempotency key, including repeats.
+    pub fn message_calls(&self) -> Vec<String> {
+        self.state().message_calls.clone()
+    }
+
+    /// The held stage agent's turn ended: it is `completed` in Aether.
+    pub fn end_turn(&self, agent: &AetherAgentId) {
+        let held = self.state().in_turn.remove(agent);
+        assert!(held, "end_turn ends a held turn: {agent}");
+    }
+}
+
+#[async_trait]
+impl AgentBackend for FakeBackend {
+    async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedAgent, ArchonError> {
+        let mut state = self.state();
+        state.requests.push(request.clone());
+        if let Some(error) = state.failures.pop_front() {
+            return Err(error);
+        }
+        if let Some(existing) = state.by_key.get(&request.idempotency_key) {
+            if state.recorded[&request.idempotency_key] != request {
+                return Err(conflict(&request.idempotency_key));
+            }
+            return Ok(existing.clone());
+        }
+        let network = request.network.unwrap_or(state.network_default());
+        if let Some(parent) = &request.parent
+            && state.node_network(parent) == Some(NetworkPolicy::Denied)
+            && network == NetworkPolicy::Allowed
+        {
+            return Err(widens(parent));
+        }
+        state.next += 1;
+        let n = state.next;
+        let run = request
+            .attach_run
+            .clone()
+            .or_else(|| state.node_run(request.parent.as_ref()?))
+            .unwrap_or_else(|| AetherRunId::parse(&format!("run_{n:04}")).expect("run id"));
+        let spawned = SpawnedAgent {
+            agent: AetherAgentId::parse(&format!("agt_{n:04}")).expect("agent id"),
+            task: AetherTaskId::parse(&format!("tsk_{n:04}")).expect("task id"),
+            run,
+        };
+        state
+            .by_key
+            .insert(request.idempotency_key.clone(), spawned.clone());
+        state
+            .recorded
+            .insert(request.idempotency_key.clone(), request);
+        if state.lost_replies > 0 {
+            state.lost_replies -= 1;
+            return Err(ArchonError::Unavailable("reply lost".into()));
+        }
+        Ok(spawned)
+    }
+
+    async fn create_run_node(&self, request: RunNodeRequest) -> Result<CreatedNode, ArchonError> {
+        let mut state = self.state();
+        state.node_requests.push(request.clone());
+        if let Some(error) = state.node_failures.pop_front() {
+            return Err(error);
+        }
+        if let Some(existing) = state.node_by_key.get(&request.idempotency_key) {
+            if state.node_recorded[&request.idempotency_key] != request {
+                return Err(conflict(&request.idempotency_key));
+            }
+            return Ok(existing.clone());
+        }
+        state.next_node += 1;
+        let n = state.next_node;
+        let run = request
+            .attach_run
+            .clone()
+            .unwrap_or_else(|| AetherRunId::parse(&format!("run_node{n:04}")).expect("run id"));
+        let agent = CreatedNode {
+            agent: AetherAgentId::parse(&format!("agt_node{n:04}")).expect("id"),
+            run,
+        };
+        state
+            .node_by_key
+            .insert(request.idempotency_key.clone(), agent.clone());
+        state
+            .node_recorded
+            .insert(request.idempotency_key.clone(), request);
+        if state.lost_node_replies > 0 {
+            state.lost_node_replies -= 1;
+            return Err(ArchonError::Unavailable("node reply lost".into()));
+        }
+        Ok(agent)
+    }
+
+    async fn network_default(&self) -> Result<NetworkPolicy, ArchonError> {
+        Ok(self.state().network_default())
+    }
+
+    async fn is_live(&self, agent: &AetherAgentId) -> Result<bool, ArchonError> {
+        let mut state = self.state();
+        state.live_checks.push(agent.clone());
+        if state.dead.contains(agent) {
+            return Ok(false);
+        }
+        Ok(state.is_node(agent) || state.in_turn.contains(agent))
+    }
+
+    async fn cancel(&self, agent: &AetherAgentId, _reason: &str) -> Result<(), ArchonError> {
+        let mut state = self.state();
+        if let Some(error) = state.cancel_failures.pop_front() {
+            return Err(error);
+        }
+        state.cancelled.push(agent.clone());
+        state.dead.insert(agent.clone());
+        state.in_turn.remove(agent);
+        Ok(())
+    }
+
+    async fn task_outcome(&self, task: &AetherTaskId) -> Result<Option<StageOutcome>, ArchonError> {
+        let mut state = self.state();
+        if let Some(error) = state.outcome_failures.pop_front() {
+            return Err(error);
+        }
+        Ok(state.outcomes.get(task).cloned())
+    }
+
+    async fn send_message(
+        &self,
+        to: &AetherAgentId,
+        content: &str,
+        idempotency_key: &str,
+    ) -> Result<(), ArchonError> {
+        let mut state = self.state();
+        state.message_calls.push(idempotency_key.to_owned());
+        if let Some(error) = state.message_failures.pop_front() {
+            return Err(error);
+        }
+        if !state.knows(to) {
+            return Err(ArchonError::NotFound(format!("aether: no agent {to}")));
+        }
+        let seen = state
+            .delivered
+            .iter()
+            .find(|(key, ..)| key == idempotency_key);
+        match seen {
+            Some((_, first_to, first)) if first_to == to && first == content => Ok(()),
+            Some(_) => Err(ArchonError::Invalid(format!(
+                "aether: idempotency_key `{idempotency_key}` already sent another message"
+            ))),
+            None => {
+                let delivery = (idempotency_key.to_owned(), to.clone(), content.to_owned());
+                state.delivered.push(delivery);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Move every settled stage of `run` `minutes` into the past, as if the
+/// run had finished that long ago.
+pub async fn age_settlements(h: &Harness, run: &PipelineRunId, minutes: i64) {
+    age_settlements_except(h, run, minutes, &[]).await;
+}
+
+/// Age every settled stage of `run` except those of the stages named in
+/// `keep`, as when they settled long before the run's last stage did.
+pub async fn age_settlements_except(h: &Harness, run: &PipelineRunId, minutes: i64, keep: &[&str]) {
+    let mut store = h.ctx.store.lock().await;
+    let stages = store.stage_runs(run).expect("stage runs");
+    assert!(!stages.is_empty(), "a run with stages");
+    let mut aged = 0;
+    for mut settled in stages {
+        assert!(settled.state.is_terminal(), "only settled stages age");
+        if keep.contains(&settled.stage_id.as_str()) {
+            continue;
+        }
+        let finished = settled.finished_at.expect("settled stages have finished");
+        settled.finished_at = Some(finished - chrono::Duration::minutes(minutes));
+        store.upsert_stage_run(&settled).expect("aged stage run");
+        aged += 1;
+    }
+    assert!(aged > 0, "some stage aged");
+}
+
+/// Move `stage`'s persisted deadline two hours into the past, as if its
+/// agent had outlived it; returns the new deadline.
+pub async fn expire_deadline(h: &Harness, stage: &StageRun) -> Timestamp {
+    let key = format!("spawn_request:{}", stage.id);
+    let mut store = h.ctx.store.lock().await;
+    let raw = store.kv_get(&key).expect("kv").expect("stored spawn");
+    let mut spawn: serde_json::Value = serde_json::from_str(&raw).expect("json");
+    let past = archon_core::now() - chrono::Duration::hours(2);
+    spawn["request"]["deadline"] = serde_json::to_value(past).expect("timestamp");
+    store.kv_set(&key, &spawn.to_string()).expect("kv set");
+    past
+}

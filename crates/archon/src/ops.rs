@@ -1,0 +1,58 @@
+//! The operator's requests to archond, shared by the one-shot commands and
+//! the chat's slash commands: each sends one request and checks the reply,
+//! and the caller says what happened in its own words.
+
+use archon_client::ArchonClient;
+use archon_core::notify::Question;
+use archon_core::protocol::{PauseTarget, Reply, Request};
+
+use crate::connect::unexpected;
+use crate::questions::expand_option;
+
+/// Send one line to the orchestrator.
+pub async fn say(client: &ArchonClient, text: String) -> anyhow::Result<()> {
+    assert!(!text.trim().is_empty(), "blank lines are never sent");
+    match client.call(Request::Say { text }).await? {
+        Ok(Reply::Ok) => Ok(()),
+        Ok(other) => Err(unexpected(&other, "ok")),
+        Err(refusal) => Err(archon_client::refusal_error(refusal).into()),
+    }
+}
+
+/// Answer `question`; a bare option number picks that option. Returns the
+/// answer as sent.
+pub async fn answer(
+    client: &ArchonClient,
+    question: &Question,
+    text: &str,
+) -> anyhow::Result<String> {
+    assert!(!text.trim().is_empty(), "callers refuse empty answers");
+    let text = expand_option(question, text);
+    // Options come from the asker, so an empty one is refused, not sent.
+    if text.is_empty() {
+        return Err(archon_core::ArchonError::Invalid(
+            "that option is empty; answer in words".into(),
+        )
+        .into());
+    }
+    let request = Request::Answer {
+        question: question.id.clone(),
+        text: text.clone(),
+    };
+    match client.request(request).await? {
+        Reply::Ok | Reply::Question(_) => Ok(text),
+        other => Err(unexpected(&other, "ok")),
+    }
+}
+
+/// Pause `target`, or resume it when `pause` is false.
+pub async fn pause(client: &ArchonClient, target: PauseTarget, pause: bool) -> anyhow::Result<()> {
+    let request = match pause {
+        true => Request::Pause(target),
+        false => Request::Resume(target),
+    };
+    match client.request(request).await? {
+        Reply::Ok => Ok(()),
+        other => Err(unexpected(&other, "ok")),
+    }
+}

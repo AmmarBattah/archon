@@ -1,0 +1,43 @@
+[package]
+name = "archon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Archon CLI: quiet operator chat, queue and repo management, daemon and MCP entry points"
+
+[[bin]]
+name = "archon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+archon-aether = { workspace = true }
+archon-client = { workspace = true }
+archon-core = { workspace = true }
+archon-daemon = { workspace = true }
+archon-mcp = { workspace = true }
+archon-pipeline = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+rustix = { workspace = true }
+rustyline = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+terminal_size = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+archon-core = { workspace = true, features = ["testing"] }
+# A pseudo-terminal for the tests of what a bare `archon` opens.
+rustix = { workspace = true, features = ["pty"] }
+
+[lints]
+workspace = true

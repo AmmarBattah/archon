@@ -1,0 +1,109 @@
+diff --git a/inventory-api/README.md b/inventory-api/README.md
+index 1a55755..eae8ab9 100644
+--- a/inventory-api/README.md
++++ b/inventory-api/README.md
+@@ -6,7 +6,10 @@ In-memory inventory service. `api.handle(request)` maps a request
+ 
+ ## Endpoints
+ 
+-- `GET /items` → `{"items": [...]}`: every item, ordered by `id`.
++- `GET /items?limit=N&cursor=C` → `{"items": [...], "next_cursor": C2}`: one page
++  of items ordered by `id`. `limit` is 1..100 (default 20); `cursor` is the opaque
++  `next_cursor` of the previous page, which is `null` on the last page. An invalid
++  `limit` or `cursor` gets 400.
+ - `GET /items/<id>` → the item, 404 when unknown, 400 when `id` is not a number.
+ 
+ Run the tests with `python3 -m unittest`.
+diff --git a/inventory-api/api.py b/inventory-api/api.py
+index aba1605..e1e1608 100644
+--- a/inventory-api/api.py
++++ b/inventory-api/api.py
+@@ -5,8 +5,15 @@ response is `{"status": int, "body": object}`; the transport layer lives
+ elsewhere.
+ """
+ 
++import base64
++import binascii
++import json
++
+ from data import ITEMS
+ 
++DEFAULT_LIMIT = 20
++MAX_LIMIT = 100
++
+ 
+ def handle(request):
+     if request.get("method") != "GET":
+@@ -21,8 +28,33 @@ def handle(request):
+ 
+ 
+ def list_items(query):
+-    items = sorted(ITEMS, key=lambda item: item["id"])
+-    return {"status": 200, "body": {"items": items}}
++    raw_limit = query.get("limit", str(DEFAULT_LIMIT))
++    if not raw_limit.isdigit() or not 1 <= int(raw_limit) <= MAX_LIMIT:
++        return _error(400, f"limit must be an integer from 1 to {MAX_LIMIT}")
++    limit = int(raw_limit)
++    after = 0
++    if "cursor" in query:
++        after = _decode_cursor(query["cursor"])
++        if after is None:
++            return _error(400, "invalid cursor")
++    items = sorted((i for i in ITEMS if i["id"] > after), key=lambda item: item["id"])
++    page = items[:limit]
++    next_cursor = _encode_cursor(page[-1]["id"]) if len(items) > limit else None
++    return {"status": 200, "body": {"items": page, "next_cursor": next_cursor}}
++
++
++def _encode_cursor(after_id):
++    raw = json.dumps({"after": after_id}).encode()
++    return base64.urlsafe_b64encode(raw).decode()
++
++
++def _decode_cursor(cursor):
++    try:
++        decoded = json.loads(base64.urlsafe_b64decode(cursor.encode()))
++    except (binascii.Error, ValueError, UnicodeDecodeError):
++        return None
++    after = decoded.get("after") if isinstance(decoded, dict) else None
++    return after if isinstance(after, int) and after >= 0 else None
+ 
+ 
+ def get_item(raw_id):
+diff --git a/inventory-client/README.md b/inventory-client/README.md
+index bfda2ff..876dfbe 100644
+--- a/inventory-client/README.md
++++ b/inventory-client/README.md
+@@ -3,7 +3,8 @@
+ Client for `inventory-api`. Every function takes a `transport`,
+ `async (request) => response`, so callers choose HTTP, IPC or a fake.
+ 
+-- `listItems(transport)` → every item, ordered by `id`.
++- `listItems(transport)` → every item, ordered by `id`, fetching page after page
++  by following `next_cursor` until it is `null`.
+ - `getItem(transport, id)` → one item; rejects on any non-200 response.
+ - `lowStock(items, threshold)` → SKUs with `qty` below the threshold.
+ 
+diff --git a/inventory-client/client.js b/inventory-client/client.js
+index 6825096..6e4a23f 100644
+--- a/inventory-client/client.js
++++ b/inventory-client/client.js
+@@ -11,9 +11,16 @@ async function request(transport, path, query = {}) {
+   return res.body;
+ }
+ 
++// Follows next_cursor until the server reports the last page.
+ async function listItems(transport) {
+-  const body = await request(transport, '/items');
+-  return body.items;
++  const items = [];
++  let cursor = null;
++  do {
++    const body = await request(transport, '/items', cursor === null ? {} : { cursor });
++    items.push(...body.items);
++    cursor = body.next_cursor ?? null;
++  } while (cursor !== null);
++  return items;
+ }
+ 
+ async function getItem(transport, id) {

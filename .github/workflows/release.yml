@@ -1,0 +1,252 @@
+name: release
+
+# A pushed version tag builds every target and opens a draft release; the
+# owner publishes it. A manual run is a dry run unless told otherwise.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: build and upload the artifacts, create no release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  # The bundled SQLite is C: it must be built against musl too.
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  # Keeps macOS tar from adding AppleDouble members to the archive.
+  COPYFILE_DISABLE: "1"
+
+jobs:
+  version:
+    name: check the version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: compare the tag with the workspace version
+        id: version
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Cargo.toml has no workspace version like 1.2.3: '$version'"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME is not the workspace version, v$version"
+            exit 1
+          fi
+          if [ "$DRY_RUN" != true ] && [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "::error::a release is built from a tag; $GITHUB_REF_NAME is a $GITHUB_REF_TYPE"
+            exit 1
+          fi
+          publish=true
+          [ "$DRY_RUN" != true ] || publish=false
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "archon $version, publish: $publish" >> "$GITHUB_STEP_SUMMARY"
+      # Before the builds: a release without notes is found in a minute.
+      - name: check that CHANGELOG.md has this version's release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! sh scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"; then
+            echo "::error file=CHANGELOG.md::no release notes for $VERSION: CHANGELOG.md needs a '## $VERSION' section with text in it"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml pins the version; rustup installs exactly that.
+      - name: install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+      - name: install the musl C compiler
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      # One cache per target; a tag's cache is readable by no other ref.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref_type == 'branch' }}
+      - name: build
+        run: cargo build --release --locked -p archon --target "$TARGET"
+      - name: package
+        run: |
+          binary="target/$TARGET/release/archon"
+          file "$binary"
+          if [ "$RUNNER_OS" = Linux ] && ! file "$binary" | grep -Eq 'static(ally|-pie) linked'; then
+            echo "::error::$binary is not statically linked"
+            exit 1
+          fi
+          asset="archon-$TARGET.tar.gz"
+          mkdir dist
+          # archon, LICENSE and THIRD-PARTY-NOTICES; the script checks the members.
+          sh scripts/package-release.sh "$binary" "dist/$asset"
+          tar -tvzf "dist/$asset"
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          size=$(wc -c < "$asset" | tr -d ' ')
+          echo "$asset: $size bytes, SHA-256 $(cut -d ' ' -f 1 "$asset.sha256")" | tee -a "$GITHUB_STEP_SUMMARY"
+      # The archive is installed by install.sh from a local server, and the
+      # installed binary must work with nothing else of the checkout.
+      - name: install the archive and run it from an empty directory
+        run: |
+          served="$RUNNER_TEMP/served"
+          mkdir -p "$served/latest/download" "$RUNNER_TEMP/home" "$RUNNER_TEMP/empty"
+          cp dist/* "$served/latest/download/"
+          printf 'v%s\n' "$VERSION" > "$served/latest/download/VERSION"
+          python3 -m http.server 8471 --bind 127.0.0.1 --directory "$served" >/dev/null 2>&1 &
+          server=$!
+          trap 'kill "$server"' EXIT
+          export ARCHON_INSTALL_BASE_URL=http://127.0.0.1:8471
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 \
+            "$ARCHON_INSTALL_BASE_URL/latest/download/VERSION"
+          installer="$PWD/install.sh"
+          export HOME="$RUNNER_TEMP/home"
+          export ARCHON_CONFIG_DIR="$HOME/config" ARCHON_DATA_DIR="$HOME/data"
+          cd "$RUNNER_TEMP/empty"
+          ARCHON_SKIP_AETHER=1 sh "$installer"
+          installed=$(ls -A "$HOME/.local/bin")
+          if [ "$installed" != archon ]; then
+            echo "::error::the installer put more than archon in place: $installed"
+            exit 1
+          fi
+          archon="$HOME/.local/bin/archon"
+          reported=$("$archon" --version)
+          if [ "$reported" != "archon $VERSION" ]; then
+            echo "::error::the packaged binary reports '$reported', not 'archon $VERSION'"
+            exit 1
+          fi
+          "$archon" pipelines list | tee pipelines.txt
+          grep -q default-pr-review pipelines.txt
+          "$archon" pipelines check
+          "$archon" update --check
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archon-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+          # The archive is already compressed.
+          compression-level: 0
+
+  checksums:
+    name: collect checksums
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: archon-*
+          merge-multiple: true
+      - name: write SHA256SUMS and VERSION
+        working-directory: dist
+        run: |
+          cat archon-*.tar.gz.sha256 > SHA256SUMS
+          archives=$(wc -l < SHA256SUMS)
+          if [ "$archives" -ne 4 ]; then
+            echo "::error::expected 4 archives, found $archives"
+            exit 1
+          fi
+          sha256sum --check --strict SHA256SUMS
+          # `archon update` reads the latest release's version from this asset.
+          printf 'v%s\n' "$VERSION" > VERSION
+          {
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checksums
+          path: |
+            dist/SHA256SUMS
+            dist/VERSION
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: create the draft release
+    needs: [version, checksums]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      # The body is this version's section of CHANGELOG.md, then how to install.
+      - name: write the release notes
+        run: sh scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
+      # A draft: its assets are not public until the owner publishes it.
+      - name: create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --notes-file "$RUNNER_TEMP/notes.md" \
+            --title "Archon $GITHUB_REF_NAME" dist/*

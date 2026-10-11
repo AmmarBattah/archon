@@ -1,0 +1,89 @@
+name: ci
+
+# Documentation-only changes start no Rust job. `pipelines/`, `bench/` and
+# `docs/examples/` are compiled into or read by the tests, so they are not
+# in these lists.
+on:
+  pull_request:
+    paths-ignore:
+      - "*.md"
+      - "docs/*.md"
+      - "docs/assets/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/CODEOWNERS"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - "docs/*.md"
+      - "docs/assets/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/CODEOWNERS"
+  workflow_dispatch:
+
+# Every job is safe for a pull request from a fork: a read-only token, no
+# secrets, and no `pull_request_target`.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # CI reads no debugger output; without debug info the test binaries
+  # compile and link faster and the cache stays small.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+# The Makefile is the single source of truth for the check list and for
+# CARGO_BUILD_JOBS. Together the two jobs run what `make ci` runs, split so
+# that the check build (clippy, rustdoc) and the test build run in parallel
+# and each keeps its own cache.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml pins the version and components; with no
+      # arguments rustup installs exactly that.
+      - name: install pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo clippy --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Pull requests restore main's cache and never write one.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: make fmt-check lint doc
+        run: make fmt-check lint doc
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-nextest@0.9.148
+      # The same tests as `make test`, run in parallel across test binaries.
+      - name: make test-nextest
+        run: make test-nextest

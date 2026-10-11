@@ -1,0 +1,11 @@
+id = "feature-token-bucket"
+title = "Implement a token-bucket rate limiter from a written spec"
+prompt = """
+Implement the rate limiter described in `SPEC.md` in `ratelimit.py` (the \
+module currently only has stubs). Follow the spec exactly, including its \
+error cases and edge cases; the tests in `test_ratelimit.py` only cover the \
+basics. Keep it dependency-free (standard library only) and commit your work.
+"""
+timeout_minutes = 25
+pipeline = "default-pr-review"
+tags = ["feature", "python", "single-repo", "spec"]

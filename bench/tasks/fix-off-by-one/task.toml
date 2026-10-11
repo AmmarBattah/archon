@@ -1,0 +1,11 @@
+id = "fix-off-by-one"
+title = "Fix an off-by-one bug revealed by a failing test"
+prompt = """
+In this repository `python3 -m unittest` fails. Find and fix the bug in \
+`window.py` so every test passes, without changing the tests, and make sure \
+the function is correct for every input, not just the tested ones. Commit \
+your fix.
+"""
+timeout_minutes = 15
+pipeline = "default-pr-review"
+tags = ["bugfix", "python", "single-repo"]

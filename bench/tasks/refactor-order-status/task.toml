@@ -1,0 +1,26 @@
+id = "refactor-order-status"
+title = "Replace a stringly-typed order status with an enum across a Rust crate"
+prompt = """
+The `orders` crate stores an order's status as a `String` and compares \
+string literals all over the code. Refactor it to a proper type:
+
+- Add `src/status.rs` with `pub enum OrderStatus { Pending, Paid, Shipped, \
+Cancelled }` deriving at least `Debug, Clone, Copy, PartialEq, Eq, Hash`.
+- `OrderStatus::as_str(self) -> &'static str` returns the lowercase names \
+("pending", "paid", "shipped", "cancelled"); `Display` prints the same.
+- `FromStr` for `OrderStatus` with `type Err = ParseStatusError`, a public \
+error type that implements `std::error::Error` and whose message names the \
+rejected input.
+- `OrderStatus::can_transition_to(self, next: OrderStatus) -> bool` encodes \
+the lifecycle: pending -> paid, pending -> cancelled, paid -> shipped, \
+paid -> cancelled; nothing else.
+- `Order::status` becomes an `OrderStatus`; re-export `OrderStatus` and \
+`ParseStatusError` from the crate root; use the enum everywhere, so the status \
+string literals appear only in `src/status.rs`.
+
+Observable behaviour (errors, report output and ordering, parsing) must stay \
+exactly the same, and `cargo test` must pass. Commit your work.
+"""
+timeout_minutes = 25
+pipeline = "default-pr-review"
+tags = ["refactor", "rust", "single-repo"]

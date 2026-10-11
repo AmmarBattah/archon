@@ -1,0 +1,28 @@
+id = "multi-repo-currency"
+title = "Thread a currency column through a Rust exporter and a Python report (two repositories)"
+prompt = """
+Our books now hold more than one currency. Two repositories need to change \
+together:
+
+- `ledger` (Rust) converts a TSV of transactions on stdin into CSV on \
+stdout. Input lines may now carry a fourth column, the ISO 4217 currency \
+code (exactly three uppercase ASCII letters, e.g. `EUR`); when it is \
+missing the currency is `USD`. The CSV header becomes \
+`date,account,amount_cents,currency` and every row gets the currency. A \
+malformed currency code must make `ledger` print an error naming the line \
+number to stderr and exit with status 2 (other input errors keep exiting \
+with status 1).
+- `reports` (Python) reads that CSV on stdin and prints per-account totals. \
+It must now total per account *and* currency: header \
+`account,currency,total_cents`, rows sorted by account then currency. CSV \
+from the old ledger (no `currency` column) still works and counts as `USD`. \
+A malformed currency code in the input makes `reports.py` print an error to \
+stderr and exit with status 2.
+
+Keep both repositories' existing tests passing (`cargo test`, \
+`python3 -m unittest`), update their READMEs, and commit in both.
+"""
+timeout_minutes = 35
+pipeline = "default-pr-review"
+repos = ["ledger", "reports"]
+tags = ["feature", "multi-repo", "rust", "python"]

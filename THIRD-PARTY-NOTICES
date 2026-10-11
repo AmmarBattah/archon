@@ -1,0 +1,18 @@
+Third-party notices for Archon
+==============================
+
+Archon is licensed under the MIT License (see LICENSE). Its binaries are
+built from the Rust crates pinned in Cargo.lock, each under its own licence.
+`cargo tree --workspace --format "{p} {l}"` lists every crate with its
+licence; all but the one below are under permissive licences (MIT,
+Apache-2.0, BSL-1.0, Zlib, Unlicense, Unicode-3.0).
+
+One crate is under a licence that asks distributors of a binary to say where
+its source code is available:
+
+option-ext 0.2.0
+  Licence: Mozilla Public License 2.0 (https://www.mozilla.org/MPL/2.0/)
+  Source:  https://github.com/soc/option-ext
+           https://crates.io/crates/option-ext
+  Used:    unmodified, as a dependency of `dirs`, which Archon uses to find
+           the user's configuration and data directories.

@@ -1,0 +1,59 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Archon benchmark</title><style>body{font:15px/1.45 system-ui,sans-serif;max-width:1100px;margin:2em auto;padding:0 1em;color:#222}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:1.5em}figure{margin:0}figcaption{font-weight:600;margin-bottom:.3em}svg text{font-size:12px}pre{white-space:pre-wrap;background:#f6f6f6;padding:1em;border-radius:4px;font-size:13px}</style></head><body><h1>Archon benchmark</h1><p>Run <code>20260926T200340Z</code>, effort <code>high</code>, 3 trials per task and arm.</p><div class="charts"><figure><figcaption>Success rate (%)</figcaption><svg role="img" aria-label="Success rate" width="630" height="112" viewBox="0 0 630 112"><text x="0" y="18">archon</text><rect x="80" y="4" width="420.0" height="18" fill="#1f5fa8"><title>claude-code/claude-opus-5-5</title></rect><text x="506.0" y="18">100 (n=12)</text><text x="0" y="44">aether</text><rect x="80" y="30" width="420.0" height="18" fill="#d9822b"><title>claude-code/claude-opus-5-5</title></rect><text x="506.0" y="44">100 (n=13)</text><text x="0" y="70">claude</text><rect x="80" y="56" width="420.0" height="18" fill="#5a9e4b"><title>claude-code/claude-opus-5-5</title></rect><text x="506.0" y="70">100 (n=12)</text><text x="0" y="96">codex</text><rect x="80" y="82" width="420.0" height="18" fill="#8a5fb0"><title>codex/gpt-5.6-sol</title></rect><text x="506.0" y="96">100 (n=13)</text></svg></figure><figure><figcaption>Wall time (s)</figcaption><svg role="img" aria-label="Wall time" width="630" height="112" viewBox="0 0 630 112"><text x="0" y="18">archon</text><rect x="80" y="4" width="245.4" height="18" fill="#1f5fa8"><title>claude-code/claude-opus-5-5</title></rect><line x1="150.8" x2="500.0" y1="13" y2="13" stroke="#222"/><text x="506.0" y="18">279 ± 199 (n=12)</text><text x="0" y="44">aether</text><rect x="80" y="30" width="79.9" height="18" fill="#d9822b"><title>claude-code/claude-opus-5-5</title></rect><line x1="116.8" x2="203.1" y1="39" y2="39" stroke="#222"/><text x="209.1" y="44">90.98 ± 49.14 (n=13)</text><text x="0" y="70">claude</text><rect x="80" y="56" width="67.8" height="18" fill="#5a9e4b"><title>claude-code/claude-opus-5-5</title></rect><line x1="104.3" x2="191.3" y1="65" y2="65" stroke="#222"/><text x="197.3" y="70">77.20 ± 49.52 (n=12)</text><text x="0" y="96">codex</text><rect x="80" y="82" width="188.4" height="18" fill="#8a5fb0"><title>codex/gpt-5.6-sol</title></rect><line x1="107.8" x2="429.1" y1="91" y2="91" stroke="#222"/><text x="435.1" y="96">215 ± 183 (n=13)</text></svg></figure><figure><figcaption>Cost ($)</figcaption><svg role="img" aria-label="Cost" width="630" height="112" viewBox="0 0 630 112"><text x="0" y="18">archon</text><rect x="80" y="4" width="248.7" height="18" fill="#1f5fa8"><title>claude-code/claude-opus-5-5</title></rect><line x1="157.4" x2="500.0" y1="13" y2="13" stroke="#222"/><text x="506.0" y="18">2.02 ± 1.39 (n=12)</text><text x="0" y="44">aether</text><rect x="80" y="30" width="51.4" height="18" fill="#d9822b"><title>claude-code/claude-opus-5-5</title></rect><line x1="106.2" x2="156.6" y1="39" y2="39" stroke="#222"/><text x="162.6" y="44">0.42 ± 0.20 (n=13)</text><text x="0" y="70">claude</text><rect x="80" y="56" width="46.9" height="18" fill="#5a9e4b"><title>claude-code/claude-opus-5-5</title></rect><line x1="103.2" x2="150.5" y1="65" y2="65" stroke="#222"/><text x="156.5" y="70">0.38 ± 0.19 (n=12)</text><text x="0" y="96">codex</text><rect x="80" y="82" width="46.8" height="18" fill="#8a5fb0"><title>codex/gpt-5.6-sol</title></rect><line x1="99.5" x2="154.2" y1="91" y2="91" stroke="#222"/><text x="160.2" y="96">0.38 ± 0.22 (n=13)</text></svg></figure><figure><figcaption>Total tokens (input + output) (tok)</figcaption><svg role="img" aria-label="Total tokens (input + output)" width="630" height="112" viewBox="0 0 630 112"><text x="0" y="18">archon</text><rect x="80" y="4" width="249.8" height="18" fill="#1f5fa8"><title>claude-code/claude-opus-5-5</title></rect><line x1="159.5" x2="500.0" y1="13" y2="13" stroke="#222"/><text x="506.0" y="18">1379985 ± 940488 (n=12)</text><text x="0" y="44">aether</text><rect x="80" y="30" width="51.3" height="18" fill="#d9822b"><title>claude-code/claude-opus-5-5</title></rect><line x1="101.5" x2="161.1" y1="39" y2="39" stroke="#222"/><text x="167.1" y="44">283225 ± 164621 (n=13)</text><text x="0" y="70">claude</text><rect x="80" y="56" width="43.2" height="18" fill="#5a9e4b"><title>claude-code/claude-opus-5-5</title></rect><line x1="93.5" x2="152.9" y1="65" y2="65" stroke="#222"/><text x="158.9" y="70">238689 ± 163868 (n=12)</text><text x="0" y="96">codex</text><rect x="80" y="82" width="53.2" height="18" fill="#8a5fb0"><title>codex/gpt-5.6-sol</title></rect><line x1="97.7" x2="168.8" y1="91" y2="91" stroke="#222"/><text x="174.8" y="96">294024 ± 196335 (n=13)</text></svg></figure><figure><figcaption>Operator-visible messages (msgs)</figcaption><svg role="img" aria-label="Operator-visible messages" width="630" height="112" viewBox="0 0 630 112"><text x="0" y="18">archon</text><rect x="80" y="4" width="262.6" height="18" fill="#1f5fa8"><title>claude-code/claude-opus-5-5</title></rect><line x1="227.0" x2="458.3" y1="13" y2="13" stroke="#222"/><text x="464.3" y="18">3.67 ± 1.61 (n=12)</text><text x="0" y="44">aether</text><rect x="80" y="30" width="248.0" height="18" fill="#d9822b"><title>claude-code/claude-opus-5-5</title></rect><line x1="155.9" x2="500.0" y1="39" y2="39" stroke="#222"/><text x="506.0" y="44">3.46 ± 2.40 (n=13)</text><text x="0" y="70">claude</text><rect x="80" y="56" width="71.6" height="18" fill="#5a9e4b"><title>claude-code/claude-opus-5-5</title></rect><text x="157.6" y="70">1.00 (n=12)</text><text x="0" y="96">codex</text><rect x="80" y="82" width="71.6" height="18" fill="#8a5fb0"><title>codex/gpt-5.6-sol</title></rect><text x="157.6" y="96">1.00 (n=13)</text></svg></figure></div><h2>Full summary</h2><pre># Archon benchmark
+
+- Run `20260926T200340Z`: 2026-09-26T20:03:40.884977145+00:00 → 2026-09-26T21:15:03.728438624+00:00
+- Archon commit: not published (the build predates the public repository)
+- Effort: `high`; trials per task and arm: 3; parallel: 3
+- Model `aether`: `claude-code/claude-opus-5-5`
+- Model `archon`: `claude-code/claude-opus-5-5`
+- Model `claude`: `claude-code/claude-opus-5-5`
+- Model `codex`: `codex/gpt-5.6-sol`
+- Version `aetherd`: `0.1.1`
+- Version `archon`: pre-release build (before 1.0.0)
+- Version `claude`: `2.1.283 (Claude Code)`
+- Version `codex`: `codex-cli 0.155.1`
+- Trials: 96 planned, 52 completed, 44 skipped; spent $40.01 of $37.00
+- **Stopped early:** --max-usd 37.00 reached after $40.01; 44 trials skipped
+
+## Per arm
+
+| Arm | Model | Trials | Success | pass@1 | pass@1 | Score | Wall s | Input tok | Output tok | Cost $ | Operator msgs | Infra | Timeouts |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| archon | `claude-code/claude-opus-5-5` | 12 | 12/12 (100%) | 100% | 100% | 1.00 ± 0.00 | 279 ± 199 | 1350763 ± 940220 | 29221 ± 22419 | 2.02 ± 1.39 | 3.7 ± 1.6 | 1 | 0 |
+| aether | `claude-code/claude-opus-5-5` | 13 | 13/13 (100%) | 100% | 100% | 1.00 ± 0.00 | 91 ± 49 | 274846 ± 164522 | 8379 ± 5688 | 0.42 ± 0.20 | 3.5 ± 2.4 | 0 | 0 |
+| claude | `claude-code/claude-opus-5-5` | 12 | 12/12 (100%) | 100% | 100% | 1.00 ± 0.00 | 77 ± 50 | 231210 ± 163780 | 7478 ± 5381 | 0.38 ± 0.19 | 1.0 ± 0.0 | 1 | 0 |
+| codex | `codex/gpt-5.6-sol` | 13 | 13/13 (100%) | 100% | 100% | 1.00 ± 0.00 | 215 ± 183 | 285680 ± 196260 | 8343 ± 5436 | 0.38 ± 0.22 | 1.0 ± 0.0 | 0 | 0 |
+
+## Per task
+
+Each cell: passes/trials · wall s · cost $ · operator msgs (mean ± stdev).
+
+| Task | archon | aether | claude | codex |
+|---|---|---|---|---|
+| ask-cache-invalidation | 2/2 · 35 ± 0 · 0.23 ± 0.01 · 1.0 ± 0.0 | 2/2 · 34 ± 2 · 0.20 ± 0.01 · 1.0 ± 0.0 | 2/2 · 32 ± 4 · 0.20 ± 0.00 · 1.0 ± 0.0 | 2/2 · 63 ± 2 · 0.11 ± 0.01 · 1.0 ± 0.0 |
+| feature-token-bucket | 2/2 · 586 ± 42 · 3.04 ± 0.56 · 4.0 ± 1.4 | 2/2 · 109 ± 20 · 0.51 ± 0.07 · 3.0 ± 0.0 | 2/2 · 116 ± 22 · 0.49 ± 0.08 · 1.0 ± 0.0 | 2/2 · 194 ± 13 · 0.37 ± 0.03 · 1.0 ± 0.0 |
+| fix-off-by-one | 2/2 · 182 ± 151 · 0.64 ± 0.01 · 3.5 ± 0.7 | 2/2 · 45 ± 38 · 0.16 ± 0.00 · 1.0 ± 0.0 | 2/2 · 18 ± 2 · 0.16 ± 0.01 · 1.0 ± 0.0 | 2/2 · 57 ± 9 · 0.17 ± 0.04 · 1.0 ± 0.0 |
+| long-backlog | 2/2 · 390 ± 151 · 3.97 ± 0.19 · 6.0 ± 0.0 | 2/2 · 165 ± 1 · 0.72 ± 0.01 · 4.5 ± 0.7 | 1/1 · 154 ± 0 · 0.71 ± 0.00 · 1.0 ± 0.0 | 2/2 · 563 ± 233 · 0.75 ± 0.11 · 1.0 ± 0.0 |
+| multi-repo-currency | 2/2 · 193 ± 41 · 2.19 ± 0.05 · 4.0 ± 0.0 | 2/2 · 123 ± 12 · 0.56 ± 0.02 · 7.5 ± 0.7 | 2/2 · 110 ± 16 · 0.52 ± 0.06 · 1.0 ± 0.0 | 2/2 · 239 ± 1 · 0.52 ± 0.03 · 1.0 ± 0.0 |
+| multi-repo-pagination | 1/1 · 388 ± 0 · 2.73 ± 0.00 · 4.0 ± 0.0 | 1/1 · 111 ± 0 · 0.49 ± 0.00 · 6.0 ± 0.0 | 1/1 · 125 ± 0 · 0.56 ± 0.00 · 1.0 ± 0.0 | 1/1 · 222 ± 0 · 0.48 ± 0.00 · 1.0 ± 0.0 |
+| refactor-order-status | 1/1 · 190 ± 0 · 1.36 ± 0.00 · 3.0 ± 0.0 | 1/1 · 64 ± 0 · 0.38 ± 0.00 · 3.0 ± 0.0 | 1/1 · 55 ± 0 · 0.34 ± 0.00 · 1.0 ± 0.0 | 1/1 · 197 ± 0 · 0.42 ± 0.00 · 1.0 ± 0.0 |
+| review-seeded-bug | — | 1/1 · 55 ± 0 · 0.27 ± 0.00 · 2.0 ± 0.0 | 1/1 · 41 ± 0 · 0.22 ± 0.00 · 1.0 ± 0.0 | 1/1 · 140 ± 0 · 0.23 ± 0.00 · 1.0 ± 0.0 |
+
+## Infrastructure failures
+
+Left out of every number above.
+
+- review-seeded-bug / archon #1: grading: aborting the failed merge of : git [&quot;merge&quot;, &quot;-q&quot;, &quot;--no-ff&quot;, &quot;--no-edit&quot;, &quot;&quot;] in ~/.local/share/archon-bench/work/20260926T200340Z/e447d784a73b9fefd03a69ae/review-seeded-bug fail…
+- long-backlog / claude #2: claude reported success: You've hit your session limit
+
+## Method
+
+- Every arm gets the same task prompt, effort and time limit, and the same model where the harness allows; `codex` runs its own model. Every arm runs with its tool permission prompts bypassed.
+- `claude` keeps Claude Code's built-in subagents (the Task tool); the `aether` arm is a single leaf agent without delegation.
+- Each trial starts from a fresh copy of the fixtures in an unguessably named directory outside the Archon checkout, with a one-commit git history. Hidden tests, reference solutions and rubrics are copied in only at grade time, into a separate copy the agent never sees, after the agent and every process it started have stopped. Agent processes do not inherit environment variables pointing at the checkout. There is no OS sandbox: an agent that searched the whole home directory could still find the checkout.
+- Success is the hidden grader's verdict. Test graders restore the visible tests from the task, not from the agent's repository, and require the runner's own summary to report no failures and a minimum number of passing tests. Rubric graders need related facts close together and cap the answer length.
+- A failed trial with a harness error (the arm could not run cleanly: a provider limit, a crash, a grading failure) is an infrastructure failure. It is left out of pass rates and every metric, counted under Infra and listed with its error.
+- Wall time runs from handing over the prompt until the arm finished; Archon's daemon start-up (recorded as `setup_secs`) and the quiet window used to detect that Archon finished are excluded.
+- Input tokens include cache reads and writes. Cost is billed dollars when reported, else Aether's estimate or `--price` list prices. `(n=…)` marks a metric only that many trials reported.
+- Operator messages are what the operator had to read: one final result for `claude`/`codex`, the assistant messages of the Aether agent, and the default-visible chat lines for Archon.
+- Values are mean ± sample standard deviation over graded trials. pass@k uses the unbiased estimator per task, averaged over tasks, with k the fewest graded trials any (task, arm) cell has.
+</pre></body></html>

@@ -1,0 +1,21 @@
+//! Pipelines: discovery and validation (`catalog`, `spec`, `builtin`),
+//! prompt templating (`template`), the autonomy knobs' stages and gates
+//! (`autonomy`), team stage names and merges (`team`), and the run state
+//! machine (`engine`).
+//! No process spawning and no store access: the daemon drives this crate.
+
+pub mod autonomy;
+pub mod builtin;
+pub mod catalog;
+pub mod contract;
+pub mod engine;
+mod gate;
+mod sections;
+pub mod spec;
+pub mod team;
+pub mod template;
+
+pub use catalog::{Catalog, CatalogSources};
+pub use engine::{EngineAction, OperatorWait, RunDriver, SpawnPlan};
+pub use spec::PipelineSpec;
+pub use template::RunVars;

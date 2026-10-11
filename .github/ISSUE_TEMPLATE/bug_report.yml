@@ -1,0 +1,54 @@
+name: Bug report
+description: Something Archon does wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For a security problem, do not file an issue:
+        use "Report a vulnerability" under the Security tab instead.
+
+        Remove tokens, private repository names and local paths from anything
+        you paste. Issues are public.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what Archon did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, in order. A minimal repository or configuration helps most.
+      placeholder: |
+        1. archon ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The error text, or the relevant part of `archon doctor` and `archon status`.
+      render: text
+  - type: input
+    id: archon-version
+    attributes:
+      label: Archon version
+      description: Output of `archon --version`.
+    validations:
+      required: true
+  - type: input
+    id: aether-version
+    attributes:
+      label: Aether version
+      description: The Aether version, and whether Archon runs its own Aether (dedicated mode) or yours (shared mode).
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04, macOS 15, ...
+    validations:
+      required: true

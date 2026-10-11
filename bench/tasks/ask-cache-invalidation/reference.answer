@@ -1,0 +1,5 @@
+Root cause: price updates only invalidate the product cache, never the category listing cache.
+
+`updatePrice` in `src/pricing.js` writes the new price to the store and deletes `productKey(sku)`, so the product page (`Catalog.product`) re-reads it immediately. Category pages are served by `Catalog.listing` in `src/catalog.js`, which caches each page's rows (including `priceCents`) under `listingKey(category, page)` with `LISTING_TTL_SECONDS` = 600 from `src/config.js`, i.e. a ten-minute TTL. Nothing deletes those listing entries on a price change, so a cached page keeps the old price until the entry expires, which is up to 10 minutes.
+
+Fix: in `updatePrice`, also invalidate the listing pages of the product's category (delete every `listingKey(category, page)` for that category, or keep a per-category version number in the listing key and bump it on writes).
