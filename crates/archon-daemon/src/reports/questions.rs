@@ -16,7 +16,7 @@ use std::path::Path;
 use archon_core::Timestamp;
 use archon_core::error::ArchonError;
 use archon_core::id::{QuestionId, ReportId};
-use archon_core::notify::{FeedEntry, FeedItem, Question};
+use archon_core::notify::{AnswerVia, FeedEntry, FeedItem, Question};
 use archon_core::protocol::ReportState;
 use archon_core::run::OperatorGate;
 use archon_queue::Store;
@@ -94,6 +94,7 @@ fn ask(
         options: vec![REOPEN.to_owned(), LEAVE_CLOSED.to_owned()],
         item: Some(gate.item.clone()),
         aether: None,
+        asked_by: None,
         asked_at: now,
         answer: None,
         answered_at: None,
@@ -102,6 +103,18 @@ fn ask(
     assert!(question.number > 0, "a recorded question is numbered");
     let item = store.append_feed(FeedEntry::Question(question.clone()), now)?;
     Ok((question.id, item))
+}
+
+/// Whether `question` is a report's "Reopen it?" question: one a record
+/// asks, or one worded as such that no record asks any more.
+pub fn asks_to_reopen(store: &mut Store, question: &Question) -> Result<bool, ArchonError> {
+    if is_reopen_question(question) {
+        return Ok(true);
+    }
+    let records = records::all(store)?;
+    Ok(records
+        .iter()
+        .any(|(_, record)| record.reopen_question.as_ref() == Some(&question.id)))
 }
 
 /// A "Reopen it?" question as [`ask`] words it, whichever build asked it.
@@ -160,9 +173,10 @@ pub async fn answer_reopen(
     ctx: &DaemonContext,
     question: &QuestionId,
     answer: &str,
+    via: AnswerVia,
 ) -> Result<Option<Question>, ArchonError> {
     assert!(!answer.trim().is_empty(), "an answer says something");
-    let claimed = claim(&mut *ctx.store.lock().await, question, answer)?;
+    let claimed = claim(&mut *ctx.store.lock().await, question, answer, via)?;
     let answer = answer.trim();
     let wants_reopen = answer.eq_ignore_ascii_case(REOPEN) || answer.eq_ignore_ascii_case("yes");
     match claimed {
@@ -199,6 +213,7 @@ fn claim(
     store: &mut Store,
     question: &QuestionId,
     answer: &str,
+    via: AnswerVia,
 ) -> Result<Option<Claimed>, ArchonError> {
     let records = records::all(store)?;
     let asking = records
@@ -213,7 +228,7 @@ fn claim(
             return Ok(None);
         }
         let report = report_asked_about(&records, &current).cloned();
-        let (question, echo) = record_answer(store, question, answer)?;
+        let (question, echo) = record_answer(store, question, answer, via)?;
         return Ok(Some(Claimed::Orphan {
             report,
             question,
@@ -225,7 +240,7 @@ fn claim(
         ReportState::Disconnected,
         "only a disconnected report asks to reopen"
     );
-    let (question, echo) = record_answer(store, question, answer)?;
+    let (question, echo) = record_answer(store, question, answer, via)?;
     let mut record = record.clone();
     record.reopen_question = None;
     records::put(store, report, record.clone(), archon_core::now())?;
@@ -243,6 +258,7 @@ fn record_answer(
     store: &mut Store,
     question: &QuestionId,
     answer: &str,
+    via: AnswerVia,
 ) -> Result<(Question, FeedItem), ArchonError> {
     let now = archon_core::now();
     let answered = store.answer_question(question, answer, now)?;
@@ -254,6 +270,7 @@ fn record_answer(
     let entry = FeedEntry::Answer {
         question: question.clone(),
         text: answer.to_owned(),
+        via,
     };
     let echo = store.append_feed(entry, now)?;
     Ok((answered, echo))
@@ -450,6 +467,7 @@ fn withdraw(
     let entry = FeedEntry::Answer {
         question: question.clone(),
         text: text.to_owned(),
+        via: AnswerVia::Archon,
     };
     store.append_feed(entry, now).map(Some)
 }
@@ -466,6 +484,7 @@ mod tests {
             options: vec![REOPEN.to_owned(), LEAVE_CLOSED.to_owned()],
             item: None,
             aether: None,
+            asked_by: None,
             asked_at: archon_core::now(),
             answer: None,
             answered_at: None,

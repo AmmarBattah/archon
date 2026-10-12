@@ -11,7 +11,7 @@ use archon_core::run::{GateDecision, GateSubject, OperatorGate, PipelineRun, Run
 use archon_pipeline::OperatorWait;
 use archon_queue::Store;
 
-use super::{FollowUp, RunTable, clip, finish, pages, recover, settle};
+use super::{FollowUp, RunTable, clip, finish, gate_news, pages, recover, settle};
 use crate::context::DaemonContext;
 use crate::reports;
 
@@ -120,6 +120,7 @@ pub(super) async fn announce(ctx: &DaemonContext, key: &GateKey) -> Result<Follo
         options: GATE_OPTIONS.iter().map(|o| (*o).to_owned()).collect(),
         item: Some(item.id.clone()),
         aether: None,
+        asked_by: None,
         asked_at: archon_core::now(),
         answer: None,
         answered_at: None,
@@ -138,8 +139,11 @@ pub(super) async fn announce(ctx: &DaemonContext, key: &GateKey) -> Result<Follo
         current.location = Some(location);
         current.question = Some(question.id.clone());
         store.update_gate(&current)?;
+        let news = gate_news::opened(ctx.config.aether.mode, &current, &item, &question);
+        crate::triggers::hold(&mut store, news)?;
         feed_item
     };
+    crate::triggers::wake(ctx);
     // No receivers is normal (nobody has chat open); not an error.
     let _ = ctx.feed.send(feed_item);
     Ok(FollowUp::default())

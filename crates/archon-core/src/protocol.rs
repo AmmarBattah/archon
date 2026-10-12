@@ -165,11 +165,24 @@ pub enum Request {
         item: Option<QueueItemId>,
         #[serde(default)]
         options: Vec<String>,
+        /// Aether's out-of-band MCP caller identity, never a tool argument;
+        /// recorded as the question's asker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<AetherAgentId>,
     },
     /// CLI only: the operator's answer, never the orchestrator's.
     Answer {
         question: QuestionId,
         text: String,
+    },
+    /// The orchestrator records that the operator answered, in chat, a
+    /// question it asked with `ask_operator`. Never a gate's question.
+    RecordChatAnswer {
+        question: QuestionId,
+        /// The operator's words.
+        answer: String,
+        /// Aether's out-of-band MCP caller identity, never a tool argument.
+        caller: Option<AetherAgentId>,
     },
     ListQuestions {
         open_only: bool,

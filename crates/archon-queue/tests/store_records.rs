@@ -6,7 +6,7 @@ use archon_core::aether_ids::AetherQuestionRef;
 use archon_core::autonomy::AutonomyPatch;
 use archon_core::error::ArchonError;
 use archon_core::id::{NotificationId, QuestionId, ReportId};
-use archon_core::notify::{FeedEntry, Notification, NotificationKind, Question};
+use archon_core::notify::{AnswerVia, FeedEntry, Notification, NotificationKind, Question};
 use archon_core::protocol::{ItemQuery, RepoRef};
 use archon_core::queue::{PauseState, Priority, QueueState};
 use archon_core::run::{RunState, StageState, Verdict};
@@ -388,6 +388,7 @@ fn feed_entries_round_trip_with_gapless_seq() {
         FeedEntry::Answer {
             question: QuestionId::new(),
             text: "yes".into(),
+            via: AnswerVia::ChatCommand,
         },
         FeedEntry::Report {
             report: ReportId::new(),
@@ -458,6 +459,7 @@ fn question(text: &str, at: i64) -> Question {
         options: vec!["yes".into(), "no".into()],
         item: None,
         aether: None,
+        asked_by: None,
         asked_at: t(at),
         answer: None,
         answered_at: None,

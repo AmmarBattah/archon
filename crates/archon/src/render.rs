@@ -183,8 +183,13 @@ fn describe(entry: &FeedEntry, labels: &QuestionLabels) -> Parts {
             parts
         }
         FeedEntry::Question(question) => describe_question(question, labels.get(&question.id)),
-        FeedEntry::Answer { question, text } => {
+        FeedEntry::Answer {
+            question,
+            text,
+            via,
+        } => {
             let mut parts = simple("answer", Style::Green, text);
+            parts.notes = via.note().map(str::to_owned).into_iter().collect();
             match labels.get(question) {
                 Some(n) => parts.text = format!("Q{n}: {text}"),
                 None => parts.reference = Some(format!("[{question}]")),
@@ -251,7 +256,7 @@ fn describe_question(question: &Question, number: Option<u64>) -> Parts {
 #[cfg(test)]
 mod tests {
     use archon_core::id::{FeedItemId, NotificationId, QueueItemId, ReportId};
-    use archon_core::notify::Notification;
+    use archon_core::notify::{AnswerVia, Notification};
 
     use super::*;
 
@@ -283,6 +288,7 @@ mod tests {
             options: options.iter().map(|o| (*o).to_owned()).collect(),
             item: None,
             aether: None,
+            asked_by: None,
             asked_at: archon_core::now(),
             answer: None,
             answered_at: None,
@@ -372,6 +378,7 @@ mod tests {
         let answer = item(FeedEntry::Answer {
             question: q.id.clone(),
             text: "yes".into(),
+            via: AnswerVia::Archon,
         });
         let mut labels = QuestionLabels::default();
         labels.insert(q.id.clone(), 1);
@@ -382,6 +389,29 @@ mod tests {
         );
         let bare = render_feed_item(&answer, false).unwrap();
         assert_eq!(head(&bare), format!("answer  yes  [{}]", q.id));
+        assert_eq!(bare.lines().count(), 1, "Archon's own surface goes unnamed");
+    }
+
+    #[test]
+    fn an_answer_given_in_chat_says_so() {
+        let q = question(&[]);
+        for (via, note) in [
+            (AnswerVia::ChatCommand, "answered from operator chat"),
+            (
+                AnswerVia::ChatReply,
+                "answered in chat, recorded by the orchestrator",
+            ),
+        ] {
+            let answer = item(FeedEntry::Answer {
+                question: q.id.clone(),
+                text: "approve".into(),
+                via,
+            });
+            let rendered = render_feed_item(&answer, false).unwrap();
+            let lines: Vec<&str> = rendered.lines().collect();
+            assert_eq!(lines.len(), 2, "{rendered}");
+            assert!(lines[1].contains(note), "{rendered}");
+        }
     }
 
     #[test]

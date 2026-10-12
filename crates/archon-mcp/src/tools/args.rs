@@ -78,6 +78,11 @@ pub(super) fn to_request(tool: &str, arguments: Value) -> Result<Request, ToolEr
             item: args.optional("item")?,
         },
         "ask_operator" => ask_operator(&mut args)?,
+        "record_chat_answer" => Request::RecordChatAnswer {
+            question: args.required("question")?,
+            answer: args.required_text("answer")?,
+            caller: None,
+        },
         "publish_report" => publish_report(&mut args)?,
         "autonomy_policy" => Request::Autonomy {
             repo: args.optional("repo")?,
@@ -471,6 +476,7 @@ fn ask_operator(args: &mut Args) -> Result<Request, ToolError> {
         text: args.required_text("text")?,
         item: args.optional("item")?,
         options: args.text_list("options")?,
+        caller: None,
     })
 }
 
