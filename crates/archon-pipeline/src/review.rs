@@ -77,8 +77,13 @@ impl Verdict {
 const MIN_COMMIT_CHARS: usize = 7;
 
 /// `value` as a commit id: hex, abbreviated to no fewer than seven digits.
+/// One trailing `...` or `…` is dropped: models mark abbreviations so, and git still resolves the id.
 fn commit_of(value: Option<&Value>) -> Option<String> {
     let text = value?.as_str()?.trim();
+    let text = text
+        .strip_suffix("...")
+        .or_else(|| text.strip_suffix('…'))
+        .unwrap_or(text);
     let sized = (MIN_COMMIT_CHARS..=64).contains(&text.len());
     let hex = sized && text.bytes().all(|b| b.is_ascii_hexdigit());
     hex.then(|| text.to_ascii_lowercase())
@@ -415,6 +420,12 @@ mod tests {
         let read = Verdict::read(Some(&delta)).unwrap();
         assert!(!read.pass);
         assert_eq!(read.base.as_deref(), Some("1234567"));
+        let marked = json!({"verdict": "pass", "head": "5d240fa...", "base": "e803fef…"});
+        let read = Verdict::read(Some(&marked)).unwrap();
+        assert_eq!(
+            (read.head.as_str(), read.base.as_deref()),
+            ("5d240fa", Some("e803fef"))
+        );
         for (structured, why) in [
             (None, "no structured verdict"),
             (Some(json!({"head": "abcdef1"})), "no `verdict`"),
@@ -422,6 +433,12 @@ mod tests {
             (Some(json!({"verdict": "pass"})), "`head`"),
             (Some(json!({"verdict": "pass", "head": "abc"})), "`head`"),
             (Some(json!({"verdict": "pass", "head": "HEAD~1"})), "`head`"),
+            (Some(json!({"verdict": "pass", "head": "abc..."})), "`head`"),
+            (
+                Some(json!({"verdict": "pass", "head": "abcdef1......"})),
+                "`head`",
+            ),
+            (Some(json!({"verdict": "pass", "head": "..."})), "`head`"),
             (
                 Some(json!({"verdict": "pass", "head": "abcdef1", "base": "main"})),
                 "`base`",
