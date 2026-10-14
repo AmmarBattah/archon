@@ -194,9 +194,33 @@ pub fn version_of(program: &Path) -> String {
     }
 }
 
+pub fn redact_home(text: &str, home: Option<&str>) -> String {
+    match home.filter(|home| home.starts_with('/') && home.len() > 1) {
+        Some(home) => text.replace(home, "$HOME"),
+        None => text.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions_redact_home_in_output_and_diagnostics() {
+        let home = "/users/operator";
+        for text in [
+            "tool 1.0 (/users/operator/bin/tool)",
+            "unavailable (/users/operator/bin/tool: missing)",
+            "unreachable: connecting to /users/operator/.local/share/archon-bench/run/aether.sock",
+        ] {
+            let redacted = redact_home(text, Some(home));
+            assert!(!redacted.contains(home));
+            assert_eq!(redacted, text.replace(home, "$HOME"));
+        }
+        for home in [None, Some(""), Some("/"), Some("relative")] {
+            assert_eq!(redact_home("tool 1.0", home), "tool 1.0");
+        }
+    }
 
     #[test]
     fn quoting_leaves_plain_words_and_escapes_the_rest() {

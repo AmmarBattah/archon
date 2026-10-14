@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="346" viewBox="0 0 1280 346" role="img">
+<title>Archon benchmark history: pass rate, cost and wall time</title>
+<desc>Historical snapshots use different models, task mixes and sample sizes. A complete smoke run establishes a separate quality baseline.</desc>
+<style>text {font: 12px system-ui,sans-serif; fill:#172033}</style>
+<rect width="1280" height="346" fill="#fff"/>
+<text x="20" y="30" style="font-size:20px;font-weight:600">Benchmark history · Archon and single-agent Aether</text>
+<g transform="translate(20,70)">
+<text x="0" y="0" font-weight="600">Pass rate (%)</text>
+<text x="0" y="43">v1 archon</text>
+<rect x="108" y="30" width="230.00" height="19" fill="#225ea8"/>
+<text x="344.00" y="43">100.00</text>
+<text x="0" y="74">v1 aether</text>
+<rect x="108" y="61" width="230.00" height="19" fill="#d97706"/>
+<text x="344.00" y="74">100.00</text>
+<text x="0" y="105">v2 archon</text>
+<rect x="108" y="92" width="230.00" height="19" fill="#225ea8"/>
+<text x="344.00" y="105">100.00</text>
+<text x="0" y="136">v2 aether</text>
+<rect x="108" y="123" width="230.00" height="19" fill="#d97706"/>
+<text x="344.00" y="136">100.00</text>
+<text x="0" y="167">v3 archon</text>
+<rect x="108" y="154" width="201.25" height="19" fill="#225ea8"/>
+<text x="315.25" y="167">87.50</text>
+<text x="0" y="198">v3 aether</text>
+<rect x="108" y="185" width="215.62" height="19" fill="#d97706"/>
+<text x="329.62" y="198">93.75</text>
+</g><g transform="translate(440,70)">
+<text x="0" y="0" font-weight="600">Mean cost / trial ($)</text>
+<text x="0" y="43">v1 archon</text>
+<rect x="108" y="30" width="200.00" height="19" fill="#225ea8"/>
+<text x="314.00" y="43">2.02</text>
+<text x="0" y="74">v1 aether</text>
+<rect x="108" y="61" width="41.34" height="19" fill="#d97706"/>
+<text x="155.34" y="74">0.42</text>
+<text x="0" y="105">v2 archon</text>
+<rect x="108" y="92" width="152.29" height="19" fill="#225ea8"/>
+<text x="266.29" y="105">1.54</text>
+<text x="0" y="136">v2 aether</text>
+<rect x="108" y="123" width="38.94" height="19" fill="#d97706"/>
+<text x="152.94" y="136">0.39</text>
+<text x="0" y="167">v3 archon</text>
+<rect x="108" y="154" width="118.02" height="19" fill="#225ea8"/>
+<text x="232.02" y="167">1.19</text>
+<text x="0" y="198">v3 aether</text>
+<rect x="108" y="185" width="38.21" height="19" fill="#d97706"/>
+<text x="152.21" y="198">0.39</text>
+</g><g transform="translate(860,70)">
+<text x="0" y="0" font-weight="600">Mean wall / trial (s)</text>
+<text x="0" y="43">v1 archon</text>
+<rect x="108" y="30" width="200.00" height="19" fill="#225ea8"/>
+<text x="314.00" y="43">279.33</text>
+<text x="0" y="74">v1 aether</text>
+<rect x="108" y="61" width="65.14" height="19" fill="#d97706"/>
+<text x="179.14" y="74">90.98</text>
+<text x="0" y="105">v2 archon</text>
+<rect x="108" y="92" width="112.98" height="19" fill="#225ea8"/>
+<text x="226.98" y="105">157.80</text>
+<text x="0" y="136">v2 aether</text>
+<rect x="108" y="123" width="53.34" height="19" fill="#d97706"/>
+<text x="167.34" y="136">74.50</text>
+<text x="0" y="167">v3 archon</text>
+<rect x="108" y="154" width="111.49" height="19" fill="#225ea8"/>
+<text x="225.49" y="167">155.72</text>
+<text x="0" y="198">v3 aether</text>
+<rect x="108" y="185" width="55.19" height="19" fill="#d97706"/>
+<text x="169.19" y="198">77.08</text>
+</g>
+<text x="20" y="311">Observed graded-trial means; infrastructure failures excluded. v1/v2 are incomplete and task weights differ.</text>
+<text x="20" y="331">Smoke uses Haiku and four tasks (two new); older snapshots use Opus. Compare like configurations. Small samples do not establish reliability.</text>
+</svg>

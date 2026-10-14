@@ -8,7 +8,7 @@ explains the method and publishes the v1 results.
 
 ## Tasks
 
-Eight tasks under [`tasks/`](tasks). Each has fixture repositories, a prompt,
+Eleven tasks under [`tasks/`](tasks). Each has fixture repositories, a prompt,
 a time limit, and a grader the agent never sees.
 
 | Task | What it tests | Grader | Limit |
@@ -21,9 +21,16 @@ a time limit, and a grader the agent never sees.
 | `long-backlog` | Work through four independent tickets in one repository, one commit each (Python). | Hidden acceptance tests for every ticket. | 60 min |
 | `ask-cache-invalidation` | Answer a debugging question about stale prices without changing code (Node). | Keyword rubric on the answer. | 15 min |
 | `review-seeded-bug` | Review an HMAC token module and find its seeded forgery bug (Node). | Keyword rubric on the answer. | 15 min |
+| `quality-ledger-transfer` | Atomic bounded transfers, failed-operation rollback, account validation and concurrent conservation (Python). | Hidden state and boundary tests. | 12 min |
+| `quality-safe-extract` | Batch validation before writes, traversal and symlink rejection, duplicate and ancestor conflicts (Python). | Hidden filesystem tests. | 12 min |
+| `quality-retry-budget` | Deadline arithmetic, capped exponential delay, Retry-After semantics and input validation (Python). | Hidden numerical and policy tests. | 12 min |
 
 `archon-bench verify` checks that every grader passes the reference solution
-and fails the untouched fixture.
+and fails the untouched fixture. The three quality tasks also ship a
+`naive.patch`: a plausible incomplete fix that passes visible tests and must
+fail hidden tests. Verify applies each variant to a separate fresh fixture;
+it fails if a naive solution passes. Hidden tests use fixed data, temporary
+files and bounded synchronization, with no network or wall-clock sleeps.
 
 ## Arms
 
@@ -32,11 +39,17 @@ and fails the untouched fixture.
 | `archon` | A private `archond` per trial, with the fixture registered. The prompt is sent as an operator message, and Archon's orchestrator picks the pipeline, plans work items and runs its stage agents (implement, review and so on). |
 | `aether` | One Aether leaf agent (`create_agent`) with the prompt, without delegation. |
 | `claude` | `claude -p … --dangerously-skip-permissions`. Claude Code keeps its built-in Task subagents. |
-| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox` on codex's own default model. |
+| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox` on `gpt-6-luna` by default. |
 
 Every arm gets the same prompt, effort and time limit, with tool permission
 prompts bypassed. `archon`, `aether` and `claude` use the same model.
 `archon` and `aether` run on the same Aether daemon.
+
+Live test and benchmark runs use `claude-code/claude-haiku-5-5` or
+`codex/gpt-6-luna` under the operator's model rule. Plain `run` defaults to
+Haiku for `archon`, `aether` and `claude`, and Luna for `codex`; these defaults
+are independent of local daemon configuration. Historical Opus/Sol snapshots
+below describe earlier runs, not the current test defaults.
 
 ## Isolation and anti-gaming
 
@@ -223,12 +236,132 @@ built from this checkout, first on `PATH`. Then run:
 archon-bench verify
 archon-bench run --dry-run
 archon-bench run --trials 3 --parallel 3 --effort high \
-  --model claude-code/claude-opus-5-5 \
-  --price gpt-5.6-sol=4,0.4,20 \
-  --aether-socket ~/.local/share/archon-live/aether.sock \
+  --model claude-code/claude-haiku-5-5 \
+  --arms archon,aether \
+  --aether-socket "$AETHER_SOCKET" \
   --max-usd 37
 archon-bench report bench/results/<stamp>
 ```
 
 (`archon-bench` is `cargo run -p archon-bench --`.) Results land in
 `bench/results/<stamp>/`, which is gitignored.
+
+Set up the private environment from [the smoke instructions](results-smoke/README.md)
+first. Every live `run` selecting `archon` or `aether` performs the same sandbox
+preflight as smoke, before collecting versions or starting trials. Plans with
+`--dry-run` remain available without a sandbox or baseline. Recorded version
+strings and connection diagnostics replace the operator's home path with `$HOME`.
+
+## Quality smoke gate
+
+**Baseline pending:** the first Haiku attempt completed only three of eight
+cells after a diagnostic isolation error exhausted the budget. No measured
+`baseline.json` is committed; the default gate fails until a complete reviewed
+run establishes one. See [the evidence and incident account](results-smoke/README.md).
+The harness, adversarial checks and dry-run preset are ready.
+
+Run this before merging changes to routing, prompts or review. It fixes the
+suite to `fix-off-by-one`, `quality-ledger-transfer`, `quality-retry-budget`
+and `review-seeded-bug`, with `archon` and single-agent `aether`, one trial
+per cell, serial execution, `claude-code/claude-haiku-5-5` at high effort
+and a default **$7 admission limit**. The three
+quality checks require care beyond the visible examples: a naive transfer can
+mutate before detecting overflow, a retry calculation can clip a server delay
+or retry at the deadline, and a security review must identify a token forgery.
+`quality-safe-extract` stays in the full suite; its strict review cost makes it
+less suitable for the cheap smoke preset.
+
+```sh
+cargo build -p archon -p archon-bench --locked
+archon-bench verify
+archon-bench smoke --dry-run
+ARCHON_SOCKET=<private-sandbox>/run/archond.sock archon-bench smoke \
+  --archon-bin <private-sandbox>/bin/archon \
+  --aether-socket <private-sandbox>/run/aetherd.sock
+```
+
+All four `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR`, `AETHER_CONFIG_DIR` and
+`AETHER_DATA_DIR` must also be set to existing, distinct private directories
+below that sandbox root; aliases to the same directory are rejected. Retain this
+entire environment for every diagnostic: ordinary Archon CLI commands can
+autostart a daemon, even a queue read. Prefer saved captures. Both sockets must be under `$XDG_DATA_HOME/archon-bench` (normally
+`~/.local/share/archon-bench`), with real parent directories. The sandbox
+Aether daemon needs the same `ARCHON_SOCKET`, its own configuration and data,
+and the benchmark's `archon` MCP registration; its `PATH` must find this
+checkout's copied binary first. Never use an operator daemon. A reproducible
+setup and the measured first run are in
+[`results-smoke/README.md`](results-smoke/README.md).
+
+The command prints pass rate, cost and wall time per arm and task, writes the
+usual JSON/Markdown/HTML reports plus `gate.json`, and exits nonzero if Archon
+loses passes against a measured `results-smoke/baseline.json`. Missing,
+duplicate, unpriced, timed-out or infrastructure-error trials cannot pass.
+The model, effort, task set, trial count and time limits must match the stored
+baseline. Luna is selectable with `--model codex/gpt-6-luna --baseline <luna.json>`;
+that file must point to a separately measured Luna baseline. Do not compare
+a different model against Haiku's threshold. Aether's accuracy is reported as the comparison arm; Archon's rate
+is the quality gate. The command never updates the baseline automatically.
+
+Bootstrap the first baseline after setting up the private environment:
+
+```sh
+archon-bench smoke --bootstrap --archon-bin "$sandbox/bin/archon" \
+  --aether-socket "$AETHER_SOCKET"
+```
+
+This runs the exact preset under the shared preflight without reading
+`baseline.json`. Only complete, priced, within-budget evidence with a positive
+Archon pass count produces `<results>/<stamp>/candidate-baseline.json`.
+Review the run, its failures, model, effort, budget and provenance. In a reviewed
+commit, copy the candidate to `bench/results-smoke/baseline.json` and change
+`candidate` to `false`. Candidate files are rejected by the gate until reviewed;
+bootstrap never promotes or overwrites the stored baseline.
+
+`--max-usd` stops admission once completed spend reaches the limit and also
+checks total spend at the end. It is **not a provider hard billing cap**: an
+already running trial may exceed it. Serial execution limits the overshoot
+to that trial. A partial or over-budget run exits nonzero; keep its evidence,
+investigate, and explicitly budget a new run. Costs use the same billed or
+estimated accounting as the full suite.
+
+The baseline records `max_usd`; neither the requested check cap nor the
+recorded run cap may exceed it. Total spend must satisfy both the run cap and
+the requested check cap. Increasing the budget requires a reviewed baseline.
+
+To check committed evidence without paying again:
+
+```sh
+archon-bench smoke --check-results bench/results-smoke
+```
+
+Change a baseline only in a reviewed commit with the corresponding complete
+real run, a reason for changing the suite/model or threshold, and updated
+`source_run`. One trial per cell is a cheap regression signal, not a
+statistical reliability estimate. A passing smoke is no substitute for tests
+or for investigating a task whose hidden grader no longer rejects its naive
+fixture.
+
+### Pipeline and review reports
+
+Reports now include disjoint **whole-trial** pipeline and review-level
+buckets for Archon, including pass rate, cost and wall time. A trial with
+multiple pipelines or levels appears in one `mixed: ...` bucket, so its cost
+and verdict are never attributed separately to every work item. These are
+observational associations, not measurements of review's causal effect.
+Missing capture is `unknown (no capture)`; an empty captured queue is `no work (empty queue)`.
+Missing review policy is unknown, never inferred as `none`. Older results
+can recover metadata from their `archon-items.json` captures when available.
+
+The snapshots remain versioned. Regenerate the history figure and numeric
+CSV after adding a snapshot:
+
+```sh
+python3 bench/history.py bench/results-v1 bench/results-v2 bench/results-v3 \
+  --output bench/results-smoke/history.svg
+```
+
+![Pass rate, cost and wall over published snapshots](results-smoke/history.svg)
+
+The current history excludes the incomplete smoke attempt. A completed smoke
+will use Haiku and a different task mix, starting a separate quality baseline.
+The historical plot shows observed means, not an apples-to-apples speedup.

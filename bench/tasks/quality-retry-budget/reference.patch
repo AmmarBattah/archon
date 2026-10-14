@@ -1,0 +1,27 @@
+--- a/retry_budget.py
++++ b/retry_budget.py
+@@ -3,4 +3,23 @@
+ 
+ def retry_delay(attempt, elapsed_ms, *, max_attempts=4, budget_ms=1000,
+                 base_ms=100, cap_ms=400, retry_after_ms=None):
+-    raise NotImplementedError
++    values = [(attempt, 1), (max_attempts, 1), (elapsed_ms, 0),
++              (budget_ms, 0), (base_ms, 0), (cap_ms, 0)]
++    if retry_after_ms is not None:
++        values.append((retry_after_ms, 0))
++    if any(type(value) is not int or value < minimum for value, minimum in values):
++        raise ValueError("retry arguments must be integers in the documented range")
++    if attempt >= max_attempts or elapsed_ms >= budget_ms:
++        return None
++    if base_ms == 0 or cap_ms == 0:
++        backoff = 0
++    elif attempt - 1 >= cap_ms.bit_length():
++        backoff = cap_ms
++    else:
++        backoff = min(cap_ms, base_ms << (attempt - 1))
++    assert 0 <= backoff <= cap_ms
++    delay = max(backoff, retry_after_ms if retry_after_ms is not None else 0)
++    assert delay >= backoff
++    if elapsed_ms + delay >= budget_ms:
++        return None
++    return delay

@@ -1,0 +1,283 @@
+{
+  "run": "20261014T114814Z",
+  "reason": "Interrupted during extraction strict review to preserve the total $12 budget; extraction never graded.",
+  "interrupted": true,
+  "baseline_evidence": false,
+  "completed_trials": 6,
+  "completed_trial_cost_usd": 4.928224800000001,
+  "all_agent_cost_usd": 10.8980292,
+  "agents": [
+    {
+      "id": "agt_01M4X3VPSA5GNP0H8R5KFSMEAF",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.2349464
+    },
+    {
+      "id": "agt_01M4X3WB1QXRBB66R7QHY63EJV",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0
+    },
+    {
+      "id": "agt_01M4X3WB1YA2NC8JMZYHHFY6CX",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.1964632
+    },
+    {
+      "id": "agt_01M4X3YKMB3H27YYSCYSS7PTX1",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.1648228
+    },
+    {
+      "id": "agt_01M4X3Z55A9ZQSYSWT6D6B3PR4",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.26683619999999997
+    },
+    {
+      "id": "agt_01M4X3ZR3C5QTPP275BX76M9MP",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0
+    },
+    {
+      "id": "agt_01M4X3ZR413XQWBRAWMCS7KCJ0",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 1.0472684
+    },
+    {
+      "id": "agt_01M4X420CTNFK7QMP1GH8AH8MH",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.338111
+    },
+    {
+      "id": "agt_01M4X4276YPSACYC64PRJPQKWJ",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.3008176
+    },
+    {
+      "id": "agt_01M4X42EJ4DQS7SK3DGDJ1GXXF",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.32837739999999993
+    },
+    {
+      "id": "agt_01M4X46NQBS2T5ZK4B9RVCSWB5",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.5024274
+    },
+    {
+      "id": "agt_01M4X4E5FTRZ3N81D65HDC2CZK",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.3936272
+    },
+    {
+      "id": "agt_01M4X4GE117JQEJD8YKBYRHQ16",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.27276639999999996
+    },
+    {
+      "id": "agt_01M4X4H1AJXAGYS9EV05HEV0H5",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0
+    },
+    {
+      "id": "agt_01M4X4H1AW9S7AYTBK18DYNQTJ",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.38041480000000005
+    },
+    {
+      "id": "agt_01M4X4JB71NM4BHS958NWG089X",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.211107
+    },
+    {
+      "id": "agt_01M4X4NBJDJ91EKQNB825000XM",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.290239
+    },
+    {
+      "id": "agt_01M4X4QA88V1W9X3HAEKX7WYN1",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.37650240000000007
+    },
+    {
+      "id": "agt_01M4X4QWVMG9NXSJRDFHCCR72K",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0
+    },
+    {
+      "id": "agt_01M4X4QWW4YMDXG0MC3WP4QE03",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 1.2662910000000005
+    },
+    {
+      "id": "agt_01M4X4TFS2D0D5SFVSA8K9YPM5",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.360623
+    },
+    {
+      "id": "agt_01M4X4TPTKAY4CQ3S119N03B9P",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.4050808
+    },
+    {
+      "id": "agt_01M4X4TY9GCQ6VN0R6KY4HJHBW",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.3197366
+    },
+    {
+      "id": "agt_01M4X508Z61ASNZT9SS4TT70K5",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.3848786
+    },
+    {
+      "id": "agt_01M4X50J9KH512T508SX9ZHKK9",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.436351
+    },
+    {
+      "id": "agt_01M4X50W5EDVBC9TH93GED0NQJ",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.3837102
+    },
+    {
+      "id": "agt_01M4X54JG3TXXQK8W7WZW22MV3",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.3858698
+    },
+    {
+      "id": "agt_01M4X54VDY2ETTE3WS07T2ZDX7",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.5025716
+    },
+    {
+      "id": "agt_01M4X5544ZBDZAFDHAVQFKAJHX",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.4193838
+    },
+    {
+      "id": "agt_01M4X596H7Y9TSEW2P21FNK5DM",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0
+    },
+    {
+      "id": "agt_01M4X596HNJE8B3Y24HDAFSFB6",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.3503718
+    },
+    {
+      "id": "agt_01M4X5A1MPRXEPJNH0P09AHGD8",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.1091254
+    },
+    {
+      "id": "agt_01M4X5A7TWNRPC6YBF41YB6TYY",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.1198596
+    },
+    {
+      "id": "agt_01M4X5AESKWZKNSAW8P886WQN4",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.1494488
+    }
+  ]
+}

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{bail, ensure};
 use archon_bench::arms::ArmSettings;
 use archon_bench::isolation::Protected;
 use archon_bench::metrics::Arm;
@@ -18,6 +18,8 @@ use archon_bench::usage::PriceArg;
 use archon_bench::verify;
 use archon_core::model::{Effort, ModelRef};
 use clap::{Args, Parser, Subcommand};
+
+mod smoke_cli;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,6 +40,8 @@ enum BenchCommand {
     List,
     /// Run trials and write results.jsonl, run.json, summary.md, chart.json and report.html.
     Run(Box<RunArgs>),
+    /// Run the fixed quality gate or bootstrap a candidate baseline.
+    Smoke(Box<smoke_cli::SmokeArgs>),
     /// Re-render summary.md, chart.json and report.html from a results directory.
     Report {
         results: PathBuf,
@@ -45,7 +49,7 @@ enum BenchCommand {
         #[arg(long)]
         lavish: bool,
     },
-    /// Check every grader: fails on the untouched fixture, passes with the reference.
+    /// Check graders against untouched, reference and optional naive fixtures.
     Verify {
         /// Task ids; empty checks every task.
         #[arg(long, value_delimiter = ',')]
@@ -71,7 +75,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 1)]
     parallel: usize,
     /// The model every Claude-based arm uses, as provider/model.
-    #[arg(long, default_value = "claude-code/claude-opus-5-5")]
+    #[arg(long, default_value = "claude-code/claude-haiku-5-5")]
     model: ModelRef,
     /// Override --model for the archon arm (orchestrator and stages).
     #[arg(long)]
@@ -82,7 +86,7 @@ struct RunArgs {
     /// `claude --model`; defaults to --model's name when it is a claude-code model.
     #[arg(long)]
     claude_model: Option<String>,
-    /// `codex exec -m`; defaults to `model` in ~/.codex/config.toml.
+    /// `codex exec -m`; defaults to gpt-6-luna.
     #[arg(long)]
     codex_model: Option<String>,
     #[arg(long, default_value = "high")]
@@ -143,13 +147,22 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        BenchCommand::Run(args) => run(&cli.tasks, *args).await,
+        BenchCommand::Run(args) => run(&cli.tasks, *args).await.map(|_| ()),
+        BenchCommand::Smoke(args) => smoke_cli::run(&cli.tasks, *args).await,
         BenchCommand::Report { results, lavish } => render(&results, lavish),
         BenchCommand::Verify { only } => verify_all(&cli.tasks, &only).await,
     }
 }
 
-async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<()> {
+async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<Option<PathBuf>> {
+    if !args.dry_run
+        && args
+            .arms
+            .iter()
+            .any(|arm| matches!(arm, Arm::Archon | Arm::Aether))
+    {
+        smoke_cli::validate_sockets(args.aether_socket.as_deref())?;
+    }
     let tasks = BenchTask::select(BenchTask::load_all(tasks_root)?, &args.only)?;
     let protected = Protected::for_run(tasks_root, &args.results_dir)?;
     let work_dir = match &args.work_dir {
@@ -185,10 +198,11 @@ async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<()> {
             "{}",
             plan::render_dry_run(&tasks, &specs, &settings, &options, &versions)?
         );
-        return Ok(());
+        return Ok(None);
     }
     let dir = runner::run(tasks, settings, options).await?;
-    render(&dir, args.lavish)
+    render(&dir, args.lavish)?;
+    Ok(Some(dir))
 }
 
 fn program_of(arm: Arm) -> &'static str {
@@ -211,7 +225,7 @@ fn settings(args: &RunArgs) -> anyhow::Result<ArmSettings> {
     };
     let codex_model = match &args.codex_model {
         Some(model) => model.clone(),
-        None if args.arms.contains(&Arm::Codex) => codex_default_model()?,
+        None if args.arms.contains(&Arm::Codex) => "gpt-6-luna".to_owned(),
         None => String::new(),
     };
     ensure!(
@@ -237,28 +251,6 @@ fn settings(args: &RunArgs) -> anyhow::Result<ArmSettings> {
         prices: args.price.clone(),
         env: Default::default(),
     })
-}
-
-/// The `model` key of `$CODEX_HOME/config.toml` (default `~/.codex`).
-fn codex_default_model() -> anyhow::Result<String> {
-    let home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".codex")));
-    let path = home
-        .context("neither CODEX_HOME nor HOME is set; pass --codex-model")?
-        .join("config.toml");
-    let text = std::fs::read_to_string(&path).with_context(|| {
-        format!(
-            "reading {} for the codex model; pass --codex-model",
-            path.display()
-        )
-    })?;
-    let config: toml::Table =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let model = config.get("model").and_then(toml::Value::as_str);
-    model
-        .map(str::to_owned)
-        .with_context(|| format!("{} sets no model; pass --codex-model", path.display()))
 }
 
 fn render(dir: &Path, lavish: bool) -> anyhow::Result<()> {
@@ -291,6 +283,9 @@ async fn verify_all(tasks_root: &Path, only: &[String]) -> anyhow::Result<()> {
             checked.reference.success,
             checked.reference.score
         );
+        if let Some(naive) = &checked.naive {
+            println!("\tnaive: pass={} score={:?}", naive.success, naive.score);
+        }
         if !checked.holds() {
             broken.push(checked.task);
         }
@@ -301,4 +296,25 @@ async fn verify_all(tasks_root: &Path, only: &[String]) -> anyhow::Result<()> {
         base.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paid_run_defaults_use_cheap_models_without_local_config() {
+        let cli = Cli::parse_from(["archon-bench", "run", "--dry-run"]);
+        let BenchCommand::Run(args) = cli.command else {
+            panic!("parsed another command");
+        };
+        let settings = settings(&args).unwrap();
+        assert_eq!(
+            settings.archon_model.to_string(),
+            "claude-code/claude-haiku-5-5"
+        );
+        assert_eq!(settings.aether_model, settings.archon_model);
+        assert_eq!(settings.claude_model, "claude-haiku-5-5");
+        assert_eq!(settings.codex_model, "gpt-6-luna");
+    }
 }

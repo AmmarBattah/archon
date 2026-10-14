@@ -179,20 +179,20 @@ mod tests {
         let relative = Protected::new(&[Path::new("src/../src")]).unwrap();
         assert_eq!(relative.roots(), [cwd.join("src").canonicalize().unwrap()]);
         let protected = Protected {
-            roots: vec!["/home/u/archon".into(), "/data/results".into()],
+            roots: vec!["/users/u/archon".into(), "/data/results".into()],
         };
         let scrub = protected.scrub_env(vars(&[
-            ("CARGO_MANIFEST_DIR", "/home/u/archon/bench"),
+            ("CARGO_MANIFEST_DIR", "/users/u/archon/bench"),
             ("CARGO_PKG_NAME", "archon-bench"),
-            ("CARGO_HOME", "/home/u/.cargo"),
+            ("CARGO_HOME", "/users/u/.cargo"),
             ("CARGO_BUILD_JOBS", "4"),
             ("CARGO_TARGET_DIR", "/shared/target"),
             ("OLDPWD", "/somewhere"),
             ("NOTES", "see /data/results/20260926"),
-            ("HOME", "/home/u"),
+            ("HOME", "/users/u"),
             (
                 "PATH",
-                "/home/u/archon/target/debug:/usr/bin:/home/u/.cargo/bin",
+                "/users/u/archon/target/debug:/usr/bin:/users/u/.cargo/bin",
             ),
             ("ANTHROPIC_API_KEY", "sk-test"),
         ]));
@@ -208,7 +208,7 @@ mod tests {
         );
         assert_eq!(
             scrub.set,
-            [("PATH".to_owned(), "/usr/bin:/home/u/.cargo/bin".to_owned())]
+            [("PATH".to_owned(), "/usr/bin:/users/u/.cargo/bin".to_owned())]
         );
         let untouched = protected.scrub_env(vars(&[("PATH", "/usr/bin")]));
         assert!(untouched.set.is_empty() && untouched.remove.is_empty());

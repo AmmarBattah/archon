@@ -1,0 +1,49 @@
+--- a/ledger.py
++++ b/ledger.py
+@@ -1,14 +1,43 @@
+ """Bounded, thread-safe ledger. See SPEC.md."""
++
++from threading import Lock
+ 
+ MAX_BALANCE = 2**63 - 1
+ 
+ 
+ class Ledger:
+     def __init__(self, balances):
+-        raise NotImplementedError
++        if not isinstance(balances, dict):
++            raise ValueError("balances must be a dict")
++        if any(not isinstance(key, str) or not key for key in balances):
++            raise ValueError("account names must be nonempty strings")
++        if any(type(value) is not int or not 0 <= value <= MAX_BALANCE
++               for value in balances.values()):
++            raise ValueError("balances must be bounded integers")
++        self._balances = dict(balances)
++        self._lock = Lock()
++        assert self._balances == balances
++        assert self._balances is not balances
+ 
+     def transfer(self, source, destination, amount):
+-        raise NotImplementedError
++        if type(amount) is not int or not 1 <= amount <= MAX_BALANCE:
++            raise ValueError("amount must be a positive bounded integer")
++        with self._lock:
++            debit = self._balances[source]
++            credit = self._balances[destination]
++            if debit < amount:
++                return False
++            if source == destination:
++                return True
++            if credit > MAX_BALANCE - amount:
++                return False
++            remaining, received = debit - amount, credit + amount
++            assert 0 <= remaining <= MAX_BALANCE
++            assert remaining + received == debit + credit
++            self._balances[source] = remaining
++            self._balances[destination] = received
++            return True
+ 
+     def snapshot(self):
+-        raise NotImplementedError
++        with self._lock:
++            return dict(self._balances)

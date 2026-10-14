@@ -1,11 +1,13 @@
 //! `report.html`: the summary as a self-contained page (inline SVG, no
 //! scripts or network), optionally opened for review with `lavish-axi`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::summary::{Aggregate, Stat, Summary};
+use crate::metrics::Arm;
+use crate::summary::{Aggregate, ROUTING_NOTES, Stat, Summary};
 
 const BAR_WIDTH: f64 = 420.0;
 const ROW_HEIGHT: f64 = 26.0;
@@ -74,6 +76,7 @@ pub fn render_html(summary: &Summary, markdown: &str) -> String {
          <style>body{font:15px/1.45 system-ui,sans-serif;max-width:1100px;margin:2em auto;padding:0 1em;color:#222}\
          .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:1.5em}\
          figure{margin:0}figcaption{font-weight:600;margin-bottom:.3em}svg text{font-size:12px}\
+         table{border-collapse:collapse;width:100%;margin:1em 0}th,td{text-align:left;padding:.5em;border-bottom:1px solid #ddd}\
          pre{white-space:pre-wrap;background:#f6f6f6;padding:1em;border-radius:4px;font-size:13px}</style></head><body>\
          <h1>Archon benchmark</h1>",
     );
@@ -89,9 +92,45 @@ pub fn render_html(summary: &Summary, markdown: &str) -> String {
     for metric in &METRICS {
         out.push_str(&bar_chart(metric, &summary.arms));
     }
-    out.push_str("</div><h2>Full summary</h2><pre>");
+    out.push_str("</div>");
+    out.push_str(&routing_table("Per pipeline", &summary.pipelines));
+    out.push_str(&routing_table("Per review level", &summary.reviews));
+    out.push_str("<h2>Full summary</h2><pre>");
     out.push_str(&escape(markdown));
     out.push_str("</pre></body></html>\n");
+    out
+}
+
+fn routing_table(title: &str, buckets: &BTreeMap<String, Aggregate>) -> String {
+    if buckets.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "<h2>{}</h2><p>{}</p><table><thead><tr><th>Bucket</th><th>Trials</th>\
+         <th>Pass rate</th><th>Wall s</th><th>Cost $</th><th>Infra</th><th>Timeouts</th>\
+         </tr></thead><tbody>",
+        escape(title),
+        escape(ROUTING_NOTES)
+    );
+    for (label, a) in buckets {
+        assert_eq!(a.arm, Arm::Archon, "routing buckets contain Archon only");
+        assert!(a.successes <= a.trials, "passes cannot exceed trials");
+        let cost = a.cost_usd.as_ref().map_or_else(|| "—".into(), value_label);
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}/{} ({:.0}%)</td><td>{}</td>\
+             <td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape(label),
+            a.trials,
+            a.successes,
+            a.trials,
+            a.success_rate * 100.0,
+            value_label(&a.wall_secs),
+            cost,
+            a.infra,
+            a.timeouts
+        ));
+    }
+    out.push_str("</tbody></table>");
     out
 }
 
@@ -176,7 +215,6 @@ pub fn open_in_lavish(report: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::Arm;
     use crate::metrics::tests::result;
 
     #[test]
@@ -198,5 +236,26 @@ mod tests {
             1,
             "archon had no token counts"
         );
+    }
+
+    #[test]
+    fn report_renders_routing_tables_with_whole_trial_metrics() {
+        let mut archon = result(Some(2.0), None);
+        archon.arm = Arm::Archon;
+        archon.archon_work = Some(vec![crate::metrics::ArchonItem {
+            pipeline: "<direct>|custom".into(),
+            run_pipelines: Vec::new(),
+            review: Some(archon_core::autonomy::ReviewLevel::Strict),
+        }]);
+        let summary = Summary::build(&[archon], None).unwrap();
+        let html = render_html(&summary, "");
+        assert_eq!(html.matches("<table>").count(), 2);
+        assert!(html.contains("Per pipeline") && html.contains("Per review level"));
+        assert!(html.contains("&lt;direct&gt;|custom") && !html.contains("<direct>"));
+        assert!(html.contains("<td>strict</td><td>1</td><td>1/1 (100%)"));
+        assert!(html.contains("2.00 (n=1)"));
+        assert!(html.contains("not per-item outcomes"));
+        let md = crate::summary::render_markdown(&summary).unwrap();
+        assert!(md.contains("<direct>\\|custom"));
     }
 }

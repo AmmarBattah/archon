@@ -1,5 +1,5 @@
 //! Every bundled grader must fail on the untouched fixture and pass once the
-//! task's reference solution is applied.
+//! task's reference solution is applied; optional naive solutions must fail.
 
 use std::path::Path;
 
@@ -25,9 +25,11 @@ async fn every_grader_fails_untouched_and_passes_with_its_reference() {
     }
     let mut broken: Vec<Verification> = Vec::new();
     let mut checked = 0;
+    let mut naive_checked = 0;
     while let Some(joined) = running.join_next().await {
         let verification = joined.unwrap().unwrap();
         checked += 1;
+        naive_checked += usize::from(verification.naive.is_some());
         if !verification.holds() {
             broken.push(verification);
         }
@@ -39,5 +41,48 @@ async fn every_grader_fails_untouched_and_passes_with_its_reference() {
             kept.display()
         );
     }
-    assert!(checked >= 8, "only {checked} tasks were verified");
+    assert!(checked >= 11, "only {checked} tasks were verified");
+    assert!(
+        naive_checked >= 3,
+        "only {naive_checked} naive fixes were verified"
+    );
+}
+
+#[test]
+fn naive_quality_fixes_pass_the_visible_examples() {
+    use archon_bench::verify::NAIVE_PATCH;
+    use archon_bench::workspace::{self, TrialLayout};
+
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("tasks");
+    let base = tempfile::tempdir().unwrap();
+    let cases = [
+        ("quality-ledger-transfer", "test_ledger"),
+        ("quality-safe-extract", "test_safe_extract"),
+        ("quality-retry-budget", "test_retry_budget"),
+    ];
+    for (id, module) in cases {
+        let task = BenchTask::load(&suite.join(id)).unwrap();
+        let layout = TrialLayout::under(&base.path().join(id));
+        workspace::prepare(&task, &layout).unwrap();
+        let cwd = layout.agent_cwd(&task);
+        workspace::git(
+            &cwd,
+            &["apply", task.dir.join(NAIVE_PATCH).to_str().unwrap()],
+        )
+        .unwrap();
+        let output = std::process::Command::new("python3")
+            .args(["-m", "unittest", "-q", module])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{id}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("\nOK\n"),
+            "{id}: no passing test summary"
+        );
+    }
 }

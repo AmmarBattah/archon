@@ -1,0 +1,13 @@
+--- a/retry_budget.py
++++ b/retry_budget.py
+@@ -3,4 +3,9 @@
+ 
+ def retry_delay(attempt, elapsed_ms, *, max_attempts=4, budget_ms=1000,
+                 base_ms=100, cap_ms=400, retry_after_ms=None):
+-    raise NotImplementedError
++    if attempt >= max_attempts or elapsed_ms >= budget_ms:
++        return None
++    delay = min(cap_ms, base_ms * 2 ** min(attempt - 1, cap_ms.bit_length()))
++    if retry_after_ms is not None:
++        delay = min(cap_ms, max(delay, retry_after_ms))
++    return min(delay, budget_ms - elapsed_ms)

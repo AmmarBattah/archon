@@ -16,7 +16,7 @@ use crate::arms::{self, ArmOutcome, ArmSettings, TrialInput};
 use crate::grade::{self, GradeOutcome, ResultSource};
 use crate::metrics::{Arm, RunManifest, TrialResult};
 use crate::plan::{Budget, RunOptions, TrialSpec, check_plan, plan};
-use crate::process::version_of;
+use crate::process::{redact_home, version_of};
 use crate::task::BenchTask;
 use crate::workspace::{self, TrialLayout};
 
@@ -175,6 +175,9 @@ async fn run_trial(shared: &Shared, spec: TrialSpec) -> TrialResult {
         None => Err(anyhow::anyhow!("no workspace to grade")),
     };
     let mut result = trial_result(shared, task, spec, outcome, graded);
+    if let Some(layout) = &layout {
+        capture_routing(&mut result, &layout.logs);
+    }
     if !shared.options.keep_workspaces
         && let Some(layout) = &layout
         && let Err(e) = std::fs::remove_dir_all(&layout.workspace)
@@ -185,6 +188,22 @@ async fn run_trial(shared: &Shared, spec: TrialSpec) -> TrialResult {
     result.started_at = Some(started_at);
     result.finished_at = Some(finished_at);
     result
+}
+
+fn capture_routing(result: &mut TrialResult, logs: &Path) {
+    if result.arm != Arm::Archon {
+        return;
+    }
+    assert!(result.archon_work.is_none(), "routing is captured once");
+    assert!(logs.is_dir(), "prepared trials have a logs directory");
+    match arms::archon::read_archon_work(logs) {
+        Ok(work) => result.archon_work = work,
+        Err(e) => {
+            let problem = format!("capturing Archon routing: {e:#}");
+            eprintln!("{problem}");
+            result.note = Some(join_notes(result.note.take(), problem));
+        }
+    }
 }
 
 /// A fresh, unguessably named workspace and the trial's logs directory,
@@ -285,6 +304,7 @@ fn trial_result(
         started_at: None,
         finished_at: None,
         note,
+        archon_work: None,
     }
 }
 
@@ -308,6 +328,11 @@ pub async fn collect_versions(settings: &ArmSettings, arms: &[Arm]) -> BTreeMap<
             Err(e) => format!("unreachable: {e}"),
         };
         versions.insert("aetherd".to_owned(), aetherd);
+    }
+    let home = std::env::var_os("HOME");
+    let home = home.as_ref().map(|value| value.to_string_lossy());
+    for version in versions.values_mut() {
+        *version = redact_home(version, home.as_deref());
     }
     versions
 }
@@ -363,4 +388,41 @@ fn write_manifest(dir: &Path, manifest: &RunManifest) -> anyhow::Result<()> {
     let path = dir.join("run.json");
     std::fs::write(&path, serde_json::to_string_pretty(manifest)?)
         .with_context(|| format!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::tests::result;
+    use crate::workspace::tests::scratch;
+
+    #[test]
+    fn capture_routing_persists_an_observed_empty_queue() {
+        let tmp = scratch();
+        std::fs::write(tmp.path().join("archon-items.json"), "[]").unwrap();
+        let mut trial = result(None, None);
+        trial.arm = Arm::Archon;
+        capture_routing(&mut trial, tmp.path());
+        assert_eq!(trial.archon_work, Some(Vec::new()));
+        let json = serde_json::to_string(&trial).unwrap();
+        assert!(json.contains("\"archon_work\":[]"));
+    }
+
+    #[test]
+    fn capture_failure_is_visible_without_changing_the_grader_verdict() {
+        let tmp = scratch();
+        std::fs::write(tmp.path().join("archon-items.json"), "broken").unwrap();
+        let mut trial = result(None, None);
+        trial.arm = Arm::Archon;
+        trial.note = Some("grader remark".into());
+        capture_routing(&mut trial, tmp.path());
+        assert!(trial.archon_work.is_none());
+        assert!(trial.success && trial.error.is_none());
+        assert!(
+            trial
+                .note
+                .unwrap()
+                .starts_with("grader remark; capturing Archon routing:")
+        );
+    }
 }

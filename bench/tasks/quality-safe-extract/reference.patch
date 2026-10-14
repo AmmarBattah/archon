@@ -1,0 +1,65 @@
+--- a/safe_extract.py
++++ b/safe_extract.py
+@@ -1,5 +1,61 @@
+ """Extract validated regular-file entries. See SPEC.md."""
++
++from pathlib import Path
++
++
++def validate_entries(entries):
++    if not isinstance(entries, list):
++        raise ValueError("entries must be a list")
++    names = set()
++    for entry in entries:
++        if not isinstance(entry, tuple) or len(entry) != 2:
++            raise ValueError("each entry must be a (name, bytes) tuple")
++        name, data = entry
++        if not isinstance(name, str) or not isinstance(data, bytes):
++            raise ValueError("each entry needs a string name and bytes data")
++        if any(char in name for char in ("\\", ":", "\x00")):
++            raise ValueError("unsafe path character")
++        parts = name.split("/")
++        if any(part in ("", ".", "..") for part in parts):
++            raise ValueError("unsafe path component")
++        if name in names:
++            raise ValueError("duplicate path")
++        names.add(name)
++    for name in names:
++        if any(str(parent) in names for parent in Path(name).parents):
++            raise ValueError("file/directory collision")
++    assert len(names) == len(entries)
++    assert all(not Path(name).is_absolute() for name in names)
++
++
++def validate_targets(entries, root):
++    if not isinstance(root, (str, Path)):
++        raise ValueError("root must be a path")
++    root = Path(root)
++    if root.is_symlink() or not root.is_dir():
++        raise ValueError("root must be an existing real directory")
++    for name, _ in entries:
++        target = root / name
++        current = root
++        for part in Path(name).parts:
++            current = current / part
++            if current.is_symlink():
++                raise ValueError("symlinks are forbidden")
++            if current.exists() and (current == target or not current.is_dir()):
++                raise ValueError("existing path conflicts with entry")
++        assert target != root
++        assert target.is_relative_to(root)
++    return root
+ 
+ 
+ def extract(entries, root):
+-    raise NotImplementedError
++    validate_entries(entries)
++    root = validate_targets(entries, root)
++    for name, data in entries:
++        target = root / name
++        target.parent.mkdir(parents=True, exist_ok=True)
++        with target.open("xb") as output:
++            written = output.write(data)
++        assert written == len(data)
++        assert target.is_file()
++    return [name for name, _ in entries]
