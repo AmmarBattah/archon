@@ -974,7 +974,9 @@ After a quiet spell, delivery waits the window from the first event. News
 the operator waits on or must act on ends the window at once: an
 `operator_answer`, a `chat_answer`, a `gate_opened`, an `item_blocked`,
 `lavish_feedback`, a `budget` and a stage's escalation
-(`TriggerEvent::is_urgent`). News pushed while a batch is delivered has
+(`TriggerEvent::is_urgent`). So does the waking outcome of the last item
+queued, dispatching or running (`triggers::hold_at_once`): no other outcome
+is coming to share its turn. News pushed while a batch is delivered has
 waited already and goes out right after it.
 
 **Which news wakes the orchestrator.** A wake is a whole turn of the

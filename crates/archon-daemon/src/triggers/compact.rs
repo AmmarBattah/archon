@@ -42,6 +42,10 @@ pub(super) struct Held {
     /// it sooner carries this along.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defer_until: Option<Timestamp>,
+    /// News after which none is coming to share its turn: it skips the
+    /// coalescing window. A digest drops this, and waits the window.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_once: bool,
 }
 
 impl Held {
@@ -52,6 +56,7 @@ impl Held {
             pushed_at: Some(now),
             quiet,
             defer_until: None,
+            at_once: false,
         }
     }
 
@@ -198,6 +203,7 @@ pub(super) fn compact(held: Vec<Held>, facts: &Facts, now: Timestamp) -> Vec<Hel
         pushed_at: None,
         quiet,
         defer_until,
+        at_once: false,
     }];
     events.extend(kept);
     events
@@ -690,12 +696,21 @@ mod tests {
         assert_eq!(back.pushed_at, None);
         assert_eq!(back.event, budget("daily"));
         assert!(!back.quiet, "news saved before quiet news existed wakes");
+        assert!(!back.at_once, "and waits the coalescing window");
         let routine = Held {
             quiet: true,
             ..at(budget("daily"), now)
         };
         let raw = serde_json::to_value(&routine).unwrap();
         assert_eq!(raw["quiet"], true);
+        assert_eq!(raw.get("at_once"), None, "the default is left out");
         assert_eq!(serde_json::from_value::<Held>(raw).unwrap(), routine);
+        let last = Held {
+            at_once: true,
+            ..at(budget("daily"), now)
+        };
+        let raw = serde_json::to_value(&last).unwrap();
+        assert_eq!(raw["at_once"], true);
+        assert_eq!(serde_json::from_value::<Held>(raw).unwrap(), last);
     }
 }

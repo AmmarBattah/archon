@@ -261,6 +261,46 @@ async fn a_routine_success_waits_for_the_work_still_queued_and_wakes_with_it() {
     }
 }
 
+/// The last item to finish is told without the coalescing window, as no
+/// other outcome is coming; one finishing while work remains waits it.
+#[tokio::test]
+async fn the_last_outcome_skips_the_coalesce_window() {
+    let mut config = Config::default();
+    config.orchestrator.trigger_coalesce_ms = 60_000;
+    let h = Harness::with_config(config).await;
+    let mut noted = request("the first change");
+    noted.tags = vec![NOTIFY_TAG.into()];
+    let first = enqueued(&h, noted).await;
+    let mut after = request("the change after it");
+    after.depends_on = vec![first.id.clone()];
+    let second = enqueued(&h, after).await;
+    let delivery = tokio::spawn(triggers::deliver_loop(h.ctx.clone()));
+    succeed(&h, &first).await;
+    assert!(
+        triggers::due(&h.ctx).await.unwrap(),
+        "a notify tag wakes it"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!batch_keyed(&h).await, "the second may share the turn");
+
+    succeed(&h, &second).await;
+    let keyed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !batch_keyed(&h).await {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    delivery.abort();
+    assert!(keyed.is_ok(), "sent without the minute-long window");
+    let held = triggers::held(&h.ctx).await.unwrap();
+    let told: Vec<&str> = held.iter().map(TriggerEvent::kind).collect();
+    assert_eq!(
+        told,
+        ["item_finished", "item_finished"],
+        "one turn for both"
+    );
+}
+
 /// The cost the orchestrator is told for `item` once its provider settled
 /// $4.25 after the run finished: `pick` reads it from the batch Archon keys.
 async fn told_after_settlement(

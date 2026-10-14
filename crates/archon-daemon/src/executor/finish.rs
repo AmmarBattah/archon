@@ -299,7 +299,8 @@ pub(super) async fn announce(
 
 /// Hand `finished` to the orchestrator: quiet when it need not wake, and a
 /// routine success while other work runs waits up to [`MAX_SUCCESS_DEFER`]
-/// for that work, so one turn reports them together.
+/// for that work, so one turn reports them together. The last item to
+/// finish skips the coalescing window, as no other outcome is coming.
 async fn tell_orchestrator(
     ctx: &DaemonContext,
     item: &QueueItem,
@@ -313,16 +314,15 @@ async fn tell_orchestrator(
     if !needs_operator && !wakes_orchestrator(item, ctx.config.orchestrator.wake_on_success) {
         return triggers::push_quiet(ctx, finished).await;
     }
-    if needs_operator || !is_routine_success(item) {
-        return triggers::push(ctx, finished).await;
-    }
     let mut store = ctx.store.lock().await;
     // Checked under the lock that settles items, so the last to finish wakes it.
-    if others_unfinished(&store)? {
+    if !others_unfinished(&store)? {
+        triggers::hold_at_once(&mut store, finished)?;
+    } else if needs_operator || !is_routine_success(item) {
+        triggers::hold(&mut store, finished)?;
+    } else {
         let until = archon_core::now() + MAX_SUCCESS_DEFER;
         triggers::hold_deferred(&mut store, finished, until)?;
-    } else {
-        triggers::hold(&mut store, finished)?;
     }
     drop(store);
     triggers::wake(ctx);
