@@ -46,6 +46,9 @@ pub struct TuiArgs {
 pub enum Command {
     /// Inspect, record and manage learned advice.
     Lessons(crate::cmd::lessons::LessonsArgs),
+    /// Correct one stage of a finished run and curate the memory that misled it.
+    #[command(subcommand)]
+    Learning(crate::cmd::learning::LearningCommand),
     /// Open the quiet line chat with the orchestrator.
     Chat {
         /// Also show progress notifications.

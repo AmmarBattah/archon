@@ -431,6 +431,7 @@ mod tests {
             id: StageRunId::new(),
             run: run.id.clone(),
             stage_id: stage_id.into(),
+            kind: None,
             attempt: 1,
             fan_index: 0,
             model_segments: Vec::new(),

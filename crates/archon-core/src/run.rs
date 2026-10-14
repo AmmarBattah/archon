@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Timestamp;
 use crate::aether_ids::{AetherAgentId, AetherRunId, AetherTaskId};
+use crate::catalog::StageKind;
 use crate::error::ArchonError;
 use crate::id::{PipelineRunId, QuestionId, QueueItemId, ReportId, StageRunId};
 use crate::model::ModelChoice;
@@ -116,6 +117,10 @@ pub struct StageRun {
     pub id: StageRunId,
     pub run: PipelineRunId,
     pub stage_id: String,
+    /// The stage's kind in the pipeline this attempt ran in; `None` on stage
+    /// runs recorded before Archon kept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<StageKind>,
     /// 1-based; grows with each retry/fix loop iteration.
     pub attempt: u32,
     /// 0-based slot within a fan-out stage; 0 for single-agent stages.
@@ -457,6 +462,7 @@ mod tests {
             id: StageRunId::new(),
             run: PipelineRunId::new(),
             stage_id: "ship".into(),
+            kind: Some(StageKind::Ship),
             attempt: 1,
             fan_index: 0,
             model_segments: Vec::new(),

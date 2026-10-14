@@ -135,6 +135,17 @@ pub enum CorrectionCause {
     Budget,
 }
 
+impl CorrectionCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quality => "quality",
+            Self::Scope => "scope",
+            Self::Infrastructure => "infrastructure",
+            Self::Budget => "budget",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorrectionEvent {

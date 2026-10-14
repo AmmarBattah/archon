@@ -1,10 +1,13 @@
+use archon_core::Timestamp;
 use archon_core::error::ArchonError;
+use archon_core::feedback::ChoiceStanding;
 use archon_core::id::{QueueItemId, RepoId};
-use archon_core::model::ModelPlan;
+use archon_core::model::{ModelChoice, ModelPlan};
 use archon_core::outcome::DiffSize;
 use archon_core::policy::ModelPolicy;
 use archon_pipeline::PipelineSpec;
-use archon_queue::{Store, store::RouteEvidence};
+use archon_queue::Store;
+use archon_queue::store::{CohortEvidence, RouteEvidence, RouteQuery};
 use std::collections::BTreeMap;
 
 /// What the evidence of `repo` picks for the stages of `spec` within
@@ -123,27 +126,37 @@ fn select_plan(
     if !config.enabled {
         return Ok((plan, reasons));
     }
+    let as_of = archon_core::now();
     let context = route_context(store, item)?;
     for stage in &spec.file.stages {
-        let mut evidence =
-            stage_evidence(store, repo, spec, policy, &stage.id, size, context.as_ref())?;
+        let query = RouteQuery {
+            repo,
+            pipeline: spec.name(),
+            stage: &stage.id,
+            size,
+            context: context.as_ref(),
+        };
+        let mut cohort = stage_evidence(store, &query, policy, as_of)?;
         if let Some(item) = item {
-            evidence.sort_by_key(|e| {
+            cohort.routes.sort_by_key(|e| {
                 super::routing_context::fingerprint(&format!(
                     "{item}/{}/{}",
                     stage.id, e.route.choice.model
                 ))
             });
         }
-        let exploring = item.is_some_and(|id| exploration(id, config.explore_rate));
-        let Some((chosen, explored)) = choose(&evidence, exploring) else {
+        // A cohort under an active operator correction gets no exploration.
+        let exploring =
+            !cohort.corrected && item.is_some_and(|id| exploration(id, config.explore_rate));
+        let Some((chosen, explored)) = choose(&cohort.routes, exploring) else {
             continue;
         };
         policy.check(&chosen.route.choice)?;
         assert!(chosen.route.passed <= chosen.route.runs);
+        assert!(!explored || !cohort.corrected);
         reasons.insert(
             stage.id.clone(),
-            explanation(chosen, explored, size, context.as_ref()),
+            explanation(chosen, explored, &query, &cohort),
         );
         plan.0
             .insert(stage.id.clone(), vec![chosen.route.choice.clone()]);
@@ -163,39 +176,72 @@ fn route_context(
         .map_err(|e| ArchonError::Store(format!("routing context: {e}")))
 }
 
+/// A stage's permitted evidence. A thin repository cohort pools global
+/// evidence only while it has no typed operator feedback.
 fn stage_evidence(
     store: &Store,
-    repo: Option<&RepoId>,
-    spec: &PipelineSpec,
+    query: &RouteQuery<'_>,
     policy: &ModelPolicy,
-    stage: &str,
-    size: Option<DiffSize>,
-    context: Option<&archon_core::outcome::RouteContext>,
-) -> Result<Vec<RouteEvidence>, ArchonError> {
-    let mut evidence = store.contextual_route_evidence(repo, spec.name(), stage, size, context)?;
-    if !evidence.iter().any(|e| e.route.runs >= 5) && repo.is_some() {
-        evidence = store.contextual_route_evidence(None, spec.name(), stage, size, context)?;
+    as_of: Timestamp,
+) -> Result<CohortEvidence, ArchonError> {
+    let mut cohort = store.cohort_evidence(query, as_of)?;
+    let thin = !cohort.routes.iter().any(|e| e.route.runs >= 5);
+    if thin && query.repo.is_some() && !cohort.feedback_history {
+        let global = RouteQuery {
+            repo: None,
+            ..*query
+        };
+        cohort.routes = store.cohort_evidence(&global, as_of)?.routes;
     }
-    seed(store, &mut evidence, repo, spec.name(), stage, size, policy);
-    evidence.retain(|e| policy.check(&e.route.choice).is_ok());
-    assert!(evidence.iter().all(|e| e.route.stage == stage));
-    assert!(evidence.iter().all(|e| e.route.passed <= e.route.runs));
-    Ok(evidence)
+    seed(store, &mut cohort.routes, query, policy);
+    cohort
+        .routes
+        .retain(|e| policy.check(&e.route.choice).is_ok());
+    assert!(cohort.routes.iter().all(|e| e.route.stage == query.stage));
+    assert!(cohort.routes.iter().all(|e| e.route.passed <= e.route.runs));
+    let local = cohort.routes.iter().all(|e| e.route.repo.is_some());
+    assert!(!cohort.feedback_history || local, "corrections never pool");
+    Ok(cohort)
+}
+
+/// The corrected choice's samples in its cohort, read past the policy, and
+/// what a new default of the cohort selects now.
+pub(crate) fn standings(
+    store: &Store,
+    query: &RouteQuery<'_>,
+    policy: &ModelPolicy,
+    corrected: Option<&ModelChoice>,
+    as_of: Timestamp,
+) -> Result<(Option<ChoiceStanding>, Option<ChoiceStanding>), ArchonError> {
+    let standing = |e: &RouteEvidence| ChoiceStanding {
+        choice: e.route.choice.clone(),
+        runs: e.route.runs,
+        passed: e.route.passed,
+    };
+    let corrected = match corrected {
+        Some(choice) => {
+            let routes = store.cohort_evidence(query, as_of)?.routes;
+            routes
+                .iter()
+                .find(|e| &e.route.choice == choice)
+                .map(standing)
+        }
+        None => None,
+    };
+    let cohort = stage_evidence(store, query, policy, as_of)?;
+    let selected = archon_queue::store::preferred_route(&cohort.routes).map(standing);
+    assert!(corrected.as_ref().is_none_or(|c| c.passed <= c.runs));
+    assert!(selected.as_ref().is_none_or(|s| s.runs >= 5));
+    Ok((corrected, selected))
 }
 
 fn seed(
     store: &Store,
     evidence: &mut Vec<RouteEvidence>,
-    repo: Option<&RepoId>,
-    pipeline: &str,
-    stage: &str,
-    size: Option<DiffSize>,
+    query: &RouteQuery<'_>,
     policy: &ModelPolicy,
 ) {
-    use archon_core::{
-        model::{Effort, ModelChoice},
-        outcome::LearnedRoute,
-    };
+    use archon_core::{model::Effort, outcome::LearnedRoute};
     let ready = store.learning_models();
     if !ready.is_empty() {
         evidence.retain(|e| ready.contains(&e.route.choice.model));
@@ -218,10 +264,10 @@ fn seed(
         evidence.push(RouteEvidence {
             median_cost_usd: 0.0,
             route: LearnedRoute {
-                repo: repo.cloned(),
-                pipeline: pipeline.into(),
-                stage: stage.into(),
-                size,
+                repo: query.repo.cloned(),
+                pipeline: query.pipeline.into(),
+                stage: query.stage.into(),
+                size: query.size,
                 choice,
                 runs: 0,
                 passed: 0,
@@ -233,12 +279,26 @@ fn seed(
 fn explanation(
     e: &RouteEvidence,
     explored: bool,
-    size: Option<DiffSize>,
-    context: Option<&archon_core::outcome::RouteContext>,
+    query: &RouteQuery<'_>,
+    cohort: &CohortEvidence,
 ) -> String {
     let (lower, upper) = wilson(e);
+    let context = query.context;
+    let feedback = if !cohort.penalties.is_empty() {
+        let ids: Vec<_> = cohort.penalties.iter().map(|id| id.as_str()).collect();
+        format!(
+            "; after operator corrections {} (no exploration)",
+            ids.join(", ")
+        )
+    } else if cohort.corrected {
+        "; under an active operator correction (no exploration)".to_owned()
+    } else if cohort.feedback_history {
+        "; runs of the last 90 days (operator feedback history)".to_owned()
+    } else {
+        String::new()
+    };
     format!(
-        "{} {}: {}/{} passed (n={}), Wilson 95% [{lower:.2}, {upper:.2}], median ${:.4}; {} evidence; {}; diff-size={}; review={}; revision={}; task={}",
+        "{} {}: {}/{} passed (n={}), Wilson 95% [{lower:.2}, {upper:.2}], median ${:.4}; {} evidence; {}; diff-size={}; review={}; revision={}; task={}{feedback}",
         e.route.choice.model,
         e.route.choice.effort,
         e.route.passed,
@@ -255,7 +315,7 @@ fn explanation(
         } else {
             "conservative quality bound with cost"
         },
-        size.map_or("unknown (pooled)", |s| s.as_str()),
+        query.size.map_or("unknown (pooled)", |s| s.as_str()),
         context.map_or("unknown", |c| &c.review),
         context.map_or("unknown", |c| &c.revision),
         context.map_or("general", |c| &c.task_class)

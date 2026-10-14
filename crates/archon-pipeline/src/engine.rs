@@ -58,6 +58,8 @@ pub struct OperatorWait {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpawnPlan {
     pub stage_id: String,
+    /// The stage's kind, recorded on its stage run for later attribution.
+    pub kind: StageKind,
     pub attempt: u32,
     /// 0-based slot within the stage's `fan_out`.
     pub fan_index: u32,
@@ -1148,6 +1150,7 @@ impl RunDriver {
                 let instructions = contract::instructions(stage, mode, workspace, part, owed);
                 EngineAction::Spawn(SpawnPlan {
                     stage_id: stage.id.clone(),
+                    kind: stage.kind,
                     attempt: at.attempt,
                     fan_index: fan,
                     fan_count: stage.fan_out,

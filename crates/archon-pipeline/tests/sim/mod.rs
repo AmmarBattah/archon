@@ -548,6 +548,7 @@ impl Sim {
             id,
             run: self.run.id.clone(),
             stage_id: plan.stage_id.clone(),
+            kind: Some(plan.kind),
             attempt: plan.attempt,
             fan_index: plan.fan_index,
             model_segments: Vec::new(),

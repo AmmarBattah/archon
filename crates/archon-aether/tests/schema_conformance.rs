@@ -7,11 +7,12 @@
 use std::collections::BTreeSet;
 
 use archon_aether::github::{RepositoryConfig, WatcherConfig};
+use archon_aether::memory::MemoryQuery;
 use archon_aether::wire::{
     AgentConfig, AgentPatch, AgentQuery, ApprovalPolicy, ClientFrame, Command, CreateAgent,
     EventQuery, Hello, NetworkPolicy, Scope, ToolExposure,
 };
-use archon_core::aether_ids::{AetherAgentId, AetherRunId, AetherTaskId};
+use archon_core::aether_ids::{AetherAgentId, AetherMemoryId, AetherRunId, AetherTaskId};
 use archon_core::model::Effort;
 use serde_json::{Value, json};
 
@@ -34,6 +35,10 @@ fn agent() -> AetherAgentId {
 
 fn task() -> AetherTaskId {
     AetherTaskId::parse("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap()
+}
+
+fn memory() -> AetherMemoryId {
+    AetherMemoryId::parse("mem_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap()
 }
 
 fn run() -> AetherRunId {
@@ -68,6 +73,9 @@ fn variant_name(command: &Command) -> &'static str {
         Command::McpServers { .. } => "mcp_servers",
         Command::GetGithubWatcher => "get_github_watcher",
         Command::ConfigureGithubWatcher { .. } => "configure_github_watcher",
+        Command::Memories { .. } => "memories",
+        Command::ForgetMemory { .. } => "forget_memory",
+        Command::RestoreMemory { .. } => "restore_memory",
     }
 }
 
@@ -280,6 +288,23 @@ fn control_samples() -> Vec<Command> {
             }),
             expected_revision: 4,
         },
+        Command::Memories {
+            query: MemoryQuery {
+                id: memory(),
+                include_forgotten: true,
+                include_superseded: true,
+                limit: 1,
+            },
+        },
+        Command::ForgetMemory {
+            id: memory(),
+            reason: Some("archon fb_1: stale rule".into()),
+        },
+        Command::ForgetMemory {
+            id: memory(),
+            reason: None,
+        },
+        Command::RestoreMemory { id: memory() },
     ]
 }
 
@@ -411,7 +436,7 @@ fn every_command_archon_emits_matches_both_schemas() {
         );
         assert_eq!(
             seen.len(),
-            25,
+            28,
             "every Command variant has a sample: {seen:?}"
         );
     }
@@ -495,6 +520,39 @@ fn the_agent_fields_archon_reads_exist_in_the_schema() {
         parsed.successor.as_ref().map(AetherAgentId::as_str),
         Some("agt_01ARZ3NDEKTSV4RRFFQ69G5FAW")
     );
+}
+
+/// The memory record fields and replies curation reads, in both schemas.
+#[test]
+fn the_memory_fields_archon_reads_exist_in_both_schemas() {
+    for schema in [schema(), schema_v15()] {
+        let version = &schema["protocol_version"];
+        let (properties, required) = shape(&schema, &schema["$defs"]["MemoryRecord"]);
+        for key in ["id", "scope", "kind", "provenance", "created_at"] {
+            assert!(
+                required.contains(key),
+                "v{version} MemoryRecord.{key} is required"
+            );
+        }
+        for key in ["forgotten_at", "superseded_by", "pinned"] {
+            assert!(
+                properties.contains(key),
+                "v{version} MemoryRecord.{key} exists"
+            );
+        }
+        let replies = schema["$defs"]["Reply"]["oneOf"].as_array().unwrap();
+        let data = |kind: &str| {
+            let reply = replies
+                .iter()
+                .find(|r| r["properties"]["reply"]["const"] == kind)
+                .unwrap_or_else(|| panic!("v{version} has no `{kind}` reply"));
+            reply["properties"]["data"].clone()
+        };
+        assert_eq!(data("memory")["$ref"], "#/$defs/MemoryRecord");
+        assert_eq!(data("memories")["items"]["$ref"], "#/$defs/MemoryRecord");
+        let scope = schema["$defs"]["MemoryScope"]["oneOf"].as_array().unwrap();
+        assert_eq!(scope.len(), 6, "v{version}: every scope has a label");
+    }
 }
 
 /// The values a string schema allows: v15 writes `CostBasis` as one `enum`,

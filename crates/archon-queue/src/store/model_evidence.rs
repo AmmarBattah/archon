@@ -1,12 +1,18 @@
 //! Stage observations and finished-run evidence for inspectable model defaults.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use archon_core::Timestamp;
 use archon_core::cost::DayRange;
 use archon_core::error::ArchonError;
+use archon_core::feedback::feedback_window;
+use archon_core::id::{FeedbackId, PipelineRunId, RepoId};
 use archon_core::model::ModelChoice;
 use archon_core::model_evidence::{
     MAX_ROWS, ModelEvidenceQuery, ModelEvidenceReport, ModelEvidenceRow,
+};
+use archon_core::outcome::{
+    CorrectionCause, DiffSize, FailureClass, Outcome, OutcomeResult, RouteContext,
 };
 use archon_core::queue::QueueItem;
 use archon_core::run::{StageRun, StageState, Verdict};
@@ -14,6 +20,7 @@ use rusqlite::{Connection, params};
 
 use super::codec::{SqlContext, from_json};
 use super::delegated::BENEATH;
+use super::operator_feedback as feedback;
 
 #[derive(Default)]
 struct Samples {
@@ -289,84 +296,156 @@ pub fn preferred_route(evidence: &[RouteEvidence]) -> Option<&RouteEvidence> {
         })
 }
 
+/// One stage's routing cohort: whose finished runs a learned default reads.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteQuery<'a> {
+    pub repo: Option<&'a RepoId>,
+    pub pipeline: &'a str,
+    pub stage: &'a str,
+    pub size: Option<DiffSize>,
+    pub context: Option<&'a RouteContext>,
+}
+
+/// A cohort's routing samples and the operator corrections behind them.
+#[derive(Debug, Clone)]
+pub struct CohortEvidence {
+    pub routes: Vec<RouteEvidence>,
+    /// Corrections penalizing a sample this repository cohort reads now.
+    pub penalties: Vec<FeedbackId>,
+    /// A correction of this repository cohort penalizes now, its sample
+    /// read or not: the cohort explores no other model.
+    pub corrected: bool,
+    /// The cohort has had a credited quality correction: it reads only runs
+    /// of the last 90 days, and never pools global evidence.
+    pub feedback_history: bool,
+}
+
+/// Whether a finished run is a sample of model quality at all.
+pub(super) fn counts_for_routing(outcome: &Outcome) -> bool {
+    let excluded = matches!(
+        outcome.failure,
+        Some(
+            FailureClass::Infrastructure
+                | FailureClass::Budget
+                | FailureClass::Timeout
+                | FailureClass::Blocked
+                | FailureClass::Escalated
+                | FailureClass::Ship
+        )
+    );
+    outcome.result != OutcomeResult::Cancelled && !excluded
+}
+
 impl super::Store {
     pub fn route_evidence(
         &self,
-        repo: Option<&archon_core::id::RepoId>,
+        repo: Option<&RepoId>,
         pipeline: &str,
         stage: &str,
-        size: Option<archon_core::outcome::DiffSize>,
+        size: Option<DiffSize>,
     ) -> Result<Vec<RouteEvidence>, ArchonError> {
         self.contextual_route_evidence(repo, pipeline, stage, size, None)
     }
 
     pub fn contextual_route_evidence(
         &self,
-        repo: Option<&archon_core::id::RepoId>,
+        repo: Option<&RepoId>,
         pipeline: &str,
         stage: &str,
-        size: Option<archon_core::outcome::DiffSize>,
-        context: Option<&archon_core::outcome::RouteContext>,
+        size: Option<DiffSize>,
+        context: Option<&RouteContext>,
     ) -> Result<Vec<RouteEvidence>, ArchonError> {
-        if pipeline.is_empty() || stage.is_empty() {
+        let query = RouteQuery {
+            repo,
+            pipeline,
+            stage,
+            size,
+            context,
+        };
+        Ok(self.cohort_evidence(&query, archon_core::now())?.routes)
+    }
+
+    /// The cohort's evidence `as_of`. In a repository cohort each active
+    /// quality correction turns the one sample it names unsuccessful; the
+    /// corrections are read by indexed columns, only for the samples read.
+    pub fn cohort_evidence(
+        &self,
+        query: &RouteQuery<'_>,
+        as_of: Timestamp,
+    ) -> Result<CohortEvidence, ArchonError> {
+        if query.pipeline.is_empty() || query.stage.is_empty() {
             return Err(ArchonError::Invalid(
                 "route needs pipeline and stage".into(),
             ));
         }
-        let mut groups = std::collections::BTreeMap::new();
-        for outcome in self.route_outcomes(repo, pipeline, stage, size, context)? {
-            if outcome.pipeline != pipeline || size.is_some_and(|s| outcome.size() != Some(s)) {
-                continue;
-            }
-            use archon_core::outcome::{CorrectionCause, FailureClass, OutcomeResult};
-            if outcome.result == OutcomeResult::Cancelled
-                || matches!(
-                    outcome.failure,
-                    Some(
-                        FailureClass::Infrastructure
-                            | FailureClass::Budget
-                            | FailureClass::Timeout
-                            | FailureClass::Blocked
-                            | FailureClass::Escalated
-                            | FailureClass::Ship
-                    )
-                )
-            {
-                continue;
-            }
-            for observed in outcome
-                .stages
-                .iter()
-                .filter(|s| s.stage == stage && s.passed.is_some())
-            {
-                let (costs, wins) = groups
-                    .entry((
-                        observed.choice.model.to_string(),
-                        observed.choice.effort.to_string(),
-                    ))
-                    .or_insert((Vec::new(), 0u32));
-                costs.push(observed.cost_usd);
-                let corrected = outcome
-                    .feedback
-                    .iter()
-                    .any(|e| e.stage == observed.stage && e.cause == CorrectionCause::Quality);
-                *wins += u32::from(observed.passed == Some(true) && !corrected);
-            }
-        }
-        let bounded = groups
-            .values()
-            .all(|(costs, wins)| *wins as usize <= costs.len());
-        assert!(bounded, "a choice wins at most once per observation");
-        finish_routes(groups, repo, pipeline, stage, size)
+        let history = feedback::has_cohort_feedback(&self.conn, query, as_of)?;
+        let window = history.then(|| (as_of - feedback_window(), as_of));
+        let outcomes = self.route_outcomes(query, window)?;
+        let masks = if history {
+            let runs: Vec<&PipelineRunId> = outcomes.iter().map(|o| &o.run).collect();
+            feedback::active_masks(&self.conn, &runs, query.stage, as_of)?
+        } else {
+            Vec::new()
+        };
+        let masked: HashSet<(&PipelineRunId, &ModelChoice)> =
+            masks.iter().map(|m| (&m.run, &m.choice)).collect();
+        let groups = route_samples(&outcomes, query, &masked);
+        assert!(history || masked.is_empty(), "no mask without feedback");
+        let corrected =
+            !masks.is_empty() || (history && feedback::cohort_corrected(&self.conn, query, as_of)?);
+        assert!(history || !corrected, "a correction is feedback history");
+        Ok(CohortEvidence {
+            routes: finish_routes(groups, query)?,
+            penalties: masks.into_iter().map(|m| m.feedback).collect(),
+            corrected,
+            feedback_history: history,
+        })
     }
 }
 
+/// Costs and successes per (model, effort); a legacy quality correction
+/// masks the whole stage, a typed one the one choice it credits.
+fn route_samples(
+    outcomes: &[Outcome],
+    query: &RouteQuery<'_>,
+    masks: &HashSet<(&PipelineRunId, &ModelChoice)>,
+) -> BTreeMap<(String, String), (Vec<f64>, u32)> {
+    let mut groups = BTreeMap::new();
+    for outcome in outcomes {
+        let other_size = query.size.is_some_and(|s| outcome.size() != Some(s));
+        if outcome.pipeline != query.pipeline || other_size || !counts_for_routing(outcome) {
+            continue;
+        }
+        let corrected = outcome
+            .feedback
+            .iter()
+            .any(|e| e.stage == query.stage && e.cause == CorrectionCause::Quality);
+        for observed in outcome
+            .stages
+            .iter()
+            .filter(|s| s.stage == query.stage && s.passed.is_some())
+        {
+            let (costs, wins) = groups
+                .entry((
+                    observed.choice.model.to_string(),
+                    observed.choice.effort.to_string(),
+                ))
+                .or_insert((Vec::new(), 0u32));
+            costs.push(observed.cost_usd);
+            let masked = corrected || masks.contains(&(&outcome.run, &observed.choice));
+            *wins += u32::from(observed.passed == Some(true) && !masked);
+        }
+    }
+    let bounded = groups
+        .values()
+        .all(|(costs, wins)| *wins as usize <= costs.len());
+    assert!(bounded, "a choice wins at most once per observation");
+    groups
+}
+
 fn finish_routes(
-    groups: std::collections::BTreeMap<(String, String), (Vec<f64>, u32)>,
-    repo: Option<&archon_core::id::RepoId>,
-    pipeline: &str,
-    stage: &str,
-    size: Option<archon_core::outcome::DiffSize>,
+    groups: BTreeMap<(String, String), (Vec<f64>, u32)>,
+    query: &RouteQuery<'_>,
 ) -> Result<Vec<RouteEvidence>, ArchonError> {
     use archon_core::outcome::LearnedRoute;
     use std::str::FromStr;
@@ -379,10 +458,10 @@ fn finish_routes(
         evidence.push(RouteEvidence {
             median_cost_usd,
             route: LearnedRoute {
-                repo: repo.cloned(),
-                pipeline: pipeline.into(),
-                stage: stage.into(),
-                size,
+                repo: query.repo.cloned(),
+                pipeline: query.pipeline.into(),
+                stage: query.stage.into(),
+                size: query.size,
                 choice: ModelChoice {
                     model: archon_core::model::ModelRef::from_str(&model)?,
                     effort: archon_core::model::Effort::from_str(&effort)?,

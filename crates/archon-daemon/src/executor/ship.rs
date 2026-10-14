@@ -17,8 +17,8 @@ use super::{frozen, recover};
 use crate::context::DaemonContext;
 
 pub(crate) use auto_merge::pay as pay_owed_merges;
-pub(crate) use deliver::prune_finished_ships;
 pub(super) use deliver::{deliver, delivering, queue, replay, stalled};
+pub(crate) use deliver::{prune_finished_ships, shipped_commit};
 
 /// `outcome` with the pull request GitHub lists for a ship agent's stage, or
 /// failed without one; nothing to check when archond ships (`daemon_ships`).

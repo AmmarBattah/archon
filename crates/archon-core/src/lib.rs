@@ -17,6 +17,7 @@ pub mod config;
 pub mod config_files;
 pub mod cost;
 pub mod error;
+pub mod feedback;
 pub mod github;
 pub mod id;
 pub mod initiative;

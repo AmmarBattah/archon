@@ -337,6 +337,7 @@ fn stage_run(run: &PipelineRunId, state: StageState) -> StageRun {
         id: StageRunId::new(),
         run: run.clone(),
         stage_id: "implement".into(),
+        kind: None,
         attempt: 1,
         fan_index: 0,
         model_segments: Vec::new(),

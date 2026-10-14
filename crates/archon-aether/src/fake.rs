@@ -627,3 +627,15 @@ pub fn task(id: &str, owner: Option<&str>, run: &str, status: Value) -> Value {
         "created_at": "2026-09-26T10:00:00Z", "updated_at": "2026-09-26T10:00:00Z",
     })
 }
+
+/// A `MemoryRecord` an agent proposed in repository `repo`, with its text.
+pub fn memory(id: &str, repo: &str, text: &str) -> Value {
+    json!({
+        "id": id, "scope": {"scope": "repository", "id": repo}, "kind": "constraint",
+        "text": text, "importance": 0.5, "confidence": 0.7,
+        "provenance": {"actor": {"actor": "agent", "id": "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+                       "agent": "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV"},
+        "created_at": "2026-09-01T08:00:00Z", "forgotten_at": null, "superseded_by": null,
+        "pinned": false, "tags": [], "retrieval_count": 3,
+    })
+}

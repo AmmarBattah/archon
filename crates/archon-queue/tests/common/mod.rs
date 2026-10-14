@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use archon_core::Timestamp;
 use archon_core::aether_ids::AetherAgentId;
 use archon_core::autonomy::{Autonomy, AutonomyPatch};
+use archon_core::catalog::StageKind;
 use archon_core::id::{PipelineRunId, QueueItemId, RepoId, StageRunId};
 use archon_core::model::{Effort, ModelChoice, ModelPlan};
 use archon_core::queue::{Priority, QueueItem, QueueState};
@@ -159,6 +160,7 @@ pub fn stage(run: &PipelineRun, fan_index: u32) -> StageRun {
         id: StageRunId::new(),
         run: run.id.clone(),
         stage_id: "implement".into(),
+        kind: Some(StageKind::Work),
         attempt: 1,
         fan_index,
         model_segments: Vec::new(),

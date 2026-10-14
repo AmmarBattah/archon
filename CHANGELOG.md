@@ -2,11 +2,49 @@
 
 ## Unreleased
 
+### Added
+
+- `archon learning correct qi_… --run prun_… --stage <stage> --cause <cause>
+  --reason <text>` records the operator's correction of one stage of one
+  finished run. A `quality` correction counts that stage's one producing
+  model choice as unsuccessful, once, in its repository and routing context,
+  for 90 days; an ambiguous history is recorded with no model penalty, and
+  the receipt says why. `archon learning why`, `undo`, `restore-memory` and
+  `retry-memory` show and reverse it. Agents are refused.
+- `--forget-memory mem_…` forgets that one Aether memory in the Aether
+  instance `archond` last connected to, which must speak Aether protocol 15
+  or newer, and keeps a receipt. Archon stores the memory's ID and state,
+  never its text.
+- A repository cohort with a correction reads only runs of the last 90 days,
+  never pools global evidence, and explores no other model while a
+  correction is active.
 - Add opt-in `[aether] host_context = "lean"` for new agents. On supported
   Aether versions, Claude Code skips skills and non-Aether host MCP servers;
   Codex ignores the setting. Full remains the default. Older daemons receive
   no new wire field, with one log warning and a doctor check explaining the
   fallback. Stage records and model evidence retain the effective context.
+
+### Upgrading
+
+The store migrates to schema 11, which adds the `operator_feedback` table.
+The migration is one-way: once the new `archond` has started, a 1.2.0
+`archond` refuses the store ("store schema version 11 is newer than this
+archon supports (10)"). Back it up first:
+
+1. `archon daemon stop`. `archon` and `archond` speak protocol 8, so the
+   1.2.0 `archond` must stop before the binary changes.
+2. Copy `archon.db` from the data directory (`~/.local/share/archon` by
+   default) to a name of your own, such as `archon-1.2.db`. If an
+   `archon.db-wal` lies beside it, copy that too, as `archon-1.2.db-wal`.
+3. `archon update`. The next command that changes something starts the new
+   `archond`.
+
+To go back to 1.2.0, see "Back up before a release that migrates the store"
+in [docs/install.md](docs/install.md): stop `archond`, run `archon update
+--version v1.2.0` and put the copy back. What the new release recorded since
+is lost, its corrections included. A memory a correction forgot stays
+forgotten in Aether: run `archon learning restore-memory` before going back,
+or restore it later with Aether's `/memory` (`u`).
 
 ## 1.2.0
 

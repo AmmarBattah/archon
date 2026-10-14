@@ -20,6 +20,7 @@ pub mod initiatives;
 mod items;
 mod lessons;
 mod model_evidence;
+mod operator_feedback;
 mod outcomes;
 mod repos;
 mod run_edits;
@@ -51,7 +52,8 @@ use crate::data_lock::DataLock;
 use crate::dispatch::DispatchSnapshot;
 
 pub use model_evidence::ModelEvidenceSnapshot;
-pub use model_evidence::{RouteEvidence, preferred_route};
+pub use model_evidence::{CohortEvidence, RouteEvidence, RouteQuery, preferred_route};
+pub use operator_feedback::CorrectionFacts;
 pub use run_edits::RecordedEdit;
 
 /// Well-known `kv` keys.

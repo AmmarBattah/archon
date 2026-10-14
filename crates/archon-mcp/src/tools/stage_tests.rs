@@ -265,6 +265,7 @@ fn long_review(run: PipelineRunId) -> StageRun {
         id: StageRunId::new(),
         run,
         stage_id: "review".into(),
+        kind: Some(archon_core::catalog::StageKind::Review),
         attempt: 1,
         fan_index: 0,
         model_segments: Vec::new(),

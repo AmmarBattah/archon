@@ -356,7 +356,49 @@ CREATE TABLE lesson_uses (
 CREATE INDEX lesson_uses_by_run ON lesson_uses (run);
 "#;
 
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+/// Version 11: operator corrections of one stage of a finished run. The
+/// columns beside `data` are its frozen attribution, so that routing reads
+/// them through indexes and never the records.
+const V11: &str = r#"
+CREATE TABLE operator_feedback (
+    id                 TEXT PRIMARY KEY,
+    request_key        TEXT NOT NULL CHECK (request_key <> ''),
+    item               TEXT NOT NULL REFERENCES items (id),
+    run                TEXT NOT NULL REFERENCES runs (id),
+    stage              TEXT NOT NULL CHECK (stage <> ''),
+    stage_run          TEXT REFERENCES stage_runs (id),
+    model              TEXT,
+    effort             TEXT,
+    repo               TEXT,
+    pipeline           TEXT NOT NULL,
+    revision           TEXT,
+    review             TEXT,
+    task_class         TEXT,
+    cause              TEXT NOT NULL
+                       CHECK (cause IN ('quality', 'scope', 'infrastructure', 'budget')),
+    reason             TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 1000),
+    observed_at        TEXT NOT NULL,
+    revoked_at         TEXT CHECK (revoked_at >= observed_at),
+    aether_instance_id TEXT CHECK (aether_instance_id <> ''),
+    memory_id          TEXT,
+    curation           TEXT CHECK (curation IN ('pending', 'applied', 'failed', 'restored')),
+    data               TEXT NOT NULL CHECK (json_valid(data)),
+    CHECK ((stage_run IS NULL) = (model IS NULL) AND (model IS NULL) = (effort IS NULL)),
+    CHECK ((revision IS NULL) = (review IS NULL) AND (review IS NULL) = (task_class IS NULL)),
+    CHECK (stage_run IS NULL OR revision IS NOT NULL),
+    CHECK ((memory_id IS NULL) = (curation IS NULL)
+           AND (memory_id IS NULL) = (aether_instance_id IS NULL))
+);
+CREATE UNIQUE INDEX operator_feedback_unrevoked_request ON operator_feedback (request_key)
+    WHERE revoked_at IS NULL;
+CREATE INDEX operator_feedback_by_run ON operator_feedback (run, stage_run);
+CREATE INDEX operator_feedback_by_cohort
+    ON operator_feedback
+        (repo, pipeline, stage, revision, review, task_class, observed_at, revoked_at)
+    WHERE stage_run IS NOT NULL AND cause = 'quality';
+"#;
+
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 /// Pragmas every connection needs. `on_disk` connections must end up in
 /// WAL mode; in-memory databases report `memory` and stay that way.
@@ -821,6 +863,104 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(members, ["qi_new"]);
+        assert_eq!(migrate(&mut conn).unwrap(), MIGRATIONS.len());
+    }
+
+    fn insert_feedback(conn: &Connection, id: &str, values: &str) -> rusqlite::Result<()> {
+        conn.execute_batch(&format!(
+            "INSERT INTO operator_feedback (id, request_key, item, run, stage, stage_run, model,
+                 effort, repo, pipeline, revision, review, task_class, cause, reason,
+                 observed_at, revoked_at, aether_instance_id, memory_id, curation, data)
+             VALUES ('{id}', {values})"
+        ))
+    }
+
+    /// Columns after the id of a valid attributed quality correction.
+    const V11_ROW: &str = "'k1', 'qi_new', 'prun_new', 'answer', 'stg_a', 'codex/astra', 'high',
+        'repo_a', 'ask', 'rev', 'strict', 'general', 'quality', 'wrong file', 't1', NULL,
+        'aether-1', 'mem_a', 'pending', '{}'";
+
+    /// Rows V11 must refuse, each under its own request key so that only
+    /// the named defect can refuse it.
+    fn refused_v11_rows() -> [(&'static str, String); 10] {
+        [
+            ("a replayed unrevoked request", V11_ROW.to_owned()),
+            (
+                "a partial attribution",
+                V11_ROW.replace("'high'", "NULL").replace("'k1'", "'k2'"),
+            ),
+            (
+                "an unknown cause",
+                V11_ROW
+                    .replace("'quality'", "'taste'")
+                    .replace("'k1'", "'k3'"),
+            ),
+            (
+                "an empty reason",
+                V11_ROW
+                    .replace("'wrong file'", "''")
+                    .replace("'k1'", "'k4'"),
+            ),
+            (
+                "a memory without a curation state",
+                V11_ROW.replace("'pending'", "NULL").replace("'k1'", "'k5'"),
+            ),
+            (
+                "an unrecorded stage run",
+                V11_ROW
+                    .replace("'stg_a'", "'stg_none'")
+                    .replace("'k1'", "'k6'"),
+            ),
+            (
+                "data that is not JSON",
+                V11_ROW.replace("'{}'", "'nope'").replace("'k1'", "'k7'"),
+            ),
+            (
+                "a memory forget bound to no Aether instance",
+                V11_ROW
+                    .replace("'aether-1'", "NULL")
+                    .replace("'k1'", "'k8'"),
+            ),
+            (
+                "a partial routing context",
+                V11_ROW.replace("'strict'", "NULL").replace("'k1'", "'k9'"),
+            ),
+            (
+                "a model credit without its routing context",
+                V11_ROW
+                    .replace("'rev', 'strict', 'general'", "NULL, NULL, NULL")
+                    .replace("'k1'", "'k10'"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn v11_keeps_one_unrevoked_correction_per_request_and_whole_attributions() {
+        let mut conn = v2_store();
+        insert_v2_item(&conn, "qi_new");
+        assert_eq!(migrate(&mut conn).unwrap(), MIGRATIONS.len());
+        insert_run(&conn, "prun_new", "qi_new");
+        conn.execute_batch(
+            "INSERT INTO stage_runs (id, run, stage_id, attempt, fan_index, state, terminal,
+                 started_at, data)
+             VALUES ('stg_a', 'prun_new', 'answer', 1, 0, 'completed', 1, 't', '{}')",
+        )
+        .unwrap();
+        insert_feedback(&conn, "fb_a", V11_ROW).unwrap();
+        for (why, values) in &refused_v11_rows() {
+            assert!(
+                insert_feedback(&conn, "fb_x", values).is_err(),
+                "V11 must refuse {why}"
+            );
+        }
+        conn.execute_batch("UPDATE operator_feedback SET revoked_at = 't2' WHERE id = 'fb_a'")
+            .unwrap();
+        insert_feedback(&conn, "fb_b", V11_ROW).expect("a revoked request may be made again");
+        assert!(
+            conn.execute_batch("UPDATE operator_feedback SET revoked_at = 't0' WHERE id = 'fb_b'")
+                .is_err(),
+            "a correction is not revoked before it was made"
+        );
         assert_eq!(migrate(&mut conn).unwrap(), MIGRATIONS.len());
     }
 }

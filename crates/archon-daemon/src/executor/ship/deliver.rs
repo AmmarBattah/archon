@@ -506,6 +506,26 @@ pub(in crate::executor) fn replay(
     driver.record_ship(outcome)
 }
 
+/// The commit `run` shipped, while its delivery outcome is still kept.
+pub(crate) fn shipped_commit(
+    store: &Store,
+    run: &PipelineRunId,
+) -> Result<Option<String>, ArchonError> {
+    let key = ship_key(run);
+    let Some(raw) = store.kv_get(&key)? else {
+        return Ok(None);
+    };
+    let outcome: ShipOutcome =
+        serde_json::from_str(&raw).map_err(|e| ArchonError::Store(format!("kv {key}: {e}")))?;
+    Ok(match outcome {
+        ShipOutcome::Shipped { commit, .. } => {
+            assert!(!commit.is_empty(), "a shipped outcome names its commit");
+            Some(commit)
+        }
+        ShipOutcome::Failed { .. } => None,
+    })
+}
+
 /// Delete the delivery outcomes of finished runs, which only rebuild a live
 /// run's driver, and of runs that no longer exist. Returns how many went.
 pub(crate) fn prune_finished_ships(store: &mut Store) -> Result<usize, ArchonError> {

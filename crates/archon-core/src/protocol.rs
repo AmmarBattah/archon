@@ -13,10 +13,11 @@ use crate::autonomy::{AutonomyPatch, AutonomyPolicy, AutonomyView, Directive};
 use crate::catalog::CatalogListing;
 use crate::cost::{CostQuery, CostReport};
 use crate::error::ArchonError;
+use crate::feedback::{CorrectionRequest, FeedbackReceipt, LearningWhy};
 use crate::github::{GithubThread, GithubWatch, GithubWatcherView, WatcherChange};
 use crate::id::{
-    DirectiveId, InitiativeId, LessonId, PipelineRunId, QuestionId, QueueItemId, ReportId,
-    StageRunId,
+    DirectiveId, FeedbackId, InitiativeId, LessonId, PipelineRunId, QuestionId, QueueItemId,
+    ReportId, StageRunId,
 };
 use crate::initiative::{ContractChange, EnqueueInitiative, Initiative, InitiativeDetail};
 use crate::lesson::{Lesson, LessonDraft, LessonPatch, LessonQuery, LessonStats, LessonWhy};
@@ -38,7 +39,8 @@ use crate::steer::Steer;
 /// (`for_agent`), and archond refuses such a call that names none.
 /// 7: initiatives, `steer_item` and lessons; an older archond knows none of
 /// their requests.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// 8: `archon learning` corrections, their receipts and memory curation.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Longest accepted frame in either direction.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -322,10 +324,30 @@ pub enum Request {
     LessonStats {
         repo: Option<RepoRef>,
     },
+
+    /// CLI only: the operator corrects one stage of a finished run.
+    LearningCorrect(CorrectionRequest),
+    /// The corrections of an item's runs and what each does now.
+    LearningWhy {
+        item: QueueItemId,
+    },
+    /// CLI only: revoke a correction's model penalty; its memory stays as is.
+    LearningUndo {
+        feedback: FeedbackId,
+    },
+    /// CLI only: restore the memory a correction forgot.
+    LearningRestoreMemory {
+        feedback: FeedbackId,
+    },
+    /// CLI only: retry a correction's pending or failed memory forget.
+    LearningRetryMemory {
+        feedback: FeedbackId,
+    },
 }
 
 impl Request {
-    /// Requests the MCP proxy may not forward (operator-only actions).
+    /// Operator-only actions: archond refuses them over MCP and for any
+    /// agent, whichever client forwards them.
     pub fn is_operator_only(&self) -> bool {
         match self {
             Self::Shutdown
@@ -338,6 +360,10 @@ impl Request {
             | Self::Gc { .. }
             | Self::ConfigureGithubWatcher { .. }
             | Self::UpdateLesson { .. }
+            | Self::LearningCorrect(_)
+            | Self::LearningUndo { .. }
+            | Self::LearningRestoreMemory { .. }
+            | Self::LearningRetryMemory { .. }
             | Self::Answer { .. } => true,
             Self::RepoAdd(add) => add.auto_merge,
             Self::Pause(target) | Self::Resume(target) => {
@@ -375,7 +401,8 @@ impl Request {
             | Self::GetInitiative { .. }
             | Self::Lessons(_)
             | Self::LessonsWhy { .. }
-            | Self::LessonStats { .. } => true,
+            | Self::LessonStats { .. }
+            | Self::LearningWhy { .. } => true,
             Self::ForAgent { request, .. } => request.is_read_only(),
             _ => false,
         }
@@ -551,6 +578,8 @@ pub enum Reply {
     Lessons(Vec<Lesson>),
     LessonsWhy(Box<LessonWhy>),
     LessonStats(Box<LessonStats>),
+    Feedback(Box<FeedbackReceipt>),
+    LearningWhy(Box<LearningWhy>),
 }
 
 /// What one gc pass did (ARCHITECTURE §13.2). Paths are real paths.
@@ -1380,6 +1409,48 @@ mod tests {
         for request in [steer, append, draft] {
             assert!(!request.is_read_only() && !request.is_operator_only());
         }
+    }
+
+    #[test]
+    fn learning_mutations_are_the_operators_and_why_only_reads() {
+        let feedback = FeedbackId::new();
+        let correct = Request::LearningCorrect(CorrectionRequest {
+            item: QueueItemId::new(),
+            run: PipelineRunId::new(),
+            stage: "implement".into(),
+            cause: crate::outcome::CorrectionCause::Quality,
+            reason: "Ignored the identity rule".into(),
+            forget_memory: None,
+        });
+        let wire = serde_json::to_value(&correct).unwrap();
+        assert_eq!(wire["cmd"], "learning_correct");
+        assert_eq!(wire["cause"], "quality");
+        assert_eq!(serde_json::from_value::<Request>(wire).unwrap(), correct);
+        let mutations = [
+            correct,
+            Request::LearningUndo {
+                feedback: feedback.clone(),
+            },
+            Request::LearningRestoreMemory {
+                feedback: feedback.clone(),
+            },
+            Request::LearningRetryMemory { feedback },
+        ];
+        for request in mutations {
+            assert!(
+                request.is_operator_only() && !request.is_read_only(),
+                "{request:?}"
+            );
+        }
+        let why = Request::LearningWhy {
+            item: QueueItemId::new(),
+        };
+        assert!(why.is_read_only() && !why.is_operator_only());
+        let stray = serde_json::json!({
+            "cmd": "learning_correct", "item": QueueItemId::new(), "run": PipelineRunId::new(),
+            "stage": "implement", "cause": "quality", "reason": "r", "blame": "reviewer"
+        });
+        assert!(serde_json::from_value::<Request>(stray).is_err());
     }
 
     fn stage_query(stage: Option<&str>) -> StageQuery {

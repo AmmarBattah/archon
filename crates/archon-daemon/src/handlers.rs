@@ -7,6 +7,7 @@ mod cost;
 mod initiatives;
 mod item_views;
 mod items;
+mod learning;
 mod lessons;
 mod model_evidence;
 mod operator;
@@ -24,10 +25,11 @@ use archon_core::protocol::{ClientKind, Reply, Request};
 use crate::context::DaemonContext;
 use crate::{github, reports, standby, supervisor};
 
-/// Validate and execute one request. `ClientKind::ArchonMcp` is refused
-/// operator-only requests with `ErrorCode::Forbidden`, and a request that
-/// changes Archon for an agent is made only for the orchestrator archond
-/// has now (ARCHITECTURE §11). In standby only reads are served.
+/// Validate and execute one request. Operator-only requests are refused
+/// with `ErrorCode::Forbidden` over MCP and for any agent, whatever the
+/// client; a request that changes Archon for an agent is made only for the
+/// orchestrator archond has now (ARCHITECTURE §11). In standby only reads
+/// are served.
 pub async fn handle(
     ctx: &DaemonContext,
     client: ClientKind,
@@ -42,7 +44,7 @@ pub async fn handle(
             "for_agent carries one request, not another for_agent".into(),
         ));
     }
-    if client == ClientKind::ArchonMcp && request.is_operator_only() {
+    if for_an_agent(client, caller.as_ref()) && request.is_operator_only() {
         return Err(ArchonError::Forbidden(format!(
             "{} is reserved for the operator's archon CLI",
             command_name(&request)
@@ -69,9 +71,14 @@ fn orchestrators_alone(
     caller: Option<&AetherAgentId>,
     request: &Request,
 ) -> bool {
-    let for_an_agent = client == ClientKind::ArchonMcp || caller.is_some();
     let stage_message = matches!(request, Request::MessageOrchestrator { .. });
-    for_an_agent && !request.is_read_only() && !stage_message
+    for_an_agent(client, caller) && !request.is_read_only() && !stage_message
+}
+
+/// Whether a request is made for an agent: over MCP, or forwarded for one
+/// by any client.
+fn for_an_agent(client: ClientKind, caller: Option<&AetherAgentId>) -> bool {
+    client == ClientKind::ArchonMcp || caller.is_some()
 }
 
 /// A request that names its caller itself names the agent it is forwarded for.
@@ -131,7 +138,7 @@ async fn route(
     }
 }
 
-/// Initiatives, steering and lessons.
+/// Initiatives, steering, lessons and operator corrections.
 async fn handle_adaptive(
     ctx: &DaemonContext,
     client: ClientKind,
@@ -153,6 +160,13 @@ async fn handle_adaptive(
         Request::UpdateLesson { lesson, patch } => lessons::update(ctx, &lesson, patch).await,
         Request::LessonsWhy { item } => lessons::why(ctx, &item).await,
         Request::LessonStats { repo } => lessons::stats(ctx, repo.as_ref()).await,
+        Request::LearningCorrect(correction) => learning::correct(ctx, correction).await,
+        Request::LearningWhy { item } => learning::why(ctx, &item).await,
+        Request::LearningUndo { feedback } => learning::undo(ctx, &feedback).await,
+        Request::LearningRestoreMemory { feedback } => {
+            learning::restore_memory(ctx, &feedback).await
+        }
+        Request::LearningRetryMemory { feedback } => learning::retry_memory(ctx, &feedback).await,
         request => handle_queue(ctx, request).await,
     }
 }

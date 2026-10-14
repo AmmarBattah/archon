@@ -804,6 +804,7 @@ mod tests {
             id: archon_core::id::StageRunId::new(),
             run: PipelineRunId::new(),
             stage_id: stage.to_owned(),
+            kind: None,
             attempt: 1,
             fan_index: 0,
             model_segments: Vec::new(),
