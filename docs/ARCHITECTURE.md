@@ -78,7 +78,7 @@ Contents:
 
 | Process | What it is | Lifetime |
 | --- | --- | --- |
-| `archond` (`archon daemon run`) | The Archon daemon: store, dispatcher, pipeline engine, Aether link, orchestrator supervisor, feed, lavish plugin. | Long-running; one per data directory (§9). Autostarted by commands that change something, the TUI, the chat and `archon mcp`, never by a command that only reads. |
+| `archond` (`archon daemon run`) | The Archon daemon: store, dispatcher, pipeline engine, Aether link, orchestrator supervisor, feed, lavish plugin. | Long-running; one per data directory (§9). Autostarted by the TUI, the chat, and commands and `archon mcp` tool calls that change something; never by one that only reads. |
 | `archon` | The CLI, a client of `archond`. With no subcommand it opens the terminal UI (`archon tui`, §4.7); `archon chat` is the quiet operator chat (§12). | Per command. |
 | `archon mcp` | Stdio MCP server. Aether spawns it as the `archon` MCP server, and it proxies each tool call to `archond`. | Owned by `aetherd`. |
 | `aetherd` (Archon's own) | In dedicated mode (the default), an unmodified `aether daemon` with its config, store and socket under Archon's directories (§4.7). | Started by any `archon` command that starts `archond`; stopped by `archon daemon stop` (not with `--keep-aether`). |
@@ -2552,9 +2552,11 @@ an exclusive `flock` on `<data>/data.lock` and writes its pid and socket
 into it, and holds it until it exits (`archon_queue::DataLock`). The socket's
 own lock (`archond.sock.lock`) keeps two daemons off one socket; this one
 keeps two daemons on different sockets off one store, and the one turned
-away names the holder's pid and socket. `Store::open`, used by
-`archon gc --offline`, tests and tools, takes the same lock shared, so such a
-user and `archond` exclude each other; read-only opens take no lock.
+away names the holder's pid and socket. `Store::open`, used by tests and
+tools, takes the same lock shared, and so does `archon gc --offline` before
+its read-only open, so such a user and `archond` exclude each other. Other
+read-only opens (`Store::open_read_only`, as offline `archon lessons` uses)
+take no lock.
 
 The three overrides move together. When some of them point away from their
 defaults and some do not (a private `ARCHON_CONFIG_DIR` and `ARCHON_SOCKET`
@@ -2569,7 +2571,13 @@ Commands that only read connect to a running `archond` and never start it or
 Archon's `aetherd`; without one they fail with ``archond is not running
 (start it with `archon daemon start`)``. Commands that change something,
 the TUI and the chat start both as before and say so on stderr, naming the
-data directory and socket (`crates/archon/src/connect.rs`).
+data directory and socket (`crates/archon/src/connect.rs`). `archon mcp`
+follows the same rule per tool call (`Request::is_read_only`): a read-only
+call, or the reconnect before one, only connects.
+
+Locations are compared where the filesystem leads them: symlinks and `..`
+are resolved, through the nearest existing ancestor for a path not created
+yet, so a symlink to a default directory is that default.
 
 Paths in `config.toml` (`[aether] socket`, `[orchestrator]
 instructions_file`, `[worktrees] root`) are resolved when the file is read,
@@ -3633,7 +3641,7 @@ rubric), and a review task (seeded bug must be reported).
 | A delegating stage agent settles while its children run | The stage's settle: its stored request has `leaf: false`. | `kv.descendant_stop:<stage run>` is written with the settle. No agent of that run is created (next stage or replacement), and archond does not deliver the run (§8.7), until Archon has cancelled the settled agent and Aether holds no agent beneath it in a non-terminal state; the agent is first left to end its own turn, up to 60 s. The cancel is sent once; the check is repeated each dispatcher pass and after a restart. Agents still running 120 s after the cancel are named in one `Blocker` and the run keeps waiting; a refused cancel fails the run with a `Blocker` (§6.3). |
 | Aether names no caller on Archon's tools | An unnamed call that changes Archon reaches `archond`. | One `Blocker` with the fix; such calls are accepted only from an orchestrator that cannot delegate, and new generations start without `delegate`, until the orchestrator makes a named call of any kind (§11). In dedicated mode the registration is repaired and Archon's `aetherd` restarted by the next command (§4.7). |
 | Orchestrator missing (first start) | No `kv.orchestrator_agent`. | Create it (§4.4). |
-| `archon mcp` cannot reach `archond` | Connect error in the proxy. | `connect_or_start` autostarts `archond`, except where the path overrides mix moved and default locations (§9), when it returns that as the error (`archon daemon run --detach`, which waits until the daemon listens and fails as soon as it exits). If that fails, return a tool error with the launcher's stderr and the startup log since the last start mark (each detached start appends to `archond.log`, moving it to `archond.log.1` past 16 MiB). |
+| `archon mcp` cannot reach `archond` | Connect error in the proxy. | A read-only tool call returns a tool error saying archond is not running, and never starts it. For any other call, `connect_or_start` autostarts `archond`, except where the path overrides mix moved and default locations (§9), when it returns that as the error (`archon daemon run --detach`, which waits until the daemon listens and fails as soon as it exits). If that fails, return a tool error with the launcher's stderr and the startup log since the last start mark (each detached start appends to `archond.log`, moving it to `archond.log.1` past 16 MiB). |
 | Stage exceeds deadline | Timer. | `cancel` the agent, mark the stage `timed_out`, and let the driver treat it as a failed verdict or failed work. |
 | A steer is stored but Aether does not take what the live agents are owed | `update_agent`, `interrupt` or `send_message` unanswered, or a crash after the store. | The steps stay in `kv.steer_owed:<stage run>` and every sweep repeats them in order, each message under its own key so it is delivered once. A step Aether refuses is dropped with a progress note; what the steer stored reaches the stage's next agents (§6.6). |
 | `archond` restarts on a steered run | Startup reconcile. | `frozen::thaw` applies the run's `run_edits` to its frozen pipeline and the driver takes its recorded aborts before `RunDriver::resume`, so the run has the stages and decisions the steers left (§6.6). |

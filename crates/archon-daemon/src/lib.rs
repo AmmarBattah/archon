@@ -274,9 +274,8 @@ fn build_context(options: DaemonOptions) -> Result<DaemonContext, ArchonError> {
     Ok(ctx)
 }
 
-/// The store, under the data directory's exclusive lock taken first and
-/// held as long as the store: a second daemon on this data dir stops here,
-/// before it reads or migrates anything.
+/// The store, under the data dir's exclusive lock taken first and held as long as the store:
+/// a second daemon on this data dir stops here, before it reads or migrates anything.
 fn open_store(paths: &DaemonPaths, config: &Config) -> Result<Store, ArchonError> {
     assert!(
         paths.data_dir.is_dir(),

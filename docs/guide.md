@@ -667,7 +667,8 @@ lesson changes, `reports reopen`, `orchestrator restart`, …), the TUI, the
 line chat and `archon daemon start` start archond when it is not running,
 and in dedicated mode Archon's `aetherd` first. They say so on stderr, with
 the data directory and socket the new archond owns. `archon mcp` starts
-archond for Aether's agents in the same way.
+archond for Aether's agents in the same way, for a tool call that changes
+something; a read-only tool call never starts it.
 
 Archon keeps its files in three places: the config directory, the data
 directory and archond's socket. `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR` and
@@ -683,9 +684,11 @@ One archond owns a data directory. It holds a lock on `<data>/data.lock`,
 which records its pid and socket, from before it opens the store until it
 exits. A second archond started on the same data directory, under any
 socket, exits with an error that names the first one's pid and socket.
-`archon gc --offline` and other tools that open the store hold that lock
-shared: they are refused while archond runs, and archond does not start
-while they hold it.
+`archon gc --offline`, and tools that open the store to write, hold that
+lock shared: they are refused while archond runs, and archond does not
+start while they hold it. `archon lessons`, which reads the store
+directly while archond is not running, opens it read-only and takes no
+lock.
 
 ### Steering an item
 

@@ -376,12 +376,8 @@ async fn an_unreachable_daemon_is_a_tool_error_and_the_next_call_reconnects() {
     let down = mcp.call(1, "list_repos", json!({})).await;
     assert_eq!(down["isError"], true);
     let message = text(&down);
-    // Not started either way: the binary is missing, or this process's
-    // default dirs beside a temp socket are a mix that is never started.
-    let not_started = ["could not be started", "it is not started for you"];
     assert!(
-        message.contains("daemon is unavailable")
-            && not_started.iter().any(|t| message.contains(t)),
+        message.contains("daemon is unavailable") && never_started(message),
         "{message}"
     );
     assert!(message.contains("archon daemon start"), "{message}");
@@ -408,6 +404,52 @@ async fn an_unreachable_daemon_is_a_tool_error_and_the_next_call_reconnects() {
         "reconnected after {attempts} call(s): {result}"
     );
     assert_eq!(restarted.requests(), vec![Request::RepoList]);
+    mcp.close().await;
+}
+
+/// Whether a read's error says archond was not started for it: always, and
+/// with the reason when this process's default dirs beside a temp socket mix.
+fn never_started(message: &str) -> bool {
+    [
+        "a read-only call never starts it",
+        "it is not started for you",
+    ]
+    .iter()
+    .any(|said| message.contains(said))
+}
+
+/// A read never runs `archon daemon run --detach`: not on the first call,
+/// not for an agent Aether names, and not to reconnect after archond left.
+#[tokio::test]
+async fn a_read_only_call_never_starts_archond() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("archond.sock");
+    let started = dir.path().join("started");
+    let archon = dir.path().join("archon");
+    let launcher = format!(
+        "#!/bin/sh\necho \"$@\" >> '{}'\nexit 3\n",
+        started.display()
+    );
+    archon_core::testing::write_script(&archon, &launcher);
+    let mut mcp = Mcp::start(&socket, &archon);
+
+    let down = mcp.call(1, "list_repos", json!({})).await;
+    assert!(never_started(text(&down)), "{down}");
+    let down = mcp.call_as(2, "agt_1", "list_queue", json!({})).await;
+    assert!(never_started(text(&down)), "{down}");
+
+    let daemon = FakeDaemon::start(&socket, answer_everything);
+    let up = mcp.call(3, "list_repos", json!({})).await;
+    assert_eq!(up["isError"], false, "{up}");
+    drop(daemon);
+    std::fs::remove_file(&socket).unwrap();
+    // The first may still go out on the closing connection; the next reconnects.
+    let gone = mcp.call(4, "list_repos", json!({})).await;
+    assert_eq!(gone["isError"], true, "{gone}");
+    let reconnect = mcp.call(5, "list_repos", json!({})).await;
+    assert!(never_started(text(&reconnect)), "{reconnect}");
+    assert!(!started.exists(), "the launcher ran for a read");
+    assert!(!socket.exists(), "nothing listens again");
     mcp.close().await;
 }
 

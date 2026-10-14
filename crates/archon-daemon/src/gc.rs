@@ -310,10 +310,8 @@ fn held_by_a_sweep(item: &plan::ItemPlan) -> GcReport {
     }
 }
 
-/// One pass without archond, for a disk too full to start it: holding the
-/// daemon lock and the data directory's lock shared, so none runs meanwhile
-/// on this socket or this store and no run is live, and reading the store
-/// without writing to it. Fails while an archond holds either lock.
+/// One read-only pass without archond, for a disk too full to start it, holding the daemon lock
+/// and the data dir's lock shared so none runs meanwhile. Fails while an archond holds either.
 pub fn collect_offline(
     config: &WorktreeConfig,
     paths: &DaemonPaths,

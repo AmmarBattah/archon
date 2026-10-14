@@ -1,7 +1,7 @@
 //! Where Archon keeps its files. Environment overrides: `ARCHON_CONFIG_DIR`,
 //! `ARCHON_DATA_DIR`, `ARCHON_SOCKET`.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const CONFIG_DIR_VAR: &str = "ARCHON_CONFIG_DIR";
 pub const DATA_DIR_VAR: &str = "ARCHON_DATA_DIR";
@@ -90,12 +90,10 @@ pub struct Location {
 }
 
 impl Location {
-    /// Compared as absolute paths, without touching the filesystem.
+    /// Compared where the filesystem leads them, symlinks and `..` resolved,
+    /// so another spelling of the default is no move.
     pub fn moved(&self) -> bool {
-        match (
-            std::path::absolute(&self.path),
-            std::path::absolute(&self.default),
-        ) {
+        match (resolved(&self.path), resolved(&self.default)) {
             (Ok(path), Ok(default)) => path != default,
             // No working directory to resolve against: compare as written.
             _ => self.path != self.default,
@@ -103,9 +101,39 @@ impl Location {
     }
 }
 
-/// The config directory, the data directory and `socket`, as this process
-/// resolves them. A socket left unset follows a moved data directory where
-/// there is no runtime directory, so it counts as moved with it.
+/// `path` made absolute, its longest resolvable prefix canonicalized and the
+/// rest, not created yet, appended with `..` taken lexically.
+fn resolved(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let parts: Vec<Component<'_>> = absolute.components().collect();
+    assert!(absolute.has_root(), "{} is absolute", absolute.display());
+    for end in (1..=parts.len()).rev() {
+        let prefix: PathBuf = parts[..end].iter().collect();
+        // Missing, or not readable by this user: resolve what lies above it.
+        let Ok(mut real) = prefix.canonicalize() else {
+            continue;
+        };
+        for part in &parts[end..] {
+            match part {
+                Component::ParentDir => {
+                    real.pop();
+                }
+                other => real.push(other),
+            }
+        }
+        assert!(
+            !real.components().any(|c| c == Component::ParentDir),
+            "{} is resolved",
+            real.display()
+        );
+        return Ok(real);
+    }
+    // Not even the root resolved: there is nothing to follow.
+    Ok(absolute)
+}
+
+/// The config directory, the data directory and `socket` as this process
+/// resolves them; an unset socket without a runtime dir moves with the data.
 pub fn locations(socket: &Path) -> [Location; 3] {
     let default_data = default_data_dir();
     [
@@ -127,9 +155,8 @@ pub fn locations(socket: &Path) -> [Location; 3] {
     ]
 }
 
-/// Some locations point away from their defaults and some do not, such as a
-/// private config and socket with the default data directory. An archond
-/// started on such a mix would serve one setup's data under another's name.
+/// Some locations point away from their defaults and some do not, such as a private config and
+/// socket over the default data dir; an archond started there would mix two setups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartialOverride {
     pub moved: Vec<Location>,
@@ -191,7 +218,11 @@ pub fn partial_override(socket: &Path) -> Option<PartialOverride> {
 mod tests {
     use super::*;
 
-    fn at(variable: &'static str, path: &str, default: &str) -> Location {
+    fn at(
+        variable: &'static str,
+        path: impl Into<PathBuf>,
+        default: impl Into<PathBuf>,
+    ) -> Location {
         Location {
             variable,
             path: path.into(),
@@ -268,6 +299,88 @@ mod tests {
                 "{found}"
             );
         }
+    }
+
+    /// A private config and socket over `data`, which leads to `<root>/share/archon`.
+    fn over_data(root: &Path, data: PathBuf) -> Option<PartialOverride> {
+        PartialOverride::among([
+            at(
+                CONFIG_DIR_VAR,
+                root.join("p/config"),
+                root.join("config/archon"),
+            ),
+            at(DATA_DIR_VAR, data, root.join("share/archon")),
+            at(
+                SOCKET_VAR,
+                root.join("p/s.sock"),
+                root.join("run/archon/archond.sock"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn another_way_to_the_default_data_dir_is_still_the_default() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let default = root.join("share/archon");
+        std::fs::create_dir_all(&default).unwrap();
+        std::os::unix::fs::symlink(&default, root.join("data-link")).unwrap();
+        let spellings = [
+            root.join("data-link"),
+            default.join("../archon"),
+            // `..` leaves the link's target, not the link: `share/archon` again.
+            root.join("data-link/../archon"),
+        ];
+        for data in spellings {
+            let found = over_data(root, data.clone())
+                .unwrap_or_else(|| panic!("{} is the default data dir", data.display()));
+            let kept: Vec<_> = found.kept.iter().map(|l| l.variable).collect();
+            assert_eq!(kept, [DATA_DIR_VAR], "{}", data.display());
+            assert!(
+                found.to_string().contains("is still the default"),
+                "{found}"
+            );
+        }
+        assert_eq!(over_data(root, root.join("p/data")), None, "all moved");
+    }
+
+    #[test]
+    fn a_symlink_to_the_default_config_moves_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let default = root.join("config/archon");
+        std::fs::create_dir_all(&default).unwrap();
+        let link = root.join("config-link");
+        std::os::unix::fs::symlink(&default, &link).unwrap();
+        let sock = root.join("run/archon/archond.sock");
+        let found = PartialOverride::among([
+            at(CONFIG_DIR_VAR, &link, &default),
+            at(
+                DATA_DIR_VAR,
+                root.join("share/archon"),
+                root.join("share/archon"),
+            ),
+            at(SOCKET_VAR, &sock, &sock),
+        ]);
+        assert_eq!(found, None, "the default config, reached through a symlink");
+        assert!(at(CONFIG_DIR_VAR, root.join("config"), &default).moved());
+    }
+
+    #[test]
+    fn a_path_not_created_yet_resolves_through_its_nearest_existing_ancestor() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        std::fs::create_dir(root.join("run")).unwrap();
+        std::os::unix::fs::symlink(root.join("run"), root.join("run-link")).unwrap();
+        let default = root.join("run/archon/archond.sock");
+        let socket = |path: PathBuf| at(SOCKET_VAR, path, &default);
+        assert!(!socket(root.join("run-link/archon/archond.sock")).moved());
+        assert!(!socket(root.join("run/archon/x/../archond.sock")).moved());
+        assert!(socket(root.join("run-link/other/archond.sock")).moved());
+        assert!(
+            !default.parent().unwrap().exists(),
+            "none of it was created"
+        );
     }
 
     #[test]

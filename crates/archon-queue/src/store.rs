@@ -117,10 +117,8 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens (creating if needed) the on-disk store and brings its schema up
-    /// to date. Refuses a store written by a newer Archon, and one whose
-    /// data directory an archond owns: this holds its lock shared, so any
-    /// number of these may share a store, but no archond starts meanwhile.
+    /// Opens (creating if needed) the on-disk store and brings its schema up to date, holding the
+    /// data dir's lock shared. Refuses a store of a newer Archon, or one an archond owns.
     pub fn open(path: &Path) -> Result<Self, ArchonError> {
         let dir = store_dir(path);
         std::fs::create_dir_all(dir)
@@ -129,9 +127,8 @@ impl Store {
         Self::open_locked(path, lock)
     }
 
-    /// Opens archond's store under its exclusive [`DataLock`] on the
-    /// store's directory, which the store then holds for as long as it is
-    /// open: no other process opens it read-write meanwhile.
+    /// Opens archond's store under its exclusive [`DataLock`] on the store's directory, held
+    /// for as long as the store is open.
     pub fn open_owned(path: &Path, lock: DataLock) -> Result<Self, ArchonError> {
         assert!(lock.is_exclusive(), "archond opens its store exclusively");
         assert_eq!(

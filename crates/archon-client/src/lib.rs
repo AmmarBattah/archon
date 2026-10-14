@@ -90,10 +90,8 @@ impl ArchonClient {
         })
     }
 
-    /// Connect, or spawn `<archon_bin> daemon run --detach` and retry until
-    /// `START_TIMEOUT`, reporting the daemon's startup log on failure. Never
-    /// starts one where the config dir, data dir and `socket` mix moved and
-    /// default locations (`archon_core::paths::partial_override`).
+    /// Connect, or spawn `<archon_bin> daemon run --detach` and retry until `START_TIMEOUT`,
+    /// reporting its startup log on failure; never over a mix of moved and default locations.
     pub async fn connect_or_start(
         socket: &Path,
         kind: ClientKind,

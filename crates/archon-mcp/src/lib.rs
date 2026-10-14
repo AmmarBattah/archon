@@ -30,9 +30,8 @@ pub const MAX_MESSAGE_BYTES: usize = 4 << 20;
 /// tool error rather than queued, where its deadline would run out unseen.
 pub const MAX_CONCURRENT_CALLS: usize = 64;
 
-/// Serve stdin/stdout until stdin closes. The daemon connection is opened
-/// lazily with `connect_or_start` and re-opened after a drop, so a daemon
-/// restart costs at most the tool calls in flight.
+/// Serve stdin/stdout until stdin closes. The daemon connection is opened on first use, starting
+/// archond only for a call that changes something, and re-opened after a drop.
 pub async fn serve_stdio(socket: &Path, archon_bin: &Path) -> Result<(), ArchonError> {
     serve(tokio::io::stdin(), tokio::io::stdout(), socket, archon_bin).await
 }

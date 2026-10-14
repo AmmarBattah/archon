@@ -1,8 +1,5 @@
-//! Who may use a data directory: archond holds an exclusive `flock` on
-//! `<data>/data.lock` for its whole life, taken before it opens the store,
-//! and anything else that opens the store there holds it shared. So two
-//! daemons never share one store, and none starts while another process has
-//! it open. The file is never removed, as with the socket's lock.
+//! One archond per data directory: it holds `<data>/data.lock` exclusively while it runs, and
+//! `Store::open` and `archon gc --offline` hold it shared; read-only opens take no lock.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write as _;
@@ -29,9 +26,8 @@ pub struct DataLock {
 }
 
 impl DataLock {
-    /// archond's lock on `data_dir`, recording its pid and `socket`. Refused,
-    /// naming who is in the way, while another archond or a process with
-    /// the store open holds it.
+    /// archond's lock on `data_dir`, recording its pid and `socket`; refused, naming who is in
+    /// the way, while another archond or a shared holder has it.
     pub fn acquire(data_dir: &Path, socket: &Path) -> Result<Self, ArchonError> {
         assert!(
             data_dir.is_absolute(),
@@ -59,9 +55,8 @@ impl DataLock {
         })
     }
 
-    /// A shared lock on `data_dir` for a user of the store other than
-    /// archond: refused while an archond holds it, and keeps one from
-    /// starting meanwhile.
+    /// A shared lock on `data_dir` for a store user other than archond: refused while an archond
+    /// holds it, and keeps one from starting meanwhile.
     pub fn share(data_dir: &Path) -> Result<Self, ArchonError> {
         let path = archon_core::paths::data_lock_path_for(data_dir);
         let file = open(&path)?;

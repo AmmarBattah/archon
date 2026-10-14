@@ -1,5 +1,4 @@
-//! Reaching `archond` from the CLI. A command that only reads connects to
-//! the running daemon and never starts one; a command that changes
+//! Reaching `archond` from the CLI. A command that only reads never starts it; one that changes
 //! something, or opens the chat or the terminal UI, starts it and says so.
 
 use std::path::{Path, PathBuf};
@@ -52,10 +51,8 @@ pub fn not_running_text() -> String {
     }
 }
 
-/// Connect for a command that changes something or is interactive, starting
-/// archond (and in dedicated mode Archon's own aetherd first) when nothing
-/// listens; after starting that aetherd, wait for archond's link to it.
-/// Starts nothing where the locations mix moved and default ones.
+/// Connect for a command that changes something or is interactive, starting archond when nothing
+/// listens (Archon's own aetherd first in dedicated mode), unless the locations mix.
 pub async fn connect_or_start() -> anyhow::Result<ArchonClient> {
     let socket = archon_client::default_socket();
     if let Some(mix) = archon_core::paths::partial_override(&socket) {

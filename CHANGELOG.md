@@ -11,8 +11,9 @@ starts one.
   and each undid the other's work. `archond` now holds a lock on
   `<data>/data.lock` from before it opens the store until it exits, and
   writes its pid and socket into it. A second one exits with an error that
-  names them. `archon gc --offline` and other tools that open the store
-  hold the lock shared, so they and `archond` exclude each other.
+  names them. `archon gc --offline` and tools that open the store to write
+  hold the lock shared, so they and `archond` exclude each other; read-only
+  opens, such as `archon lessons` without `archond`, take no lock.
 - A command that only reads (`status`, `questions`, `log`, `cost`,
   `model-evidence`, `queue list`, `queue show`, `queue wait`, `queue caps`,
   `repo list`, `initiatives`, `autonomy`, `github-watcher`, `orchestrator
@@ -20,7 +21,8 @@ starts one.
   Without a running `archond` it prints ``archond is not running (start it
   with `archon daemon start`)`` and exits 1. Commands that change
   something, the TUI and the chat still start both, and now say so on
-  stderr with the data directory and socket. The guide lists the rule under
+  stderr with the data directory and socket. `archon mcp` no longer starts
+  `archond` for a read-only tool call either. The guide lists the rule under
   "Which commands start archond".
 - Where `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR` and `ARCHON_SOCKET` are only
   partly set, such as a private config and socket over the default data
@@ -29,7 +31,8 @@ starts one.
   name the variables, reads add the same note, `archon mcp` does not
   autostart, `archon gc` does not collect offline, and `archon doctor` warns
   in a new `locations` check. `archon daemon run` still starts, with a
-  warning. Set all three together, or none.
+  warning. Set all three together, or none. A symlink or `..` that leads to
+  a default location counts as that default.
 
 ### Changes
 

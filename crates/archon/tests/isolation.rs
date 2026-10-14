@@ -1,10 +1,9 @@
-//! One archond per data directory, reads that never start one, and no
-//! autostart where the config dir, data dir and socket mix moved and default
-//! locations.
+//! One archond per data directory, reads that never start one, and no autostart where the
+//! config dir, data dir and socket mix moved and default locations.
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -106,17 +105,39 @@ fn assert_nothing_started(socket: &Path, data: &Path) {
     );
 }
 
-/// `env`'s commands with the defaults moved into its temp dir, and only
-/// `ARCHON_CONFIG_DIR` and `ARCHON_SOCKET` set: the data dir is the default.
-fn mixed(env: &Env, args: &[&str]) -> Command {
+/// `env`'s commands with the defaults moved into its temp dir.
+fn sandboxed(env: &Env, args: &[&str]) -> Command {
     let mut command = env.command(args);
     command
-        .env_remove("ARCHON_DATA_DIR")
         .env("HOME", env.path("home"))
         .env("XDG_CONFIG_HOME", env.path("home/.config"))
         .env("XDG_DATA_HOME", env.path("home/.local/share"))
         .env("XDG_RUNTIME_DIR", env.path("run"));
     command
+}
+
+/// Only `ARCHON_CONFIG_DIR` and `ARCHON_SOCKET` set: the data dir is the default.
+fn mixed(env: &Env, args: &[&str]) -> Command {
+    let mut command = sandboxed(env, args);
+    command.env_remove("ARCHON_DATA_DIR");
+    command
+}
+
+/// No `ARCHON_*` variable set, so every location is the sandbox's default.
+fn at_defaults(env: &Env, args: &[&str]) -> Command {
+    let mut command = sandboxed(env, args);
+    for variable in ["ARCHON_CONFIG_DIR", "ARCHON_DATA_DIR", "ARCHON_SOCKET"] {
+        command.env_remove(variable);
+    }
+    command
+}
+
+/// The sandbox's default config dir, holding `env`'s shared-mode config.
+fn default_config(env: &Env) -> PathBuf {
+    let dir = env.path("home/.config/archon");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(env.path("config/config.toml"), dir.join("config.toml")).unwrap();
+    dir
 }
 
 #[test]
@@ -159,12 +180,9 @@ fn a_mixed_environment_warns_and_starts_nothing() {
     );
 }
 
-/// Aether spawns `archon mcp` with its own environment, which may set only
-/// `ARCHON_SOCKET`: the proxy then connects but never starts archond.
-#[test]
-fn the_mcp_proxy_does_not_start_archond_in_a_mixed_environment() {
-    let env = Env::new();
-    let mut proxy = mixed(&env, &["mcp"])
+/// `archon mcp`, run as `command`, after one `list_repos` call and the end of its input.
+fn mcp_list_repos(mut command: Command) -> Output {
+    let mut proxy = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -174,15 +192,109 @@ fn the_mcp_proxy_does_not_start_archond_in_a_mixed_environment() {
     let mut stdin = proxy.stdin.take().unwrap();
     std::io::Write::write_all(&mut stdin, format!("{call}\n").as_bytes()).unwrap();
     drop(stdin);
-    let out = exit_within(proxy, common::START_WAIT);
+    exit_within(proxy, common::START_WAIT)
+}
+
+/// The tool error with which `archon mcp` answered a read: archond is not running.
+fn refused_read(out: &Output) -> String {
     let reply: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(reply["result"]["isError"], true, "{reply}");
     let said = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(said.contains("archond is not running"), "{said}");
+    said.to_owned()
+}
+
+/// Aether spawns `archon mcp` with its own environment, which may set only
+/// `ARCHON_SOCKET`: the proxy then connects but never starts archond.
+#[test]
+fn the_mcp_proxy_does_not_start_archond_in_a_mixed_environment() {
+    let env = Env::new();
+    let said = refused_read(&mcp_list_repos(mixed(&env, &["mcp"])));
     assert!(said.contains("it is not started for you"), "{said}");
     assert!(said.contains("ARCHON_DATA_DIR ("), "{said}");
     assert_nothing_started(
         &env.path("archond.sock"),
         &env.path("home/.local/share/archon"),
+    );
+}
+
+/// A read-only tool call never starts archond, wherever the locations are.
+#[test]
+fn the_mcp_proxy_starts_nothing_for_a_read() {
+    let env = Env::new();
+    let moved = mcp_list_repos(env.command(&["mcp"]));
+    // Stopped before any assertion, so a failed one leaves no daemon behind.
+    let _stopped_if_started = env.command(&["daemon", "stop"]).output().unwrap();
+    let moved = refused_read(&moved);
+    assert!(
+        moved.contains("a read-only call never starts it"),
+        "{moved}"
+    );
+    assert_nothing_started(&env.path("archond.sock"), &env.path("data"));
+
+    default_config(&env);
+    let default = mcp_list_repos(at_defaults(&env, &["mcp"]));
+    let _stopped_if_started = at_defaults(&env, &["daemon", "stop"]).output().unwrap();
+    let default = refused_read(&default);
+    assert!(
+        default.contains("a read-only call never starts it"),
+        "{default}"
+    );
+    assert_nothing_started(
+        &env.path("run/archon/archond.sock"),
+        &env.path("home/.local/share/archon"),
+    );
+}
+
+/// A symlink or `..` leading to the default data dir keeps it the default,
+/// so a private config and socket over it are still refused a start.
+#[test]
+fn another_way_to_the_default_data_dir_still_starts_nothing() {
+    let env = Env::new();
+    let default_data = env.path("home/.local/share/archon");
+    std::fs::create_dir_all(&default_data).unwrap();
+    std::os::unix::fs::symlink(&default_data, env.path("data-link")).unwrap();
+    for data in [env.path("data-link"), default_data.join("../archon")] {
+        let out = mixed(&env, &["pause"])
+            .env("ARCHON_DATA_DIR", &data)
+            .output()
+            .unwrap();
+        // Stopped before any assertion, so a failed one leaves no daemon behind.
+        let _stopped_if_started = mixed(&env, &["daemon", "stop"])
+            .env("ARCHON_DATA_DIR", &data)
+            .output()
+            .unwrap();
+        let stderr = text(&out.stderr);
+        assert!(!out.status.success(), "{} started: {out:?}", data.display());
+        assert!(stderr.contains("it is not started for you"), "{stderr}");
+        assert!(stderr.contains("is still the default"), "{stderr}");
+    }
+    assert_nothing_started(&env.path("archond.sock"), &default_data);
+}
+
+/// A config dir symlinked to the default one is the default, so with the
+/// default data dir and socket `archon daemon start` is no mix.
+#[test]
+fn a_symlink_to_the_default_config_dir_still_starts_archond() {
+    let env = Env::new();
+    let link = env.path("config-link");
+    std::os::unix::fs::symlink(default_config(&env), &link).unwrap();
+    let started = at_defaults(&env, &["daemon", "start"])
+        .env("ARCHON_CONFIG_DIR", &link)
+        .output()
+        .unwrap();
+    // Stopped before any assertion, so a failed one leaves no daemon behind.
+    let stopped = at_defaults(&env, &["daemon", "stop"])
+        .env("ARCHON_CONFIG_DIR", &link)
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    assert!(stopped.status.success(), "{stopped:?}");
+    let stderr = text(&started.stderr);
+    assert!(stderr.contains("starting it"), "{stderr}");
+    assert!(
+        env.path("home/.local/share/archon/archon.db").exists(),
+        "archond used the sandbox's default store"
     );
 }
 

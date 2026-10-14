@@ -154,14 +154,17 @@ impl DaemonLink {
         }
     }
 
+    /// Forward `request`, starting archond first only for one that changes
+    /// something: a read never starts it, as with the CLI.
     async fn call(&self, request: Request) -> Result<Result<Reply, ErrorReply>, ArchonError> {
-        let client = self.client().await?;
+        let may_start = !request.is_read_only();
+        let client = self.client(may_start).await?;
         client.call(request).await
     }
 
     /// The live connection, opened now if there is none. Concurrent callers
     /// wait for one connection attempt instead of starting the daemon twice.
-    async fn client(&self) -> Result<Arc<ArchonClient>, ArchonError> {
+    async fn client(&self, may_start: bool) -> Result<Arc<ArchonClient>, ArchonError> {
         let mut slot = self.client.lock().await;
         if slot.as_ref().is_some_and(|client| client.is_closed()) {
             tracing::info!("the archond connection closed; reconnecting");
@@ -170,12 +173,30 @@ impl DaemonLink {
         if let Some(client) = slot.as_ref() {
             return Ok(Arc::clone(client));
         }
-        let kind = ClientKind::ArchonMcp;
-        let client = ArchonClient::connect_or_start(&self.socket, kind, &self.archon_bin).await?;
+        let client = if may_start {
+            let kind = ClientKind::ArchonMcp;
+            ArchonClient::connect_or_start(&self.socket, kind, &self.archon_bin).await?
+        } else {
+            connect_running(&self.socket).await?
+        };
         let client = Arc::new(client);
         *slot = Some(Arc::clone(&client));
         Ok(client)
     }
+}
+
+/// Connect for a read-only call, which never starts archond. Where the
+/// locations mix moved and default ones, say why a change would not start it either.
+async fn connect_running(socket: &Path) -> Result<ArchonClient, ArchonError> {
+    let why = match ArchonClient::connect(socket, ClientKind::ArchonMcp).await {
+        Err(ArchonError::Unavailable(why)) => why,
+        connected => return connected,
+    };
+    let text = match archon_core::paths::partial_override(socket) {
+        Some(mix) => format!("{why}, and it is not started for you: {mix}"),
+        None => format!("{why}; a read-only call never starts it"),
+    };
+    Err(ArchonError::Unavailable(text))
 }
 
 #[derive(Debug)]
