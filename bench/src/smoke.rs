@@ -13,7 +13,7 @@ pub const TASKS: [&str; 4] = [
     "fix-off-by-one",
     "quality-ledger-transfer",
     "quality-retry-budget",
-    "quality-safe-extract",
+    "review-seeded-bug",
 ];
 pub const DEFAULT_MAX_USD: f64 = 7.0;
 
@@ -57,8 +57,8 @@ impl Baseline {
             "baseline lacks model or effort"
         );
         ensure!(
-            !self.source_run.is_empty(),
-            "baseline lacks its evidence run"
+            !self.source_run.is_empty() && self.source_run != "pending",
+            "baseline lacks a completed evidence run (template is not a baseline)"
         );
         Ok(())
     }

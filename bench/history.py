@@ -66,13 +66,13 @@ def render(rows):
               for index, (metric, title) in enumerate(METRICS)]
     return f'''<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="{height}" viewBox="0 0 1280 {height}" role="img">
 <title>Archon benchmark history: pass rate, cost and wall time</title>
-<desc>Historical snapshots use different task mixes and sample sizes. Smoke starts a separate quality baseline.</desc>
+<desc>Historical snapshots use different models, task mixes and sample sizes. A complete smoke run establishes a separate quality baseline.</desc>
 <style>text {{font: 12px system-ui,sans-serif; fill:#172033}}</style>
 <rect width="1280" height="{height}" fill="#fff"/>
 <text x="20" y="30" style="font-size:20px;font-weight:600">Benchmark history · Archon and single-agent Aether</text>
 {''.join(panels)}
 <text x="20" y="{height - 35}">Observed graded-trial means; infrastructure failures excluded. v1/v2 are incomplete and task weights differ.</text>
-<text x="20" y="{height - 15}">Smoke uses four tasks (three new); compare future smoke runs to smoke, not to the older eight-task suite. Small samples do not establish reliability.</text>
+<text x="20" y="{height - 15}">Smoke uses Haiku and four tasks (two new); older snapshots use Opus. Compare like configurations. Small samples do not establish reliability.</text>
 </svg>
 '''
 
@@ -83,8 +83,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     rows = read_rows(args.directories)
-    assert rows and args.output.suffix == ".svg"
-    assert args.output.parent.is_dir()
+    if args.output.suffix != ".svg":
+        parser.error("--output must end in .svg")
+    if not args.output.parent.is_dir():
+        parser.error("--output parent directory must exist")
     args.output.write_text(render(rows))
     with args.output.with_suffix(".csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))

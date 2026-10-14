@@ -1,0 +1,36 @@
+{
+  "stamp": "20261014T114814Z",
+  "started_at": "2026-10-14T11:48:14.657640387Z",
+  "finished_at": null,
+  "archon_commit": "c35f633fd8c0dbea352ae3c6b75cb9cc7cce2446",
+  "versions": {
+    "aetherd": "1.0.3",
+    "archon": "archon 1.1.0"
+  },
+  "models": {
+    "aether": "claude-code/claude-opus-5-5",
+    "archon": "claude-code/claude-opus-5-5"
+  },
+  "effort": "high",
+  "arms": [
+    "archon",
+    "aether"
+  ],
+  "tasks": [
+    "fix-off-by-one",
+    "quality-ledger-transfer",
+    "quality-retry-budget",
+    "quality-safe-extract"
+  ],
+  "trials": 1,
+  "parallel": 1,
+  "timeout_factor": 1.0,
+  "max_usd": 7.0,
+  "max_trials": 8,
+  "planned": 8,
+  "completed": 0,
+  "skipped": 0,
+  "spent_usd": 0.0,
+  "unpriced_trials": 0,
+  "stopped_reason": null
+}

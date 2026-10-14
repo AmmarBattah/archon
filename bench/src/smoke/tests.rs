@@ -2,11 +2,23 @@ use super::*;
 use crate::metrics::tests::result;
 
 fn evidence() -> (Baseline, RunManifest, Vec<TrialResult>) {
-    let baseline: Baseline =
-        serde_json::from_str(include_str!("../../results-smoke/baseline.json")).unwrap();
+    let baseline = Baseline {
+        suite_version: 1,
+        tasks: TASKS.map(str::to_owned).to_vec(),
+        model: "claude-code/claude-haiku-5-5".into(),
+        effort: "high".into(),
+        archon_successes: 4,
+        archon_trials: 4,
+        source_run: "unit-test-fixture".into(),
+    };
     let mut manifest: RunManifest =
         serde_json::from_str(include_str!("../../results-v3/run.json")).unwrap();
     manifest.tasks = TASKS.map(str::to_owned).to_vec();
+    manifest.models = ["archon", "aether"]
+        .map(|arm| (arm.to_owned(), baseline.model.clone()))
+        .into_iter()
+        .collect();
+    manifest.effort = baseline.effort.clone();
     manifest.arms = vec![Arm::Archon, Arm::Aether];
     manifest.trials = 1;
     manifest.parallel = 1;
@@ -34,10 +46,21 @@ fn evidence() -> (Baseline, RunManifest, Vec<TrialResult>) {
 
 #[test]
 fn gate_detects_lost_archon_pass_without_penalizing_aether_failures() {
-    let (baseline, manifest, mut results) = evidence();
+    let (mut baseline, manifest, mut results) = evidence();
+    baseline.archon_successes = 4;
     let first = evaluate(&results, &manifest, &baseline, 7.0).unwrap();
     assert!(first.passed);
     results[1].success = false;
+    assert!(
+        evaluate(&results, &manifest, &baseline, 7.0)
+            .unwrap()
+            .passed
+    );
+    results[0].success = false;
+    let lost_one = evaluate(&results, &manifest, &baseline, 7.0).unwrap();
+    assert_eq!(lost_one.archon_successes, 3);
+    assert!(!lost_one.passed);
+    baseline.archon_successes = 3;
     assert!(
         evaluate(&results, &manifest, &baseline, 7.0)
             .unwrap()
@@ -97,6 +120,9 @@ fn changed_models_effort_and_baseline_shape_need_explicit_rebaselining() {
     results[0].model = baseline.model.clone();
     results[0].effort = Some("low".into());
     assert!(evaluate(&results, &manifest, &baseline, 7.0).is_err());
+    baseline.source_run = "pending".into();
+    assert!(baseline.validate().is_err());
+    baseline.source_run = "unit-test-fixture".into();
     baseline.archon_successes = 5;
     assert!(baseline.validate().is_err());
     baseline.archon_successes = 0;

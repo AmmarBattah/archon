@@ -109,9 +109,8 @@ pub fn check_plan(specs: &[TrialSpec], options: &RunOptions) -> anyhow::Result<(
     Ok(())
 }
 
-/// `--max-usd`: no new trial starts once recorded spend reaches the limit.
-/// Trials already running finish, so a run may overshoot by at most
-/// `--parallel - 1` trials. Unpriced trials count as $0 and are reported.
+/// Admission stops at the recorded limit; up to `--parallel` in-flight trials finish.
+/// Even serial runs can overshoot. Unpriced trials count as $0 and are reported.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Budget {
     pub limit_usd: f64,

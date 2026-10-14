@@ -1,0 +1,19 @@
+{
+  "run": "20261014T121507Z",
+  "reason": "Stopped immediately after the operator required cheap models; no graded trial completed.",
+  "interrupted": true,
+  "baseline_evidence": false,
+  "completed_trials": 0,
+  "completed_trial_cost_usd": 0,
+  "all_agent_cost_usd": 0.29517000000000004,
+  "agents": [
+    {
+      "id": "agt_01M4X5CYSTPCGDRE0FN6434CXX",
+      "model": {
+        "provider": "claude-code",
+        "model": "claude-opus-5-5"
+      },
+      "cost_usd": 0.29517000000000004
+    }
+  ]
+}

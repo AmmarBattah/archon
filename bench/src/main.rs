@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{bail, ensure};
 use archon_bench::arms::ArmSettings;
 use archon_bench::isolation::Protected;
 use archon_bench::metrics::Arm;
@@ -75,7 +75,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 1)]
     parallel: usize,
     /// The model every Claude-based arm uses, as provider/model.
-    #[arg(long, default_value = "claude-code/claude-opus-5-5")]
+    #[arg(long, default_value = "claude-code/claude-haiku-5-5")]
     model: ModelRef,
     /// Override --model for the archon arm (orchestrator and stages).
     #[arg(long)]
@@ -86,7 +86,7 @@ struct RunArgs {
     /// `claude --model`; defaults to --model's name when it is a claude-code model.
     #[arg(long)]
     claude_model: Option<String>,
-    /// `codex exec -m`; defaults to `model` in ~/.codex/config.toml.
+    /// `codex exec -m`; defaults to gpt-6-luna.
     #[arg(long)]
     codex_model: Option<String>,
     #[arg(long, default_value = "high")]
@@ -217,7 +217,7 @@ fn settings(args: &RunArgs) -> anyhow::Result<ArmSettings> {
     };
     let codex_model = match &args.codex_model {
         Some(model) => model.clone(),
-        None if args.arms.contains(&Arm::Codex) => codex_default_model()?,
+        None if args.arms.contains(&Arm::Codex) => "gpt-6-luna".to_owned(),
         None => String::new(),
     };
     ensure!(
@@ -243,28 +243,6 @@ fn settings(args: &RunArgs) -> anyhow::Result<ArmSettings> {
         prices: args.price.clone(),
         env: Default::default(),
     })
-}
-
-/// The `model` key of `$CODEX_HOME/config.toml` (default `~/.codex`).
-fn codex_default_model() -> anyhow::Result<String> {
-    let home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".codex")));
-    let path = home
-        .context("neither CODEX_HOME nor HOME is set; pass --codex-model")?
-        .join("config.toml");
-    let text = std::fs::read_to_string(&path).with_context(|| {
-        format!(
-            "reading {} for the codex model; pass --codex-model",
-            path.display()
-        )
-    })?;
-    let config: toml::Table =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let model = config.get("model").and_then(toml::Value::as_str);
-    model
-        .map(str::to_owned)
-        .with_context(|| format!("{} sets no model; pass --codex-model", path.display()))
 }
 
 fn render(dir: &Path, lavish: bool) -> anyhow::Result<()> {
@@ -310,4 +288,25 @@ async fn verify_all(tasks_root: &Path, only: &[String]) -> anyhow::Result<()> {
         base.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paid_run_defaults_use_cheap_models_without_local_config() {
+        let cli = Cli::parse_from(["archon-bench", "run", "--dry-run"]);
+        let BenchCommand::Run(args) = cli.command else {
+            panic!("parsed another command");
+        };
+        let settings = settings(&args).unwrap();
+        assert_eq!(
+            settings.archon_model.to_string(),
+            "claude-code/claude-haiku-5-5"
+        );
+        assert_eq!(settings.aether_model, settings.archon_model);
+        assert_eq!(settings.claude_model, "claude-haiku-5-5");
+        assert_eq!(settings.codex_model, "gpt-6-luna");
+    }
 }

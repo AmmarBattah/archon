@@ -47,3 +47,42 @@ async fn every_grader_fails_untouched_and_passes_with_its_reference() {
         "only {naive_checked} naive fixes were verified"
     );
 }
+
+#[test]
+fn naive_quality_fixes_pass_the_visible_examples() {
+    use archon_bench::verify::NAIVE_PATCH;
+    use archon_bench::workspace::{self, TrialLayout};
+
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("tasks");
+    let base = tempfile::tempdir().unwrap();
+    let cases = [
+        ("quality-ledger-transfer", "test_ledger"),
+        ("quality-safe-extract", "test_safe_extract"),
+        ("quality-retry-budget", "test_retry_budget"),
+    ];
+    for (id, module) in cases {
+        let task = BenchTask::load(&suite.join(id)).unwrap();
+        let layout = TrialLayout::under(&base.path().join(id));
+        workspace::prepare(&task, &layout).unwrap();
+        let cwd = layout.agent_cwd(&task);
+        workspace::git(
+            &cwd,
+            &["apply", task.dir.join(NAIVE_PATCH).to_str().unwrap()],
+        )
+        .unwrap();
+        let output = std::process::Command::new("python3")
+            .args(["-m", "unittest", "-q", module])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{id}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("\nOK\n"),
+            "{id}: no passing test summary"
+        );
+    }
+}

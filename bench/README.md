@@ -39,7 +39,7 @@ files and bounded synchronization, with no network or wall-clock sleeps.
 | `archon` | A private `archond` per trial, with the fixture registered. The prompt is sent as an operator message, and Archon's orchestrator picks the pipeline, plans work items and runs its stage agents (implement, review and so on). |
 | `aether` | One Aether leaf agent (`create_agent`) with the prompt, without delegation. |
 | `claude` | `claude -p … --dangerously-skip-permissions`. Claude Code keeps its built-in Task subagents. |
-| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox` on codex's own default model. |
+| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox` on `gpt-6-luna` by default. |
 
 Every arm gets the same prompt, effort and time limit, with tool permission
 prompts bypassed. `archon`, `aether` and `claude` use the same model.
@@ -230,8 +230,8 @@ built from this checkout, first on `PATH`. Then run:
 archon-bench verify
 archon-bench run --dry-run
 archon-bench run --trials 3 --parallel 3 --effort high \
-  --model claude-code/claude-opus-5-5 \
-  --price gpt-5.6-sol=4,0.4,20 \
+  --model claude-code/claude-haiku-5-5 \
+  --arms archon,aether \
   --aether-socket ~/.local/share/archon-live/aether.sock \
   --max-usd 37
 archon-bench report bench/results/<stamp>
@@ -242,13 +242,22 @@ archon-bench report bench/results/<stamp>
 
 ## Quality smoke gate
 
+**Baseline pending:** the first Haiku attempt completed only three of eight
+cells after a diagnostic isolation error exhausted the budget. No measured
+`baseline.json` is committed; the default gate fails until a complete reviewed
+run establishes one. See [the evidence and incident account](results-smoke/README.md).
+The harness, adversarial checks and dry-run preset are ready.
+
 Run this before merging changes to routing, prompts or review. It fixes the
 suite to `fix-off-by-one`, `quality-ledger-transfer`, `quality-retry-budget`
-and `quality-safe-extract`, with `archon` and single-agent `aether`, one trial
-per cell, serial execution and a default **$7 admission limit**. The three
-new tasks require care beyond the visible examples: a naive transfer can
-mutate before detecting overflow, a path-prefix check can follow symlinks,
-and a retry calculation can clip a server delay or retry at the deadline.
+and `review-seeded-bug`, with `archon` and single-agent `aether`, one trial
+per cell, serial execution, `claude-code/claude-haiku-5-5` at high effort
+and a default **$7 admission limit**. The three
+quality checks require care beyond the visible examples: a naive transfer can
+mutate before detecting overflow, a retry calculation can clip a server delay
+or retry at the deadline, and a security review must identify a token forgery.
+`quality-safe-extract` stays in the full suite; its strict review cost makes it
+less suitable for the cheap smoke preset.
 
 ```sh
 cargo build -p archon -p archon-bench --locked
@@ -259,7 +268,10 @@ ARCHON_SOCKET=<private-sandbox>/run/archond.sock archon-bench smoke \
   --aether-socket <private-sandbox>/run/aetherd.sock
 ```
 
-Both sockets must be under `$XDG_DATA_HOME/archon-bench` (normally
+All four `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR`, `AETHER_CONFIG_DIR` and
+`AETHER_DATA_DIR` must also be set to existing private directories. Retain this
+entire environment for every diagnostic: ordinary Archon CLI commands can
+autostart a daemon, even a queue read. Prefer saved captures. Both sockets must be under `$XDG_DATA_HOME/archon-bench` (normally
 `~/.local/share/archon-bench`), with real parent directories. The sandbox
 Aether daemon needs the same `ARCHON_SOCKET`, its own configuration and data,
 and the benchmark's `archon` MCP registration; its `PATH` must find this
@@ -269,10 +281,12 @@ setup and the measured first run are in
 
 The command prints pass rate, cost and wall time per arm and task, writes the
 usual JSON/Markdown/HTML reports plus `gate.json`, and exits nonzero if Archon
-loses passes against [`baseline.json`](results-smoke/baseline.json). Missing,
+loses passes against a measured `results-smoke/baseline.json`. Missing,
 duplicate, unpriced, timed-out or infrastructure-error trials cannot pass.
 The model, effort, task set, trial count and time limits must match the stored
-baseline. Aether's accuracy is reported as the comparison arm; Archon's rate
+baseline. Luna is selectable with `--model codex/gpt-6-luna --baseline <luna.json>`;
+that file must point to a separately measured Luna baseline. Do not compare
+a different model against Haiku's threshold. Aether's accuracy is reported as the comparison arm; Archon's rate
 is the quality gate. The command never updates the baseline automatically.
 
 `--max-usd` stops admission once completed spend reaches the limit and also
@@ -299,10 +313,10 @@ fixture.
 
 Reports now include disjoint **whole-trial** pipeline and review-level
 buckets for Archon, including pass rate, cost and wall time. A trial with
-multiple pipelines or levels appears in one `mixed(...)` bucket, so its cost
+multiple pipelines or levels appears in one `mixed: ...` bucket, so its cost
 and verdict are never attributed separately to every work item. These are
 observational associations, not measurements of review's causal effect.
-Missing capture is `unknown`; an empty captured queue is `no queue work`.
+Missing capture is `unknown (no capture)`; an empty captured queue is `no work (empty queue)`.
 Missing review policy is unknown, never inferred as `none`. Older results
 can recover metadata from their `archon-items.json` captures when available.
 
@@ -311,10 +325,11 @@ CSV after adding a snapshot:
 
 ```sh
 python3 bench/history.py bench/results-v1 bench/results-v2 bench/results-v3 \
-  bench/results-smoke --output bench/results-smoke/history.svg
+  --output bench/results-smoke/history.svg
 ```
 
 ![Pass rate, cost and wall over published snapshots](results-smoke/history.svg)
 
-The smoke suite has a different task mix; its first run starts a new baseline.
+The current history excludes the incomplete smoke attempt. A completed smoke
+will use Haiku and a different task mix, starting a separate quality baseline.
 The historical plot shows observed means, not an apples-to-apples speedup.

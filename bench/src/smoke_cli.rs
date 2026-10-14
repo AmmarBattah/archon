@@ -10,7 +10,7 @@ use super::RunArgs;
 
 #[derive(Debug, Args)]
 pub struct SmokeArgs {
-    #[arg(long, default_value = "claude-code/claude-opus-5-5")]
+    #[arg(long, default_value = "claude-code/claude-haiku-5-5")]
     model: ModelRef,
     #[arg(long, default_value = "high")]
     effort: Effort,
@@ -34,6 +34,10 @@ pub struct SmokeArgs {
 }
 
 pub async fn run(tasks_root: &Path, args: SmokeArgs) -> anyhow::Result<()> {
+    if args.dry_run {
+        super::run(tasks_root, into_run_args(args)).await?;
+        return Ok(());
+    }
     let baseline = smoke::Baseline::load(&args.baseline)?;
     if let Some(dir) = &args.check_results {
         super::render(dir, false)?;
@@ -68,7 +72,37 @@ fn validate_sockets(aether: Option<&Path>) -> anyhow::Result<()> {
         .context("work directory lacks a parent")?
         .canonicalize()
         .context("create the archon-bench sandbox directory first")?;
-    validate_socket_paths(aether, &archon, &sandbox)
+    validate_socket_paths(aether, &archon, &sandbox)?;
+    for name in [
+        "ARCHON_CONFIG_DIR",
+        "ARCHON_DATA_DIR",
+        "AETHER_CONFIG_DIR",
+        "AETHER_DATA_DIR",
+    ] {
+        let path = std::env::var_os(name).map(PathBuf::from);
+        validate_private_directory(name, path.as_deref(), &sandbox)?;
+    }
+    Ok(())
+}
+
+fn validate_private_directory(
+    name: &str,
+    path: Option<&Path>,
+    sandbox: &Path,
+) -> anyhow::Result<()> {
+    let path =
+        path.with_context(|| format!("smoke needs {name} set to a private sandbox directory"))?;
+    ensure!(path.is_absolute(), "{name} must be absolute");
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("resolving {name}"))?;
+    ensure!(resolved.is_dir(), "{name} must name a directory");
+    ensure!(
+        resolved.starts_with(sandbox) && resolved != sandbox,
+        "{name} must be below {}",
+        sandbox.display()
+    );
+    Ok(())
 }
 
 fn validate_socket_paths(aether: &Path, archon: &Path, sandbox: &Path) -> anyhow::Result<()> {
@@ -134,8 +168,44 @@ mod tests {
         assert_eq!(run.arms, [Arm::Archon, Arm::Aether]);
         assert_eq!((run.trials, run.parallel, run.max_trials), (1, 1, 8));
         assert_eq!(run.max_usd, 7.0);
+        assert_eq!(run.model.to_string(), "claude-code/claude-haiku-5-5");
         assert!(
             crate::Cli::try_parse_from(["archon-bench", "smoke", "--only", "fix-off-by-one"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn luna_can_be_selected_with_its_own_baseline() {
+        let cli = crate::Cli::parse_from([
+            "archon-bench",
+            "smoke",
+            "--model",
+            "codex/gpt-6-luna",
+            "--baseline",
+            "luna.json",
+            "--dry-run",
+        ]);
+        let crate::BenchCommand::Smoke(args) = cli.command else {
+            panic!("parsed another command");
+        };
+        assert_eq!(args.baseline, Path::new("luna.json"));
+        assert_eq!(into_run_args(*args).model.to_string(), "codex/gpt-6-luna");
+    }
+
+    #[test]
+    fn all_sandbox_directories_are_required_and_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let private = root.join("private");
+        std::fs::create_dir(&private).unwrap();
+        assert!(validate_private_directory("ARCHON_DATA_DIR", Some(&private), &root).is_ok());
+        assert!(validate_private_directory("ARCHON_DATA_DIR", None, &root).is_err());
+        assert!(validate_private_directory("ARCHON_DATA_DIR", Some(&root), &root).is_err());
+        assert!(validate_private_directory("ARCHON_DATA_DIR", root.parent(), &root).is_err());
+        std::os::unix::fs::symlink(root.parent().unwrap(), root.join("escape")).unwrap();
+        assert!(
+            validate_private_directory("ARCHON_DATA_DIR", Some(&root.join("escape")), &root)
                 .is_err()
         );
     }

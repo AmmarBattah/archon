@@ -36,7 +36,7 @@ async fn claude_arm_solves_and_is_graded_on_fix_off_by_one() {
     workspace::create_run_dir(&run_dir).unwrap();
     let layout = workspace::TrialLayout::for_trial(&run_dir, root.join("logs")).unwrap();
     workspace::prepare(&task, &layout).unwrap();
-    let model = ModelRef::new("claude-code", "claude-opus-5-5");
+    let model = ModelRef::new("claude-code", "claude-haiku-5-5");
     let settings = ArmSettings {
         claude_bin: "claude".into(),
         codex_bin: "codex".into(),
@@ -44,7 +44,7 @@ async fn claude_arm_solves_and_is_graded_on_fix_off_by_one() {
         aether_socket: None,
         archon_model: model.clone(),
         aether_model: model,
-        claude_model: "claude-opus-5-5".into(),
+        claude_model: "claude-haiku-5-5".into(),
         codex_model: String::new(),
         effort: Effort::Medium,
         prices: Vec::new(),
