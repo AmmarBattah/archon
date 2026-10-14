@@ -34,7 +34,7 @@ read again.
 3. **Integrate.** Wait for every worker, integrate the changes you accept
    into your run workspace and resolve conflicts yourself. While you edit,
    run the checks and tests the edit affects, and add regression coverage
-   where useful.
+   where useful. A blocking or deadlock test must fail in seconds, never hang.
 4. **Commit** the settled change on `{{branch}}` under the repository's own
    commit rules (its contributing guide, commit lint, recent history). Where
    it states none: Conventional Commits, a lowercase imperative subject, the
@@ -48,8 +48,9 @@ read again.
    shares your workspace and only reads. Several work alone, on different
    models where the policy allows, and never see each other's findings. While
    they read, run the project's build, lint/format and full test suite once,
-   and edit nothing until all are back. With no reviewer asked for, that run
-   is the whole of this step. Hand a reviewer this and nothing more:
+   and follow your contract's `wait_for` early-fix rule. With no reviewer
+   asked for, that run is the whole of this step. Hand a reviewer this and
+   nothing more:
    - the acceptance criteria, in the few lines that settle what done means;
    - the exact base and head commits (`git merge-base {{base_branch}} HEAD`
      and `git rev-parse HEAD`; for a change stacked on another item's
@@ -64,6 +65,7 @@ read again.
    or an invariant is at stake or the brief asks for depth. Require the
    verdict your contract shows, on the head it read, with actionable
    findings (path, issue, impact, remedy).
+   Pass on your contract's bounds for reviewers.
    Correctness, security and missing essential coverage block; style advice
    does not. Prefer a model other than your own where the policy in your
    contract allows one; otherwise use your own and say so in the summary. Do
@@ -75,9 +77,10 @@ read again.
    committed. Leave advisory and style findings open and list them.
    A second look is owed after a failed verdict and for any commit after a
    pass: Archon delivers only commits a passing reviewer read, so batch
-   fixes. A reviewer that finished cannot look again: delegate a NEW one
-   with the previous verdict, the reviewed commit and the new one, each
-   finding beside its fix, and the regression evidence. It reads that delta
+   fixes. Delegate the missing passes as your contract defines, each a NEW
+   agent. A delta reviewer gets the previous verdict, the reviewed commit and
+   the new one, each finding beside its fix, and the regression evidence. It
+   reads that delta
    (`base` the reviewed commit) and the callers it affects, and widens only
    by naming the assumption the delta broke. If the operator adds scope
    while a review runs, let it finish, keep its verdict for the commit it

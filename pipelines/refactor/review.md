@@ -31,6 +31,7 @@ Treat these reports as claims to check against the code and evidence.
   Compare structure with the original baseline referenced above.
 - Read-only: do not edit files, commit, push or switch branches. Running
   the repository's own checks is fine; discover them from its guidance.
+  Follow your contract's command and reporting bounds.
 
 ## How to review
 

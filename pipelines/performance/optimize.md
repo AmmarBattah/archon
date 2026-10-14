@@ -37,7 +37,8 @@ rules and target; never weaken them to make a disappointing result pass.
 3. Add or update focused tests where needed to protect the behavior most at
    risk, including boundaries, failure paths and concurrency or memory
    ownership where relevant. Prefer a clear implementation; explain any
-   necessary complexity in terms of the measured gain.
+   necessary complexity in terms of the measured gain. A blocking or
+   deadlock test must fail in seconds, never hang.
 4. Rerun the benchmark using the measurement stage's exact method and compare
    repeated results to its baseline. Run relevant checks and tests. If the
    change misses the target, investigate and improve it within scope; do not
