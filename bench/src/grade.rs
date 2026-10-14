@@ -273,7 +273,10 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(repo.join("late.txt"), "committed late\n").unwrap();
+        std::fs::write(layout.answer_file(), "the final answer\n").unwrap();
         let late_layout = layout.late_grade().unwrap();
+        let answer = std::fs::read_to_string(late_layout.answer_file()).unwrap();
+        assert_eq!(answer, "the final answer\n", "graders read the same answer");
         let late = grade(&task, &late_layout, "archon", &ResultSource::Workspace)
             .await
             .unwrap();

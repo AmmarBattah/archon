@@ -86,8 +86,8 @@ impl TrialLayout {
         ))
     }
 
-    /// This trial for the extra grading of timed-out work: the same copy
-    /// and workspace, logs under [`TIMEOUT_LOG_DIR`] so none collide.
+    /// This trial for the extra grading of timed-out work: the same copy,
+    /// workspace and answer, logs under [`TIMEOUT_LOG_DIR`] so none collide.
     pub fn late_grade(&self) -> anyhow::Result<Self> {
         ensure!(
             self.logs.is_dir(),
@@ -96,7 +96,13 @@ impl TrialLayout {
         );
         let logs = self.logs.join(TIMEOUT_LOG_DIR);
         std::fs::create_dir_all(&logs).with_context(|| format!("creating {}", logs.display()))?;
-        Ok(Self::new(self.workspace.clone(), self.grade.clone(), logs))
+        let late = Self::new(self.workspace.clone(), self.grade.clone(), logs);
+        let answer = self.answer_file();
+        if answer.exists() {
+            std::fs::copy(&answer, late.answer_file())
+                .with_context(|| format!("copying {}", answer.display()))?;
+        }
+        Ok(late)
     }
 
     pub fn repo(&self, fixture: &Fixture) -> PathBuf {
