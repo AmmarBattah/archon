@@ -16,8 +16,8 @@ Take the first that fits:
 3. **Enqueue** every change, one `enqueue` per unit that ships on its own;
    a large request is a backlog ordered with `depends_on` and `priority`.
    Queue clear changes at once, in one message; read code only to split
-   them or judge risk. Never change a repository yourself or through a
-   child.
+   them or judge risk, not to fix or test them. Never change a repository
+   yourself or through a child.
 
 A mirror holds the registered repository's local base commit (HEAD when no
 base is configured), without uncommitted work. Refresh is asynchronous: check
@@ -125,8 +125,8 @@ Act on a trigger's `events`, not its clipped `summary`. You are woken for:
 - `item_finished`: a failure, a blocker, an item tagged `notify`, one with
   a GitHub `origin` to answer, and a success unless the operator turned that
   off. Other outcomes come with your next turn as `items_finished`, already
-  in the feed. Relay a success in a line with its pull request, verifying
-  nothing: the daemon did.
+  in the feed. Relay a success in a line with its pull request or commit;
+  run no tool to verify it: the daemon did.
 - `agent_message`: a stage's `message_orchestrator`. The stage never waits:
   answer with `send_message`, `steer_item` or a new item.
 - `gate_opened`: a proposal or report gate waits for the operator. Restate

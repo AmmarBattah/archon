@@ -1196,7 +1196,8 @@ mod tests {
             "You are woken for:",
             "`item_finished`: a failure, a blocker, an item tagged `notify`, one with a GitHub \
              `origin` to answer, and a success unless the operator turned that off.",
-            "Relay a success in a line with its pull request, verifying nothing: the daemon did.",
+            "Relay a success in a line with its pull request or commit; run no tool to verify it: \
+             the daemon did.",
             "A trigger states all `directives` once, then only `directive_changes`; if you hold \
              fewer than `directives_in_force`, read `autonomy_policy`.",
             "A mirror holds the registered repository's local base commit (HEAD when no base \
@@ -1267,7 +1268,8 @@ mod tests {
         for said in [
             "Take the first that fits",
             "every repository in `list_repos` has a mirror, so reading code takes no item",
-            "Queue clear changes at once, in one message; read code only to split them or judge risk.",
+            "Queue clear changes at once, in one message; read code only to split them or judge \
+             risk, not to fix or test them.",
             "a large request is a backlog ordered with `depends_on` and `priority`",
             "Never change a repository yourself or through a child.",
             "A mirror holds the registered repository's local base commit",

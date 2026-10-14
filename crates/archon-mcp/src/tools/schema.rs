@@ -404,7 +404,7 @@ fn enqueue() -> ToolDefinition {
                 "repo": repo_ref("Left out only for a pipeline with requires_repo = false (`ask`)."),
                 "pipeline": {"type": "string", "description": "Default: `direct` if `autonomy.review` is set, else the repository's, else `direct`."},
                 "title": {"type": "string", "description": "One line; it also names the branch."},
-                "brief": {"type": "string", "description": "All the stage agents get besides the repository: goal, context, constraints, acceptance criteria."},
+                "brief": {"type": "string", "description": "All the stage agents get besides the repository: the request's own words for this unit, then goal, context, constraints, acceptance criteria."},
                 "priority": priority(),
                 "depends_on": string_list("Items (`qi_…`) that must succeed first, else this one is blocked. Its agents are told their branches and pull requests."),
                 "tags": string_list(&format!("Labels for list_queue. `{NOTIFY_TAG}` wakes you when the item succeeds too.")),
