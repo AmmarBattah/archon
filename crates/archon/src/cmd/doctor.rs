@@ -395,6 +395,15 @@ fn check_host_context(
     welcome: Option<&Welcome>,
 ) -> Check {
     use archon_core::config::HostContext;
+    let effective = welcome.map(|w| w.effective_host_context(requested));
+    assert!(
+        requested != HostContext::Full || effective.is_none_or(|value| value.is_full()),
+        "full is never promoted to lean"
+    );
+    assert!(
+        welcome.is_none_or(|value| value.protocol_version > 0),
+        "a connected daemon negotiated a protocol"
+    );
     if requested == HostContext::Full {
         return check(
             "host context",
@@ -403,7 +412,7 @@ fn check_host_context(
         );
     }
     match welcome {
-        Some(welcome) if welcome.supports_host_context() => check(
+        Some(_) if effective == Some(HostContext::Lean) => check(
             "host context",
             Level::Ok,
             "configured lean; effective lean for new agents (Codex ignores it)",
@@ -412,7 +421,7 @@ fn check_host_context(
             "host context",
             Level::Warn,
             format!(
-                "configured lean; effective full: Aether version {} lacks host_context; update aether and restart aetherd",
+                "configured lean; effective full: Aether version {} lacks host_context; pending lean creations fall back to full; existing agents keep their context",
                 welcome.daemon_version,
             ),
         ),

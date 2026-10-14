@@ -68,10 +68,15 @@ Restart the orchestrator to change its context. There is no per-stage override.
 
 Archon sends lean only when Aether advertises the `host_context` feature;
 protocol 17 alone does not imply support. An older Aether gets full context,
-with one warning in the daemon log and a warning in `archon doctor`. Doctor
-shows configured and effective context for new agents. Stage records retain
-the effective policy, and `model-evidence` groups lean and full separately.
-Full stays the default pending a quality benchmark.
+with a daemon log warning and a warning in `archon doctor`. Pending lean
+requests fall back to full if support disappears, with one warning per
+changed stage or node. If Aether already accepted the lean request and
+rejects its changed replay, Archon fails the stage visibly or advances the
+run node to a new generation. Existing agents keep their original context.
+Doctor shows configured and effective context for new agents. Stage records
+retain the effective policy, and `model-evidence` groups lean and full
+separately for Claude Code; Codex stages record full. Full stays the default
+pending a quality benchmark.
 
 A relative path in the config, such as `[worktrees] root`, is relative to
 the directory holding `config.toml`, and `~/` expands to your home

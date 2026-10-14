@@ -27,12 +27,15 @@ async fn only_advertised_lean_context_is_sent_on_every_create() {
         );
         let client = connect(&fake).await;
         assert_eq!(client.welcome().protocol_version, 17);
-        assert_eq!(client.welcome().supports_host_context(), advertised);
+        assert_eq!(
+            client.welcome().effective_host_context(HostContext::Lean) == HostContext::Lean,
+            advertised
+        );
         for parent in [
             None,
             Some(archon_core::aether_ids::AetherAgentId::parse(AGENT).unwrap()),
         ] {
-            let created = client
+            let result = client
                 .create_agent(CreateAgent {
                     role: "archon-test".into(),
                     parent,
@@ -42,12 +45,16 @@ async fn only_advertised_lean_context_is_sent_on_every_create() {
                     }),
                     ..Default::default()
                 })
-                .await
-                .unwrap();
-            assert_eq!(created.id.as_str(), AGENT);
+                .await;
+            if !advertised && requested == HostContext::Lean {
+                assert!(matches!(result, Err(archon_core::ArchonError::Invalid(_))));
+                continue;
+            }
+            assert_eq!(result.unwrap().id.as_str(), AGENT);
         }
         let creates = fake.received_named("create_agent");
-        assert_eq!(creates.len(), 2);
+        let refused = !advertised && requested == HostContext::Lean;
+        assert_eq!(creates.len(), if refused { 0 } else { 2 });
         for create in creates {
             assert_eq!(create["config"]["host_context"].as_str(), expected);
             assert_eq!(
@@ -95,7 +102,7 @@ fn stored_stage_and_node_requests_state_their_own_context() {
 }
 
 #[tokio::test]
-async fn frozen_lean_creation_waits_if_a_later_daemon_lacks_the_feature() {
+async fn backend_requires_callers_to_refreeze_unsupported_lean_requests() {
     use archon_aether::{AetherBackend, AetherLink};
     use archon_core::ports::AgentBackend;
     use std::sync::Arc;
@@ -126,4 +133,13 @@ async fn frozen_lean_creation_waits_if_a_later_daemon_lacks_the_feature() {
         backend.host_context(HostContext::Lean).await.unwrap(),
         HostContext::Full
     );
+}
+
+#[test]
+fn agents_accept_unknown_host_context_values() {
+    let mut raw = fake::agent(AGENT, Some(TASK));
+    raw["config"]["host_context"] = json!("future-context");
+    let agent: archon_aether::wire::Agent = serde_json::from_value(raw).unwrap();
+    assert_eq!(agent.id.as_str(), AGENT);
+    assert_eq!(agent.config.host_context.as_deref(), Some("future-context"));
 }

@@ -109,6 +109,12 @@ pub(crate) fn prune_retired_keys(store: &mut Store) -> Result<usize, ArchonError
             pruned += 1;
         }
     }
+    for prefix in ["host_context:", "agent_host_context:"] {
+        for (key, _) in store.kv_prefix(prefix)? {
+            store.kv_delete(&key)?;
+            pruned += 1;
+        }
+    }
     Ok(pruned)
 }
 

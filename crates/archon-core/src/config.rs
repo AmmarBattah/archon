@@ -139,6 +139,16 @@ pub enum HostContext {
 }
 
 impl HostContext {
+    pub fn for_model(self, model: &crate::model::ModelRef) -> Self {
+        assert!(!model.provider.is_empty(), "a model names its engine");
+        assert!(!model.model.is_empty(), "a model names its variant");
+        if model.provider == "claude-code" {
+            self
+        } else {
+            Self::Full
+        }
+    }
+
     pub fn is_full(&self) -> bool {
         *self == Self::Full
     }

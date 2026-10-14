@@ -897,6 +897,8 @@ Restart `archond` to reload the config, then use `archon orchestrator restart`
 for a new orchestrator; already created agents and resumed fix attempts keep
 their original context. Run `archon doctor` to see the requested and effective
 policy. If Aether does not advertise support, Archon creates agents with full
-context and warns once in its log. Stage records and `archon model-evidence`
-retain the effective policy for comparing cost and outcomes. See the
+context and logs a warning. Pending lean requests also fall back to full
+if support disappears, with one warning per changed stage or node. Stage
+records and `archon model-evidence` retain the effective policy for comparing
+cost and outcomes; Codex stages always record full. See the
 [configuration reference](configuration.md) for the full contract.

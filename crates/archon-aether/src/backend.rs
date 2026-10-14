@@ -43,7 +43,18 @@ fn require_host_context(
     client: &AetherClient,
     stored: archon_core::config::HostContext,
 ) -> Result<(), ArchonError> {
-    if stored != client.welcome().effective_host_context(stored) {
+    let welcome = client.welcome();
+    assert!(welcome.protocol_version >= crate::wire::MIN_PROTOCOL_VERSION);
+    assert!(
+        !welcome.instance_id.is_empty(),
+        "the client has an Aether store identity"
+    );
+    let effective = welcome.effective_host_context(stored);
+    assert!(
+        effective.is_full() || effective == stored,
+        "negotiation only downgrades"
+    );
+    if stored != effective {
         return Err(ArchonError::Unavailable(
             "Aether version lacks host_context required by the frozen lean creation request".into(),
         ));
@@ -315,11 +326,13 @@ impl AgentBackend for AetherBackend {
         if requested.is_full() {
             return Ok(requested);
         }
-        Ok(self
-            .link
-            .client()?
-            .welcome()
-            .effective_host_context(requested))
+        let client = self.link.client()?;
+        assert!(client.welcome().protocol_version >= crate::wire::MIN_PROTOCOL_VERSION);
+        assert!(
+            !client.welcome().instance_id.is_empty(),
+            "the client has an Aether store identity"
+        );
+        Ok(client.welcome().effective_host_context(requested))
     }
 
     async fn prepare_spawn(

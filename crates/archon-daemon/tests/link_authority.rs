@@ -475,12 +475,15 @@ async fn orchestrator_negotiates_and_records_host_context() {
             creates[0]["config"]["host_context"].as_str(),
             (!effective.is_full()).then_some("lean")
         );
-        assert_eq!(
+        assert!(
             harness
                 .kv(&format!("agent_host_context:{id}"))
                 .await
-                .as_deref(),
-            Some(effective.as_str())
+                .is_none()
+        );
+        assert_eq!(
+            harness.kv("orchestrator_host_context").await,
+            (!effective.is_full()).then(|| "\"lean\"".into())
         );
     }
 }

@@ -9,6 +9,9 @@
 //! caller sends that stored request. The request stays with the node so
 //! no stage agent bound to it states a wider network.
 //!
+//! Pending lean requests may fall back to full; if Aether rejects the changed
+//! replay, creation advances to a new generation with a new key.
+//!
 //! Every node agent Archon learns of is indexed, retired ones included, so
 //! the fleet pump can tell a node's own events from a stage agent's. The
 //! index becomes a routing tombstone after retirement and retention, so
@@ -314,7 +317,7 @@ pub(super) async fn ensure(
     match create_generation(ctx, run, &refused, model, network).await? {
         Created::Agent(node) => Ok(node),
         Created::Refused { generation, error } => {
-            // Nothing of ours exists under a refused key: leave none pending.
+            // Retire the refused generation so later attempts use a fresh key.
             skip_generation(ctx, run, generation).await?;
             Err(error)
         }
@@ -352,7 +355,7 @@ async fn create_generation(
 ) -> Result<Created, ArchonError> {
     let host_context = ctx
         .backend
-        .host_context(ctx.config.aether.host_context)
+        .host_context(ctx.config.aether.host_context.for_model(model))
         .await?;
     let claim = {
         let mut store = ctx.store.lock().await;
@@ -366,6 +369,7 @@ async fn create_generation(
         } => (generation, request),
     };
     assert_eq!(request.idempotency_key, idempotency_key(run, generation));
+    let request = prepare_replay(ctx, run, generation, request).await?;
     let network = request.network;
     match ctx.backend.create_run_node(request).await {
         Ok(created) => {
@@ -380,6 +384,44 @@ async fn create_generation(
         }
         Err(error) => Err(error),
     }
+}
+
+async fn prepare_replay(
+    ctx: &DaemonContext,
+    run: &PipelineRunId,
+    generation: u32,
+    mut request: RunNodeRequest,
+) -> Result<RunNodeRequest, ArchonError> {
+    assert_eq!(request.idempotency_key, idempotency_key(run, generation));
+    let effective = ctx
+        .backend
+        .host_context(request.host_context.for_model(&request.model))
+        .await?;
+    if effective == request.host_context {
+        return Ok(request);
+    }
+    assert!(effective.is_full(), "a frozen request can only downgrade");
+    let mut store = ctx.store.lock().await;
+    let mut current = load_node(&store, run)?;
+    if current.generation != generation || current.agent.is_some() {
+        return Ok(request);
+    }
+    let stored = current
+        .request
+        .as_ref()
+        .expect("pending replay has a request");
+    if stored.host_context == effective {
+        return Ok(stored.clone());
+    }
+    assert_eq!(
+        stored, &request,
+        "only host context can change during replay"
+    );
+    request.host_context = effective;
+    current.request = Some(request.clone());
+    save_node(&mut store, run, &current)?;
+    tracing::warn!(%run, generation, "lean host context unavailable for this engine or Aether; frozen node request falls back to full");
+    Ok(request)
 }
 
 /// The request stored for the current generation, or a new generation's,
@@ -643,13 +685,18 @@ async fn find_agent(
         (None, Some(request)) => request,
         (None, None) => return Ok(Found::Nothing),
     };
+    let request = prepare_replay(ctx, run, node.generation, request).await?;
     let key = request.idempotency_key.clone();
     match ctx.backend.create_run_node(request).await {
         Ok(created) => {
             index_node_agent(&mut *ctx.store.lock().await, run, &created.agent)?;
             Ok(Found::Agent(created.agent))
         }
-        Err(ArchonError::Invalid(why) | ArchonError::NotFound(why)) => {
+        Err(ArchonError::Invalid(why)) => {
+            tracing::warn!(%run, key, %why, "Aether refused the pending node replay; abandoning its key");
+            Ok(Found::Nothing)
+        }
+        Err(ArchonError::NotFound(why)) => {
             tracing::debug!(%run, key, %why, "no run node exists under the pending key");
             Ok(Found::Nothing)
         }

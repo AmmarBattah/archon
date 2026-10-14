@@ -15,8 +15,8 @@ use archon_core::aether_ids::{AetherAgentId, AetherRunId, AetherTaskId};
 use archon_core::model::Effort;
 use serde_json::{Value, json};
 
-/// Aether's protocol 17 schema (operator logins). Both vendored schemas are
-/// Aether's but for issue numbers, which are cut from their descriptions.
+/// v17 + host_context feature (operator logins and opt-in host context).
+/// Vendored schemas omit issue numbers from Aether's descriptions.
 const SCHEMA: &str = include_str!("fixtures/aether-protocol-v17.schema.json");
 const SCHEMA_V15: &str = include_str!("fixtures/aether-protocol-v15.schema.json");
 

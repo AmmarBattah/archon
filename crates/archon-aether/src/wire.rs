@@ -168,17 +168,15 @@ pub struct Welcome {
 }
 
 impl Welcome {
-    pub fn supports_host_context(&self) -> bool {
-        self.features
-            .iter()
-            .any(|feature| feature == HOST_CONTEXT_FEATURE)
-    }
-
     pub fn effective_host_context(
         &self,
         requested: archon_core::config::HostContext,
     ) -> archon_core::config::HostContext {
-        if self.supports_host_context() {
+        if self
+            .features
+            .iter()
+            .any(|feature| feature == HOST_CONTEXT_FEATURE)
+        {
             requested
         } else {
             archon_core::config::HostContext::Full
@@ -419,7 +417,7 @@ pub struct AgentScope {
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct AgentSettings {
     #[serde(default)]
-    pub host_context: archon_core::config::HostContext,
+    pub host_context: Option<String>,
     #[serde(default)]
     pub instructions: Option<String>,
     #[serde(default)]

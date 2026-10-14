@@ -117,6 +117,9 @@ Everything below was checked against Aether's source (`aether-protocol`,
 `aether-core`, `clients/protocol.schema.json`, protocol version **15**; the
 daemon also serves 14).
 
+The lean creation extension is checked against **v17 + host_context feature**;
+protocol 17 alone does not imply support.
+
 ### 4.1 Transport and framing
 
 - Unix socket: `$AETHER_SOCKET`, else `$XDG_RUNTIME_DIR/aether/aetherd.sock`,

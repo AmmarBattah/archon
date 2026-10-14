@@ -129,11 +129,14 @@ async fn link_loop(ctx: Arc<DaemonContext>, endpoint: Endpoint) -> Result<(), Ar
             Ok(client) => {
                 let client = Arc::new(client);
                 if ctx.config.aether.host_context == archon_core::config::HostContext::Lean
-                    && !client.welcome().supports_host_context()
+                    && client
+                        .welcome()
+                        .effective_host_context(ctx.config.aether.host_context)
+                        .is_full()
                     && !host_context_warned
                 {
                     tracing::warn!(
-                        "Aether version lacks host_context; configured lean uses full host context"
+                        "Aether lacks host_context; new and pending lean creations fall back to full; existing agents keep their context"
                     );
                     host_context_warned = true;
                 }

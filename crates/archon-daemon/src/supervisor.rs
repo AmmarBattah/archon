@@ -68,6 +68,7 @@ const STOP_POLL: Duration = Duration::from_millis(200);
 const RESTARTS_KEY: &str = "orchestrator_restarts";
 const BLOCKER_KEY: &str = "orchestrator_blocker";
 const STORE_ID_KEY: &str = "store_id";
+const HOST_CONTEXT_KEY: &str = "orchestrator_host_context";
 
 /// Orchestrator lifecycle state that must not live in `kv`: the locks for its
 /// creation and for ordering its replacement with its calls, a channel
@@ -237,7 +238,10 @@ pub fn orchestrator_create_agent(
         }),
         parent: None,
         config: Some(AgentConfig {
-            host_context: config.aether.host_context,
+            host_context: config
+                .aether
+                .host_context
+                .for_model(&config.orchestrator.model),
             instructions: Some(instructions),
             effort: Some(config.orchestrator.effort),
             cost_budget: None,
@@ -824,6 +828,7 @@ async fn replace_generation(
         let generation = parse_generation(store.kv_get(keys::ORCHESTRATOR_GENERATION)?)?;
         store.kv_set(keys::ORCHESTRATOR_GENERATION, &(generation + 1).to_string())?;
         store.kv_delete(keys::ORCHESTRATOR_AGENT)?;
+        store.kv_delete(HOST_CONTEXT_KEY)?;
     }
     create_generation(ctx, client).await
 }
@@ -884,35 +889,28 @@ async fn create_orchestrator(
 ) -> Result<archon_aether::wire::Agent, ArchonError> {
     assert_eq!(request.role, ORCHESTRATOR_ROLE);
     assert!(request.parent.is_none() && request.start);
-    let key = format!(
-        "host_context:{}",
-        request.idempotency_key.as_ref().expect("keyed generation")
-    );
     let config = request.config.as_mut().expect("orchestrator config");
-    config.host_context = {
-        let mut store = ctx.store.lock().await;
-        match store.kv_get(&key)? {
-            Some(raw) => serde_json::from_str(&raw)
-                .map_err(|error| ArchonError::Store(format!("kv {key}: {error}")))?,
-            None => {
-                let effective = client.welcome().effective_host_context(config.host_context);
-                store.kv_set(&key, &serde_json::to_string(&effective)?)?;
-                effective
-            }
-        }
+    let mut store = ctx.store.lock().await;
+    let requested = match store.kv_get(HOST_CONTEXT_KEY)? {
+        Some(raw) => serde_json::from_str(&raw)
+            .map_err(|error| ArchonError::Store(format!("kv {HOST_CONTEXT_KEY}: {error}")))?,
+        None => config.host_context,
     };
-    if config.host_context != client.welcome().effective_host_context(config.host_context) {
-        return Err(ArchonError::Unavailable(
-            "Aether version lacks host_context required by the frozen lean orchestrator request"
-                .into(),
-        ));
+    config.host_context = client.welcome().effective_host_context(requested);
+    if config.host_context.is_full() {
+        store.kv_delete(HOST_CONTEXT_KEY)?;
+    } else {
+        store.kv_set(
+            HOST_CONTEXT_KEY,
+            &serde_json::to_string(&config.host_context)?,
+        )?;
     }
+    if requested != config.host_context {
+        tracing::warn!("Aether lacks host_context; orchestrator creation falls back to full");
+    }
+    drop(store);
     let agent = client.create_agent(request).await?;
     callers::record_delegation(ctx, &agent).await?;
-    ctx.store.lock().await.kv_set(
-        &format!("agent_host_context:{}", agent.id),
-        agent.config.host_context.as_str(),
-    )?;
     Ok(agent)
 }
 
