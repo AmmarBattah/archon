@@ -588,13 +588,15 @@ fn adaptive_prices_what_it_delegates_and_records_what_ships() {
         "no `Co-Authored-By` or \"Generated with\" line",
         "Delegate the reviewers your contract asks for on the committed change with `wait: false`",
         "never see each other's findings",
-        "full test suite once, and edit nothing until all are back",
+        "full test suite once, and follow your contract's `wait_for` early-fix rule",
         "With no reviewer asked for, that run is the whole of this step",
         "the exact base and head commits (`git merge-base {{base_branch}} HEAD`",
         "medium for ordinary risk, high where security or an invariant is at stake",
         "never because a tree that passed was committed",
         "for any commit after a pass: Archon delivers only commits a passing reviewer read",
         "It reads that delta (`base` the reviewed commit) and the callers it affects",
+        "Delegate only the missing passes as your contract defines",
+        "Pass on your contract's bounds for reviewers",
         "Use leaf workers unless a bounded subproblem benefits from another level allowed by the contract",
         "Continue while fixes make progress within the item's time and spending limits; \
          escalate repeated findings or a stalled approach with evidence",
@@ -606,6 +608,7 @@ fn adaptive_prices_what_it_delegates_and_records_what_ships() {
         assert!(build.contains(said), "build.md lacks {said:?}");
     }
     assert!(!build.contains("Open findings"), "only blocking ones fail");
+    assert!(!build.contains("edit nothing until all are back"));
     assert!(
         !build.contains("Each worker is a leaf"),
         "another level may pay"
@@ -633,6 +636,58 @@ fn direct_escalates_on_risk_not_size() {
         prompt.contains("the verdict your contract shows"),
         "{prompt}"
     );
+}
+
+#[test]
+fn implementation_tests_of_blocking_fail_in_seconds() {
+    let catalog = Catalog::builtin();
+    for (pipeline, prompt) in [
+        ("direct", "implement.md"),
+        ("adaptive", "build.md"),
+        ("refactor", "refactor.md"),
+        ("performance", "optimize.md"),
+    ] {
+        let spec = catalog.get(pipeline).unwrap();
+        let text = spec.prompts[prompt]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("A blocking or deadlock test must fail in seconds, never hang."),
+            "{pipeline}"
+        );
+        assert!(
+            !text.contains("daemon threads"),
+            "{pipeline}: not every language has them"
+        );
+    }
+}
+
+#[test]
+fn built_in_reviewers_apply_the_contracts_command_bounds() {
+    let catalog = Catalog::builtin();
+    for (pipeline, prompt) in [
+        ("refactor", "review.md"),
+        ("performance", "review.md"),
+        ("design-doc", "critique.md"),
+    ] {
+        let spec = catalog.get(pipeline).unwrap();
+        let stage = spec
+            .file
+            .stages
+            .iter()
+            .find(|stage| stage.prompt == prompt)
+            .unwrap();
+        assert_eq!(stage.kind, archon_core::catalog::StageKind::Review);
+        let text = spec.prompts[prompt]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("your contract's command and reporting bounds"),
+            "{pipeline}"
+        );
+    }
 }
 
 /// A declared review is a claim Archon enforces at one agent's result, so

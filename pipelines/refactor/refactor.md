@@ -44,6 +44,7 @@ verification and design review follow; their failures return here.
    requires one, document the exact change, why it is necessary and how its
    assertions still check the same behaviour. Never weaken an assertion to
    hide a regression. Document evidence for every allowed contract change.
+   A blocking or deadlock test must fail in seconds, never hang.
 5. Review your diff against the baseline reference. Commit only scoped work
    on `{{branch}}` using the repository's identity and conventions, without
    attribution trailers. Leave a clean worktree and do not push.

@@ -4,6 +4,12 @@
 
 ### Fixes
 
+- Review rounds are faster without being weaker. Reviewers run each ad-hoc
+  experiment, such as a mutant, under a 30-second timeout, and a hang counts as
+  caught. On a blocking finding the agent cancels the reviewers still reading
+  and fixes it at once, and after a fix only the missing reviews run, on the
+  change since the last reviewed commit. Tests of blocking code must fail in
+  seconds instead of hanging.
 - A reviewer's verdict that marks an abbreviated commit with a trailing `...`
   or `…`, such as `"head": "5d240fa..."`, is now accepted. Before, a passing
   review written that way failed the stage. The id must still name a commit

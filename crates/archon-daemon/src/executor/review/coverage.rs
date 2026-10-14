@@ -528,6 +528,32 @@ mod tests {
         assert!(unread.contains("agt_d passed c5"), "{unread}");
     }
 
+    #[test]
+    fn an_early_fix_needs_only_the_missing_delta_passes() {
+        let fixed = [
+            read("agt_fail", false, "c3", None),
+            read("agt_pass", true, "c3", None),
+            read("agt_delta_a", true, "c4", Some("c3")),
+            read("agt_delta_b", true, "c4", Some("c3")),
+        ];
+        assert_eq!(count(&fixed, "c4", 3).unwrap(), [1, 2, 3]);
+        let missing = count(&fixed[..3], "c4", 3).unwrap_err();
+        assert!(missing.starts_with("2 of the reviewers named"), "{missing}");
+
+        let fail_anchored = [
+            read("agt_fail", false, "c3", None),
+            read("agt_delta_a", true, "c4", Some("c3")),
+            read("agt_delta_b", true, "c4", Some("c3")),
+            read("agt_delta_c", true, "c4", Some("c3")),
+        ];
+        assert_eq!(count(&fail_anchored, "c4", 3).unwrap(), [1, 2, 3]);
+        let unanchored = count(&fail_anchored[1..], "c4", 3).unwrap_err();
+        assert!(
+            unanchored.contains("no reviewer named read the change up to it"),
+            "{unanchored}"
+        );
+    }
+
     /// The lead amended a reviewed commit (`x3`, off the line) into `c4`.
     #[test]
     fn a_pass_of_an_amended_commit_is_superseded_and_never_counts() {
