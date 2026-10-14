@@ -93,13 +93,14 @@ prefixed_id!(ReportId, "rpt");
 prefixed_id!(DirectiveId, "dir");
 prefixed_id!(InitiativeId, "ini");
 prefixed_id!(LessonId, "lsn");
+prefixed_id!(FeedbackId, "fb");
 // One Archon store's identity. Keeps Archon's idempotency keys distinct
 // across stores, since a fresh store restarts its counters.
 prefixed_id!(StoreId, "store");
 
 /// Crockford base32, the alphabet of a ULID's 26 characters.
-const ULID_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const ULID_LEN: usize = 26;
+pub(crate) const ULID_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub(crate) const ULID_LEN: usize = 26;
 
 /// The start of a queue item id as an operator types it: `01k2`, `QI_01K2`
 /// or a whole id. Returns it as ids are stored, `qi_` and upper case.
