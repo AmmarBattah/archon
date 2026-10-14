@@ -7,12 +7,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use archon_core::Timestamp;
-use archon_core::aether_ids::{AetherAgentId, AetherRunId, AetherTaskId};
+use archon_core::aether_ids::{AetherAgentId, AetherMemoryId, AetherRunId, AetherTaskId};
 use archon_core::error::ArchonError;
 use archon_core::model::{Effort, ModelRef};
 use serde::{Deserialize, Serialize};
 
 use crate::github::WatcherConfig;
+use crate::memory::MemoryQuery;
 
 /// Archon asks for this first, and falls back to the newest protocol an
 /// older aetherd serves, down to [`MIN_PROTOCOL_VERSION`].
@@ -123,6 +124,17 @@ pub enum Command {
     ConfigureGithubWatcher {
         config: WatcherConfig,
         expected_revision: u64,
+    },
+    Memories {
+        query: MemoryQuery,
+    },
+    ForgetMemory {
+        id: AetherMemoryId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    RestoreMemory {
+        id: AetherMemoryId,
     },
 }
 
