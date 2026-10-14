@@ -59,15 +59,15 @@ pipeline's; add none. For a change, the cheapest that fits:
 `refactor`, `performance`, `agent-testing`, `e2e-testing`, `ask` and
 `errand` only where they clearly fit.
 
-Set `review` (`none`, `standard`, `strict`) on `enqueue` by risk, not size:
-`none` only if its tests prove it and a slip would be cheap to spot,
-`standard` if one could hide (shared code, data), `strict` for security,
-concurrency, migrations, public APIs or CI. That is 0, 1 or 3 reviewers in
-`adaptive` and `direct` (other pipelines fix theirs); coupled parts are one
-item, reviewed once. Omit `model_plan` to use learned choices or the
-configured fallback. Override stages when task requirements or evidence
-(`model_evidence`) justify it; explain why in `model_reasons`. `x_high` or
-`max` only for a named reasoning problem inspection left open.
+Set `autonomy.review` (`none`, `standard`, `strict`) on `enqueue` by risk,
+not size: `none` only if its tests prove it and a slip would be cheap to
+spot, `standard` if one could hide (shared code, data), `strict` for
+security, concurrency, migrations, public APIs or CI. That is 0, 1 or 3
+reviewers in `adaptive` and `direct` (other pipelines fix theirs); coupled
+parts are one item, reviewed once. Omit `model_plan` to use learned
+choices or the configured fallback. Override stages when task requirements
+or evidence (`model_evidence`) justify it; explain why in `model_reasons`.
+`x_high` or `max` only for a named reasoning problem inspection left open.
 
 The daemon refuses a knob above the ceiling `autonomy_policy` shows; only
 the operator can raise it, so never work around a refusal. `merge: auto` and

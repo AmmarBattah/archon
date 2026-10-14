@@ -1316,10 +1316,10 @@ mod tests {
     fn builtin_prompt_sets_review_per_item_and_reviews_the_whole_once() {
         let prompt = unwrapped(&prompt());
         for said in [
-            "Set `review` (`none`, `standard`, `strict`) on `enqueue` by risk, not size: `none` \
-             only if its tests prove it and a slip would be cheap to spot, `standard` if one \
-             could hide (shared code, data), `strict` for security, concurrency, migrations, \
-             public APIs or CI.",
+            "Set `autonomy.review` (`none`, `standard`, `strict`) on `enqueue` by risk, not size: \
+             `none` only if its tests prove it and a slip would be cheap to spot, `standard` if \
+             one could hide (shared code, data), `strict` for security, concurrency, \
+             migrations, public APIs or CI.",
             "coupled parts are one item, reviewed once",
             "An item's gates are its pipeline's; add none.",
             "On a failure read `get_item`, then `retry_item`, split the work, or `notify` a \
