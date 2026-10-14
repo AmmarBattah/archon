@@ -1,9 +1,28 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
-One `archond` per data directory, and a command that only reads no longer
-starts one.
+Released 2026-10-14.
+
+1.1.0 was not published on its own, so this release carries all of it: read
+[its notes](https://github.com/mengsig/archon/blob/v1.2.0/CHANGELOG.md#110)
+too. On top of 1.1.0, one `archond` serves a data directory, a command that
+only reads no longer starts one, and the orchestrator spends fewer turns and
+less waiting on each request. On the bench's smoke tasks, with Claude Haiku,
+the orchestrator's relay of an outcome fell from 9.9 to 4.6 seconds with no
+task failing.
+
+### Upgrading
+
+- From 1.0.x: follow "Upgrading" under 1.1.0. Its store migration is
+  one-way, so back up `archon.db` first.
+- From a 1.1.0 build: `archon daemon stop`, `archon update`, then `archon
+  orchestrator restart` so the orchestrator gets the new prompt.
+- A command that only reads, such as `archon status`, now exits 1 when
+  `archond` is not running: start it with `archon daemon start`.
+- Set `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR` and `ARCHON_SOCKET` all
+  together or none of them. With only some set, a command that would start
+  `archond` fails and names them.
 
 ### Fixes
 
@@ -54,7 +73,7 @@ starts one.
 
 ## 1.1.0
 
-Released 2026-10-14.
+Not published on its own: its changes ship in 1.2.0.
 
 Work needs fewer agents and fewer tokens, and you can change it while it
 runs. `archond` now pushes and opens the pull request itself. The
