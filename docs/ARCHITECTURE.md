@@ -145,7 +145,7 @@ protocol 17 alone does not imply support.
 
 ```json
 {"req":1,"cmd":"hello","protocol_version":17,"client_name":"archon",
- "client_version":"1.2.0","features":[]}
+ "client_version":"1.2.1","features":[]}
 ```
 
 The reply is `Welcome {protocol_version, daemon_version, instance_id,
