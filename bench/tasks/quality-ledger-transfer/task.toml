@@ -5,6 +5,6 @@ Implement `ledger.py` according to `SPEC.md`. Preserve the documented API, \
 handle every specified error and boundary case, and add focused tests. The \
 existing tests cover basics only. Use the Python standard library and commit your work.
 """
-timeout_minutes = 12
+timeout_minutes = 20
 pipeline = "direct"
 tags = ["quality", "python", "single-repo", "atomicity", "concurrency", "overflow"]

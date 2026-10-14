@@ -142,7 +142,7 @@ fn budget() -> Value {
 }
 
 fn model_reasons() -> Value {
-    json!({"type": "object", "description": "Why, one line per stage id.",
+    json!({"type": "object", "description": "Why, one line per stage id (not the pipeline name).",
         "additionalProperties": {"type": "string", "maxLength": MAX_MODEL_REASON_CHARS}})
 }
 

@@ -47,6 +47,10 @@ pub fn graders_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("graders")
 }
 
+/// Prefix of the logs of the extra grading of a timed-out trial, so they sit
+/// beside the verdict's and overwrite nothing.
+pub const TIMEOUT_LOG_PREFIX: &str = "timeout-";
+
 /// Build `grade/` from the result, then run `grade.sh` there. `label` becomes
 /// `BENCH_ARM`: the arm, or `untouched`/`reference` when verifying.
 pub async fn grade(
@@ -55,11 +59,22 @@ pub async fn grade(
     label: &str,
     source: &ResultSource,
 ) -> anyhow::Result<GradeOutcome> {
+    grade_logged(task, layout, label, source, "").await
+}
+
+/// [`grade`] writing its logs as `<log_prefix>grade.stdout` and so on.
+pub async fn grade_logged(
+    task: &BenchTask,
+    layout: &TrialLayout,
+    label: &str,
+    source: &ResultSource,
+    log_prefix: &str,
+) -> anyhow::Result<GradeOutcome> {
     let mut notes: Vec<String> = assemble(task, layout, source)?.into_iter().collect();
-    save_result_patches(task, layout)?;
+    save_result_patches(task, layout, log_prefix)?;
     let spec = grader_command(task, layout, label);
-    let stdout = layout.logs.join("grade.stdout");
-    let stderr = layout.logs.join("grade.stderr");
+    let stdout = layout.logs.join(format!("{log_prefix}grade.stdout"));
+    let stderr = layout.logs.join(format!("{log_prefix}grade.stderr"));
     let run = process::run(&spec, &stdout, &stderr, GRADE_TIMEOUT).await?;
     let text = std::fs::read_to_string(&stdout)
         .with_context(|| format!("reading {}", stdout.display()))?;
@@ -81,14 +96,20 @@ pub async fn grade(
 
 /// `logs/<repo>.result.patch`: everything the result changed against
 /// `bench-base`, untracked files included, for review after the copy is gone.
-fn save_result_patches(task: &BenchTask, layout: &TrialLayout) -> anyhow::Result<()> {
+fn save_result_patches(
+    task: &BenchTask,
+    layout: &TrialLayout,
+    log_prefix: &str,
+) -> anyhow::Result<()> {
     assert!(layout.grade.is_dir(), "the grading copy is assembled first");
     for fixture in task.fixtures() {
         let repo = layout.grade.join(&fixture.name);
         ensure!(repo.is_dir(), "{} is missing", repo.display());
         workspace::git(&repo, &["add", "-A"])?;
         let patch = workspace::git(&repo, &["diff", "--cached", "--binary", BASE_TAG])?;
-        let path = layout.logs.join(format!("{}.result.patch", fixture.name));
+        let path = layout
+            .logs
+            .join(format!("{log_prefix}{}.result.patch", fixture.name));
         std::fs::write(&path, patch).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
@@ -259,6 +280,38 @@ mod tests {
         let patch = layout.logs.join("fix-off-by-one.result.patch");
         let patch = std::fs::read_to_string(patch).unwrap();
         assert!(patch.contains("+agent work"), "{patch}");
+    }
+
+    #[tokio::test]
+    async fn a_second_grading_keeps_its_own_logs_beside_the_verdicts() {
+        let tmp = scratch();
+        let task = bundled("fix-off-by-one");
+        let layout = TrialLayout::under(&tmp.path().join("t"));
+        workspace::prepare(&task, &layout).unwrap();
+        let repo = layout.agent_cwd(&task);
+        std::fs::write(layout.answer_file(), "").unwrap();
+        let verdict = grade(&task, &layout, "archon", &ResultSource::Workspace)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("late.txt"), "committed late\n").unwrap();
+        let late = grade_logged(
+            &task,
+            &layout,
+            "archon",
+            &ResultSource::Workspace,
+            TIMEOUT_LOG_PREFIX,
+        )
+        .await
+        .unwrap();
+        assert!(!verdict.success && !late.success);
+        let logs = &layout.logs;
+        for name in ["grade.stdout", "timeout-grade.stdout"] {
+            assert!(logs.join(name).is_file(), "{name} is missing");
+        }
+        let first = std::fs::read_to_string(logs.join("fix-off-by-one.result.patch")).unwrap();
+        let second =
+            std::fs::read_to_string(logs.join("timeout-fix-off-by-one.result.patch")).unwrap();
+        assert!(!first.contains("late.txt") && second.contains("+committed late"));
     }
 
     #[test]

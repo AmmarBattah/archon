@@ -25,6 +25,7 @@ use archon_core::notify::{FeedEntry, FeedItem};
 use archon_core::protocol::{ClientKind, ItemDetail, ItemQuery, Reply, RepoAdd, Request};
 use archon_core::queue::{QueueItem, QueueState};
 use archon_core::repo::ShipMode;
+use archon_core::run::PipelineRun;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -45,6 +46,8 @@ const DAEMON_LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 /// Aether agent statuses in which the orchestrator still has work to do.
+/// Why the bench cancels the items still unsettled at the deadline.
+pub const TIMEOUT_REASON: &str = "archon-bench: trial timeout";
 const BUSY_STATUSES: &[&str] = &["created", "ready", "running"];
 
 /// Read only captured routing fields so legacy captures never acquire policy defaults.
@@ -300,6 +303,10 @@ async fn session(input: &TrialInput<'_>, client: &ArchonClient) -> anyhow::Resul
         timed_out,
         error: None,
         source: ResultSource::Branches(result_branches(&details, &repos)),
+        timeout_source: timed_out
+            .then(|| timeout_branches(&details, &repos))
+            .flatten()
+            .map(ResultSource::Branches),
     })
 }
 
@@ -395,7 +402,7 @@ async fn wait_until_settled(
         }
         if Instant::now() >= deadline {
             for item in observed.items.iter().filter(|i| !is_settled(&i.state)) {
-                let reason = Some("archon-bench: trial timeout".to_owned());
+                let reason = Some(TIMEOUT_REASON.to_owned());
                 client
                     .request(Request::CancelItem {
                         item: item.id.clone(),
@@ -587,7 +594,7 @@ pub fn result_branches(
     done.sort_by_key(|d| d.item.updated_at);
     let mut branches: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for detail in done {
-        let Some(name) = detail.item.repo.as_ref().and_then(|r| repos.get(r)) else {
+        let Some(name) = repo_name(detail, repos) else {
             continue;
         };
         let QueueState::Succeeded { run, .. } = &detail.item.state else {
@@ -606,4 +613,48 @@ pub fn result_branches(
         }
     }
     branches
+}
+
+/// [`result_branches`] plus, after them, the last committed branch of each
+/// item the bench cancelled at the deadline. `None` when no timed-out item
+/// has one, so there is nothing beyond the verdict to grade.
+pub fn timeout_branches(
+    details: &[ItemDetail],
+    repos: &BTreeMap<RepoId, String>,
+) -> Option<BTreeMap<String, Vec<String>>> {
+    let mut late: Vec<(&ItemDetail, &str)> = details
+        .iter()
+        .filter(|d| is_timed_out(&d.item.state))
+        .filter_map(|d| Some((d, last_branch(&d.runs)?)))
+        .collect();
+    late.sort_by_key(|(d, _)| d.item.updated_at);
+    let mut branches = result_branches(details, repos);
+    let mut added = 0;
+    for (detail, branch) in late {
+        let Some(name) = repo_name(detail, repos) else {
+            continue;
+        };
+        branches
+            .entry(name.clone())
+            .or_default()
+            .push(branch.to_owned());
+        added += 1;
+    }
+    (added > 0).then_some(branches)
+}
+
+fn is_timed_out(state: &QueueState) -> bool {
+    matches!(state, QueueState::Cancelled { reason: Some(r) } if r == TIMEOUT_REASON)
+}
+
+/// The newest run's branch that has one; a run without it never committed.
+fn last_branch(runs: &[PipelineRun]) -> Option<&str> {
+    runs.iter()
+        .filter(|r| !r.branch.is_empty())
+        .max_by_key(|r| r.started_at)
+        .map(|r| r.branch.as_str())
+}
+
+fn repo_name<'a>(detail: &ItemDetail, repos: &'a BTreeMap<RepoId, String>) -> Option<&'a String> {
+    detail.item.repo.as_ref().and_then(|r| repos.get(r))
 }

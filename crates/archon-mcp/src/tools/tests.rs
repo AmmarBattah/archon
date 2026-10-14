@@ -902,7 +902,7 @@ fn shown_bytes(definition: &ToolDefinition) -> usize {
 #[test]
 fn the_tool_list_stays_within_its_budget() {
     const FROM_1_0: usize = 25;
-    const FROM_1_0_BUDGET_BYTES: usize = 18_042;
+    const FROM_1_0_BUDGET_BYTES: usize = 18_087;
     const BUDGET_BYTES: usize = 24 * 1024;
     let definitions = definitions();
     assert_eq!(definitions[FROM_1_0 - 1].name, "message_orchestrator");

@@ -1,6 +1,6 @@
 use super::*;
-use crate::metrics::ArchonItem;
 use crate::metrics::tests::result;
+use crate::metrics::{ArchonItem, TimeoutGrade};
 use crate::workspace::tests::scratch;
 use archon_core::autonomy::ReviewLevel;
 
@@ -295,5 +295,62 @@ fn invalid_routing_and_capture_paths_are_rejected() {
             .unwrap_err()
             .to_string()
             .contains("invalid task id")
+    );
+}
+
+#[test]
+fn graded_on_timeout_is_reported_apart_and_never_counted_as_a_pass() {
+    let late_pass = TimeoutGrade {
+        success: true,
+        score: Some(1.0),
+    };
+    let mut slow = trial("a", Arm::Archon, false, 1200.0, 1.0);
+    slow.timed_out = true;
+    slow.graded_on_timeout = Some(late_pass);
+    let mut stuck = trial("a", Arm::Archon, false, 1200.0, 1.0);
+    stuck.timed_out = true;
+    stuck.graded_on_timeout = Some(TimeoutGrade {
+        success: false,
+        score: None,
+    });
+    let mut unreached = trial("b", Arm::Archon, false, 1200.0, 1.0);
+    unreached.timed_out = true;
+    let summary = Summary::build(&[slow, stuck, unreached], None).unwrap();
+    let archon = &summary.arms[0];
+    assert_eq!(
+        (archon.trials, archon.successes, archon.timeouts),
+        (3, 0, 3)
+    );
+    assert_eq!(
+        (archon.timeout_graded, archon.timeout_graded_passes),
+        (2, 1)
+    );
+    assert_eq!(
+        (archon.success_rate, archon.pass_at_1, archon.score.mean),
+        (0.0, 0.0, 0.0)
+    );
+    let md = render_markdown(&summary).unwrap();
+    assert!(md.contains("## Graded on timeout"), "{md}");
+    assert!(md.contains("| archon | 3 | 2 | 1 |"), "{md}");
+    assert!(md.contains("| archon | `m` | 3 | 0/3 (0%)"), "{md}");
+}
+
+#[test]
+fn summaries_without_timeout_grades_keep_their_layout() {
+    let summary = Summary::build(&[trial("a", Arm::Claude, true, 1.0, 0.1)], None).unwrap();
+    assert!(
+        !render_markdown(&summary)
+            .unwrap()
+            .contains("Graded on timeout")
+    );
+    let old = r#"{"arm":"claude","model":"m","trials":1,"successes":1,"infra":0,"timeouts":0,
+        "success_rate":1.0,"pass_at_1":1.0,"pass_at_k":1.0,
+        "score":{"n":1,"mean":1.0,"stdev":0.0},"wall_secs":{"n":1,"mean":1.0,"stdev":0.0},
+        "input_tokens":null,"output_tokens":null,"cost_usd":null,
+        "operator_messages":{"n":1,"mean":1.0,"stdev":0.0}}"#;
+    let parsed: Aggregate = serde_json::from_str(old).unwrap();
+    assert_eq!(
+        (parsed.timeout_graded, parsed.timeout_graded_passes),
+        (0, 0)
     );
 }

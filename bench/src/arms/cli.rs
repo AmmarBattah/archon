@@ -92,6 +92,7 @@ fn base_outcome(wall_secs: f64, timed_out: bool) -> ArmOutcome {
         timed_out,
         error: None,
         source: ResultSource::Workspace,
+        timeout_source: None,
     }
 }
 

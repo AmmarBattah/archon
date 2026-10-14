@@ -113,6 +113,9 @@ pub struct ArmOutcome {
     /// Harness failure: the arm did not run cleanly.
     pub error: Option<String>,
     pub source: ResultSource,
+    /// Only when `timed_out`: `source` plus the last committed branch of each
+    /// timed-out item, graded separately and never as the verdict.
+    pub timeout_source: Option<ResultSource>,
 }
 
 impl ArmOutcome {
@@ -127,6 +130,7 @@ impl ArmOutcome {
             timed_out: false,
             error: Some(error),
             source,
+            timeout_source: None,
         }
     }
 }
