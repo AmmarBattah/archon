@@ -339,7 +339,8 @@ impl Outbox {
 
     /// Whether `pending` should go out without waiting for more news.
     fn is_now(&self, now: Timestamp) -> bool {
-        self.is_due(now) && (self.flush || self.pending.iter().any(|news| news.event.is_urgent()))
+        let skips_window = |news: &Held| news.at_once || news.event.is_urgent();
+        self.is_due(now) && (self.flush || self.pending.iter().any(skips_window))
     }
 
     /// When the first deferred news comes due, if nothing wakes the
@@ -453,6 +454,20 @@ pub(crate) fn hold_deferred(
     let news = Held {
         defer_until: Some(until),
         ..Held::new(event, now, false)
+    };
+    hold_as(store, news)
+}
+
+/// Save the outcome of the last unfinished item under the caller's store
+/// lock, to go out without the coalescing window; the caller then calls [`wake`].
+pub(crate) fn hold_at_once(store: &mut Store, event: TriggerEvent) -> Result<(), ArchonError> {
+    assert!(
+        matches!(event, TriggerEvent::ItemFinished { .. }),
+        "only an item's outcome knows no news is coming after it"
+    );
+    let news = Held {
+        at_once: true,
+        ..Held::new(event, archon_core::now(), false)
     };
     hold_as(store, news)
 }
@@ -907,6 +922,26 @@ mod tests {
         outbox.pending.truncate(2);
         outbox.flush = true;
         assert!(outbox.is_now(now), "a turn starting takes it at once");
+    }
+
+    #[test]
+    fn the_last_items_outcome_skips_the_window_and_carries_the_rest() {
+        let now = archon_core::now();
+        let deferred = Held {
+            defer_until: Some(now + chrono::TimeDelta::minutes(5)),
+            ..Held::new(success(), now, false)
+        };
+        let mut outbox = Outbox {
+            pending: vec![deferred, Held::new(success(), now, false)],
+            ..Outbox::default()
+        };
+        assert!(outbox.is_due(now), "waking news is due");
+        assert!(!outbox.is_now(now), "it waits the window for company");
+        outbox.pending.push(Held {
+            at_once: true,
+            ..Held::new(success(), now, false)
+        });
+        assert!(outbox.is_now(now), "no other outcome is coming");
     }
 
     #[test]

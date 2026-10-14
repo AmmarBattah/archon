@@ -146,8 +146,9 @@ fn installation(workspace: &Path, user_pipelines: &Path, depth: u32) -> String {
     };
     format!(
         "\n## This installation\n\n\
-         - Your workspace: `{}`. A repository's mirror is `{}/<name>` in it; `{}/` is for a \
-         helper that reads no code.\n\
+         - Your workspace and working directory: `{}`. A repository's mirror is `{}/<name>` \
+         in it: read its code there, and never search the disk for it. `{}/` is for a helper \
+         that reads no code.\n\
          - User pipelines directory: `{}`.\n\
          - Delegation depth: {depth}. To keep within it, {leaf}.\n",
         workspace.display(),
@@ -1196,7 +1197,8 @@ mod tests {
             "You are woken for:",
             "`item_finished`: a failure, a blocker, an item tagged `notify`, one with a GitHub \
              `origin` to answer, and a success unless the operator turned that off.",
-            "Relay a success in a line with its pull request, verifying nothing: the daemon did.",
+            "Relay a success in a line with its pull request or commit; run no tool to verify it: \
+             the daemon did.",
             "A trigger states all `directives` once, then only `directive_changes`; if you hold \
              fewer than `directives_in_force`, read `autonomy_policy`.",
             "A mirror holds the registered repository's local base commit (HEAD when no base \
@@ -1267,7 +1269,8 @@ mod tests {
         for said in [
             "Take the first that fits",
             "every repository in `list_repos` has a mirror, so reading code takes no item",
-            "Queue clear changes at once, in one message; read code only to split them or judge risk.",
+            "Queue clear changes at once, in one message; read code only to split them or judge \
+             risk, not to fix or test them.",
             "a large request is a backlog ordered with `depends_on` and `priority`",
             "Never change a repository yourself or through a child.",
             "A mirror holds the registered repository's local base commit",
@@ -1314,10 +1317,10 @@ mod tests {
     fn builtin_prompt_sets_review_per_item_and_reviews_the_whole_once() {
         let prompt = unwrapped(&prompt());
         for said in [
-            "Set `review` (`none`, `standard`, `strict`) on `enqueue` by risk, not size: `none` \
-             only if its tests prove it and a slip would be cheap to spot, `standard` if one \
-             could hide (shared code, data), `strict` for security, concurrency, migrations, \
-             public APIs or CI.",
+            "Set `autonomy.review` (`none`, `standard`, `strict`) on `enqueue` by risk, not size: \
+             `none` only if its tests prove it and a slip would be cheap to spot, `standard` if \
+             one could hide (shared code, data), `strict` for security, concurrency, \
+             migrations, public APIs or CI.",
             "coupled parts are one item, reviewed once",
             "An item's gates are its pipeline's; add none.",
             "On a failure read `get_item`, then `retry_item`, split the work, or `notify` a \
@@ -1427,8 +1430,9 @@ mod tests {
         assert!(prompt.contains(&shown), "the prompt never gives {shown}");
         assert!(
             prompt.contains(
-                "Your workspace: `/data/orchestrator`. A repository's mirror is `repos/<name>` \
-                 in it; `scratch/` is for a helper that reads no code."
+                "Your workspace and working directory: `/data/orchestrator`. A repository's \
+                 mirror is `repos/<name>` in it: read its code there, and never search the disk \
+                 for it. `scratch/` is for a helper that reads no code."
             ),
             "where the mirrors are: {prompt}"
         );
