@@ -4,12 +4,13 @@
 
 Released 2026-10-15.
 
-You can now tell Archon that a stage of a finished run got it wrong. It then
-trusts the model that did that work less for that kind of work in that
-repository, and it can retire the Aether memory behind the mistake. Every
-correction can be undone, and review is never lowered. Agents can also start
-with a lean host context, which needs Aether 1.0.5. This release migrates the
-store one-way: read "Upgrading" before you update.
+You can now tell Archon that a stage of a finished run got it wrong. For a
+quality correction it can attribute, it then trusts the model that did that
+work less for that kind of work in that repository, and it can retire the
+Aether memory behind the mistake. Every correction can be undone, and review
+is never lowered. Agents can also start with a lean host context, which needs
+Aether 1.0.5. This release migrates the store one-way: read "Upgrading"
+before you update.
 
 ### Added
 
@@ -33,8 +34,9 @@ store one-way: read "Upgrading" before you update.
   no new wire field, with one log warning and a doctor check explaining the
   fallback. Stage records and model evidence retain the effective context.
   On the bench's smoke tasks with Claude Haiku, lean passed as many tasks
-  as full (13 of 16 each), with 33% less input and at least 30% less
-  reported cost.
+  as full (13 of 16 each), with 33% less reported input and 30% lower
+  known cost. One lean run's accounting is incomplete, so these figures do
+  not establish the true all-in saving.
 
 ### Fixes
 
