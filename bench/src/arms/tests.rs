@@ -526,8 +526,22 @@ fn timeout_branches_add_the_last_committed_branch_after_the_verdict_branches() {
         ["archon/done"],
         "the verdict ignores timeouts"
     );
-    let late = timeout_branches(&details, &repos).unwrap();
+    let late = timeout_branches(&details, &repos, |_, _| true).unwrap();
     assert_eq!(late["lib"], ["archon/done", "archon/try2"]);
+}
+
+#[test]
+fn timeout_branches_skip_a_newer_run_that_never_committed() {
+    let repo = RepoId::new();
+    let repos: BTreeMap<RepoId, String> = [(repo.clone(), "lib".into())].into();
+    let details = [timed_out(&repo, &["archon/try1", "archon/try2"], 3)];
+    let committed = |name: &str, branch: &str| {
+        assert_eq!(name, "lib", "checked in the item's repository");
+        branch != "archon/try2"
+    };
+    let late = timeout_branches(&details, &repos, committed).unwrap();
+    assert_eq!(late["lib"], ["archon/try1"], "the retry holds no work");
+    assert_eq!(timeout_branches(&details, &repos, |_, _| false), None);
 }
 
 #[test]
@@ -544,13 +558,13 @@ fn timeout_branches_need_a_timed_out_item_with_a_branch() {
         other_cancel,
     ];
     assert_eq!(
-        timeout_branches(&details, &repos),
+        timeout_branches(&details, &repos, |_, _| true),
         None,
         "nothing committed, or not cancelled by the deadline"
     );
     let stray = timed_out(&RepoId::new(), &["archon/y"], 1);
     assert_eq!(
-        timeout_branches(&[stray], &repos),
+        timeout_branches(&[stray], &repos, |_, _| true),
         None,
         "unknown repository"
     );

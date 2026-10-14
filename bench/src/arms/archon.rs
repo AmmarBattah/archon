@@ -36,7 +36,7 @@ use crate::arms::{
 use crate::grade::ResultSource;
 use crate::metrics::{ArchonItem, Arm};
 use crate::usage::{Usage, aether_usage};
-use crate::workspace::BASE_BRANCH;
+use crate::workspace::{self, BASE_BRANCH, TrialLayout};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the fleet must stay quiet before the trial counts as finished;
@@ -304,7 +304,10 @@ async fn session(input: &TrialInput<'_>, client: &ArchonClient) -> anyhow::Resul
         error: None,
         source: ResultSource::Branches(result_branches(&details, &repos)),
         timeout_source: timed_out
-            .then(|| timeout_branches(&details, &repos))
+            .then(|| {
+                let committed = |repo: &str, branch: &str| has_commits(input.layout, repo, branch);
+                timeout_branches(&details, &repos, committed)
+            })
             .flatten()
             .map(ResultSource::Branches),
     })
@@ -621,38 +624,51 @@ pub fn result_branches(
 pub fn timeout_branches(
     details: &[ItemDetail],
     repos: &BTreeMap<RepoId, String>,
+    committed: impl Fn(&str, &str) -> bool,
 ) -> Option<BTreeMap<String, Vec<String>>> {
-    let mut late: Vec<(&ItemDetail, &str)> = details
+    let mut late: Vec<(&ItemDetail, &String, &str)> = details
         .iter()
         .filter(|d| is_timed_out(&d.item.state))
-        .filter_map(|d| Some((d, last_branch(&d.runs)?)))
+        .filter_map(|d| {
+            let name = repo_name(d, repos)?;
+            Some((d, name, last_committed(&d.runs, |b| committed(name, b))?))
+        })
         .collect();
-    late.sort_by_key(|(d, _)| d.item.updated_at);
+    late.sort_by_key(|(d, _, _)| d.item.updated_at);
     let mut branches = result_branches(details, repos);
-    let mut added = 0;
-    for (detail, branch) in late {
-        let Some(name) = repo_name(detail, repos) else {
-            continue;
-        };
+    let added = late.len();
+    for (_, name, branch) in late {
         branches
             .entry(name.clone())
             .or_default()
             .push(branch.to_owned());
-        added += 1;
     }
     (added > 0).then_some(branches)
+}
+
+/// Whether `branch` of fixture `repo` holds commits past `bench-base`; a
+/// missing branch holds none.
+fn has_commits(layout: &TrialLayout, repo: &str, branch: &str) -> bool {
+    assert!(!branch.is_empty(), "only named branches are checked");
+    let range = format!("{}..{branch}", workspace::BASE_TAG);
+    let dir = layout.workspace.join(repo);
+    workspace::git(&dir, &["rev-list", "--count", &range])
+        .is_ok_and(|count| count.trim().parse::<u64>().is_ok_and(|n| n > 0))
 }
 
 fn is_timed_out(state: &QueueState) -> bool {
     matches!(state, QueueState::Cancelled { reason: Some(r) } if r == TIMEOUT_REASON)
 }
 
-/// The newest run's branch that has one; a run without it never committed.
-fn last_branch(runs: &[PipelineRun]) -> Option<&str> {
-    runs.iter()
-        .filter(|r| !r.branch.is_empty())
-        .max_by_key(|r| r.started_at)
+/// The newest run's branch that `committed` says holds work: a run records
+/// its branch before its first commit, so a fresh retry may hold none.
+fn last_committed(runs: &[PipelineRun], committed: impl Fn(&str) -> bool) -> Option<&str> {
+    let mut named: Vec<&PipelineRun> = runs.iter().filter(|r| !r.branch.is_empty()).collect();
+    named.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    named
+        .into_iter()
         .map(|r| r.branch.as_str())
+        .find(|branch| committed(branch))
 }
 
 fn repo_name<'a>(detail: &ItemDetail, repos: &'a BTreeMap<RepoId, String>) -> Option<&'a String> {

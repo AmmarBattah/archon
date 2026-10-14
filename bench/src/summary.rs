@@ -586,7 +586,7 @@ const INFRA_ERROR_CHARS: usize = 200;
 
 pub(crate) const ROUTING_NOTES: &str = "Archon whole-trial observations: each trial appears once per table. Mixed buckets retain all selected and attempted pipelines or selected review levels. Pass rate is the trial grader verdict; cost and wall time cover the whole trial, including orchestration. These are not per-item outcomes or causal comparisons. Review levels are captured policy, not proof of completed review; historical policy changes are unavailable. Unknown means missing metadata; no work means a captured empty queue. Infrastructure failures are excluded from metrics.";
 
-const TIMEOUT_NOTES: &str = "A trial that hit its deadline is a failure in the success, pass@k and score columns, whatever it had committed. Here the last committed branch of each timed-out Archon item was graded as well, which shows a slow but correct solution. These results are never counted as passes.";
+const TIMEOUT_NOTES: &str = "A trial that hit its deadline keeps the grader verdict and score of its succeeded items only; what its cancelled items had committed counts for nothing in the success, pass@k and score columns. Here the last committed branch of each timed-out Archon item was graded as well, which shows a slow but correct solution. These results are never counted as passes.";
 
 fn percent(x: f64) -> String {
     format!("{:.0}%", x * 100.0)

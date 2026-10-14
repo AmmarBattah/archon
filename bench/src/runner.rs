@@ -308,8 +308,10 @@ async fn grade_on_timeout(
             note: Some("grading on timeout skipped: the verdict's grading copy remains".into()),
         });
     }
-    let graded =
-        grade::grade_logged(task, layout, arm.name(), source, grade::TIMEOUT_LOG_PREFIX).await;
+    let graded = match layout.late_grade() {
+        Ok(late) => grade::grade(task, &late, arm.name(), source).await,
+        Err(e) => Err(e),
+    };
     Some(match graded {
         Ok(g) => LateGrade {
             grade: Some(TimeoutGrade {

@@ -25,6 +25,9 @@ use crate::task::{BenchTask, Fixture};
 
 /// The tag every fixture's initial commit carries; graders diff against it.
 pub const BASE_TAG: &str = "bench-base";
+/// Under a trial's logs: the logs of the extra grading of timed-out work,
+/// apart from the verdict's so no fixture name can collide with them.
+pub const TIMEOUT_LOG_DIR: &str = "timeout";
 /// The branch fixtures start on (the archon arm registers it as the base).
 pub const BASE_BRANCH: &str = "main";
 /// Build output and caches never worth copying between trial directories.
@@ -81,6 +84,19 @@ impl TrialLayout {
             run_dir.join(grade),
             logs,
         ))
+    }
+
+    /// This trial for the extra grading of timed-out work: the same copy
+    /// and workspace, logs under [`TIMEOUT_LOG_DIR`] so none collide.
+    pub fn late_grade(&self) -> anyhow::Result<Self> {
+        ensure!(
+            self.logs.is_dir(),
+            "{} is not a directory",
+            self.logs.display()
+        );
+        let logs = self.logs.join(TIMEOUT_LOG_DIR);
+        std::fs::create_dir_all(&logs).with_context(|| format!("creating {}", logs.display()))?;
+        Ok(Self::new(self.workspace.clone(), self.grade.clone(), logs))
     }
 
     pub fn repo(&self, fixture: &Fixture) -> PathBuf {

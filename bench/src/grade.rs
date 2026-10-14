@@ -47,10 +47,6 @@ pub fn graders_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("graders")
 }
 
-/// Prefix of the logs of the extra grading of a timed-out trial, so they sit
-/// beside the verdict's and overwrite nothing.
-pub const TIMEOUT_LOG_PREFIX: &str = "timeout-";
-
 /// Build `grade/` from the result, then run `grade.sh` there. `label` becomes
 /// `BENCH_ARM`: the arm, or `untouched`/`reference` when verifying.
 pub async fn grade(
@@ -59,22 +55,11 @@ pub async fn grade(
     label: &str,
     source: &ResultSource,
 ) -> anyhow::Result<GradeOutcome> {
-    grade_logged(task, layout, label, source, "").await
-}
-
-/// [`grade`] writing its logs as `<log_prefix>grade.stdout` and so on.
-pub async fn grade_logged(
-    task: &BenchTask,
-    layout: &TrialLayout,
-    label: &str,
-    source: &ResultSource,
-    log_prefix: &str,
-) -> anyhow::Result<GradeOutcome> {
     let mut notes: Vec<String> = assemble(task, layout, source)?.into_iter().collect();
-    save_result_patches(task, layout, log_prefix)?;
+    save_result_patches(task, layout)?;
     let spec = grader_command(task, layout, label);
-    let stdout = layout.logs.join(format!("{log_prefix}grade.stdout"));
-    let stderr = layout.logs.join(format!("{log_prefix}grade.stderr"));
+    let stdout = layout.logs.join("grade.stdout");
+    let stderr = layout.logs.join("grade.stderr");
     let run = process::run(&spec, &stdout, &stderr, GRADE_TIMEOUT).await?;
     let text = std::fs::read_to_string(&stdout)
         .with_context(|| format!("reading {}", stdout.display()))?;
@@ -96,20 +81,14 @@ pub async fn grade_logged(
 
 /// `logs/<repo>.result.patch`: everything the result changed against
 /// `bench-base`, untracked files included, for review after the copy is gone.
-fn save_result_patches(
-    task: &BenchTask,
-    layout: &TrialLayout,
-    log_prefix: &str,
-) -> anyhow::Result<()> {
+fn save_result_patches(task: &BenchTask, layout: &TrialLayout) -> anyhow::Result<()> {
     assert!(layout.grade.is_dir(), "the grading copy is assembled first");
     for fixture in task.fixtures() {
         let repo = layout.grade.join(&fixture.name);
         ensure!(repo.is_dir(), "{} is missing", repo.display());
         workspace::git(&repo, &["add", "-A"])?;
         let patch = workspace::git(&repo, &["diff", "--cached", "--binary", BASE_TAG])?;
-        let path = layout
-            .logs
-            .join(format!("{log_prefix}{}.result.patch", fixture.name));
+        let path = layout.logs.join(format!("{}.result.patch", fixture.name));
         std::fs::write(&path, patch).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
@@ -294,23 +273,23 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(repo.join("late.txt"), "committed late\n").unwrap();
-        let late = grade_logged(
-            &task,
-            &layout,
-            "archon",
-            &ResultSource::Workspace,
-            TIMEOUT_LOG_PREFIX,
-        )
-        .await
-        .unwrap();
+        let late_layout = layout.late_grade().unwrap();
+        let late = grade(&task, &late_layout, "archon", &ResultSource::Workspace)
+            .await
+            .unwrap();
         assert!(!verdict.success && !late.success);
-        let logs = &layout.logs;
-        for name in ["grade.stdout", "timeout-grade.stdout"] {
-            assert!(logs.join(name).is_file(), "{name} is missing");
+        let (logs, late_logs) = (&layout.logs, &late_layout.logs);
+        assert_eq!(late_logs, &logs.join(workspace::TIMEOUT_LOG_DIR));
+        for dir in [logs, late_logs] {
+            assert!(
+                dir.join("grade.stdout").is_file(),
+                "{} lacks grade.stdout",
+                dir.display()
+            );
         }
         let first = std::fs::read_to_string(logs.join("fix-off-by-one.result.patch")).unwrap();
         let second =
-            std::fs::read_to_string(logs.join("timeout-fix-off-by-one.result.patch")).unwrap();
+            std::fs::read_to_string(late_logs.join("fix-off-by-one.result.patch")).unwrap();
         assert!(!first.contains("late.txt") && second.contains("+committed late"));
     }
 
