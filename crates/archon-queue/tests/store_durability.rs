@@ -214,6 +214,7 @@ fn recovery_after_a_crash_mid_dispatch() {
 
 /// Takes a store back to before V10, for tests that replay earlier migrations.
 const UNDO_V10: &str = "
+    DROP TABLE operator_feedback;
     DROP TABLE lesson_uses; DROP TABLE lessons; DROP TABLE outcome_stages; DROP TABLE outcomes;
     DROP TABLE run_edits; DROP TABLE stacks; DROP INDEX items_by_initiative;
     ALTER TABLE items DROP COLUMN initiative_id; DROP TABLE initiatives;";
@@ -235,7 +236,10 @@ fn migrations_apply_once_and_a_newer_store_is_refused() {
     let path = db_path(&dir);
     drop(Store::open(&path).unwrap());
     drop(Store::open(&path).unwrap());
-    assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(
+        schema_versions(&path),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
     let conn = rusqlite::Connection::open(&path).unwrap();
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -302,7 +306,10 @@ fn concurrent_first_opens_migrate_once() {
     for handle in handles {
         handle.join().unwrap().unwrap();
     }
-    assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(
+        schema_versions(&path),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
 }
 
 /// Appends `entry`, trying again while another writer holds the write
@@ -577,7 +584,7 @@ fn v9_keeps_an_earlier_provider_reported_total_as_the_floor() {
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(schema_versions(&path).last(), Some(&10));
+    assert_eq!(schema_versions(&path).last(), Some(&11));
     for n in [1, 2] {
         let settled = SpendRow {
             cost_complete: Some(true),

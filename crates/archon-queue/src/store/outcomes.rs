@@ -359,14 +359,13 @@ fn check_run(conn: &Connection, outcome: &Outcome) -> Result<(), ArchonError> {
 }
 
 impl Store {
+    /// The newest 500 comparable outcomes; within `window` when one is given.
     pub(super) fn route_outcomes(
         &self,
-        repo: Option<&RepoId>,
-        pipeline: &str,
-        stage: &str,
-        size: Option<archon_core::outcome::DiffSize>,
-        context: Option<&archon_core::outcome::RouteContext>,
+        query: &super::model_evidence::RouteQuery<'_>,
+        window: Option<(Timestamp, Timestamp)>,
     ) -> Result<Vec<Outcome>, ArchonError> {
+        assert!(window.is_none_or(|(since, until)| since <= until));
         let mut stmt = self.conn.prepare(
             "SELECT o.data FROM outcomes o WHERE NOT EXISTS (SELECT 1 FROM run_edits WHERE run=o.run)
              AND NOT EXISTS (SELECT 1 FROM kv WHERE key='learning/reshaped/'||o.run) AND (?1 IS NULL OR o.repo=?1) AND o.pipeline=?2
@@ -374,26 +373,33 @@ impl Store {
              (SELECT 1 FROM outcome_stages s WHERE s.run=o.run AND s.stage_id=?4)
              AND (?5 IS NULL OR (json_extract(o.data,'$.context.revision')=?5
                  AND json_extract(o.data,'$.context.review')=?6 AND json_extract(o.data,'$.context.task_class')=?7))
+             AND (?8 IS NULL OR (o.finished_at>=?8 AND o.finished_at<=?9))
              ORDER BY o.finished_at DESC, o.run DESC LIMIT 500"
         ).ctx("prepare contextual routes")?;
+        let context = query.context;
         let rows = stmt
             .query_map(
                 params![
-                    repo.map(RepoId::as_str),
-                    pipeline,
-                    size.map(|s| s.as_str()),
-                    stage,
+                    query.repo.map(RepoId::as_str),
+                    query.pipeline,
+                    query.size.map(|s| s.as_str()),
+                    query.stage,
                     context.map(|c| &c.revision),
                     context.map(|c| &c.review),
-                    context.map(|c| &c.task_class)
+                    context.map(|c| &c.task_class),
+                    window.map(|(since, _)| ts(&since)),
+                    window.map(|(_, until)| ts(&until)),
                 ],
                 |r| r.get::<_, String>(0),
             )
             .ctx("query contextual routes")?;
-        rows.map(|raw| {
-            self.settled_outcome(from_json(&raw.ctx("read contextual outcome")?, "outcome")?)
-        })
-        .collect()
+        let outcomes: Vec<Outcome> = rows
+            .map(|raw| {
+                self.settled_outcome(from_json(&raw.ctx("read contextual outcome")?, "outcome")?)
+            })
+            .collect::<Result<_, _>>()?;
+        assert!(outcomes.len() <= 500, "routing reads a bounded history");
+        Ok(outcomes)
     }
 }
 
