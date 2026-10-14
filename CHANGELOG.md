@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `archon learning correct qi_… --run prun_… --stage <stage> --cause <cause>
+  --reason <text>` records the operator's correction of one stage of one
+  finished run. A `quality` correction counts that stage's one producing
+  model choice as unsuccessful, once, in its repository and routing context,
+  for 90 days; an ambiguous history is recorded with no model penalty, and
+  the receipt says why. `archon learning why`, `undo`, `restore-memory` and
+  `retry-memory` show and reverse it. Agents are refused.
+- `--forget-memory mem_…` forgets that one Aether memory in the connected
+  instance, which must speak Aether protocol 15 or newer, and keeps a
+  receipt. Archon stores the memory's ID and state, never its text.
+- A repository cohort with a correction reads only runs of the last 90 days,
+  never pools global evidence, and explores no other model while a
+  correction is active.
+
+### Upgrading
+
+- The store migrates to schema 11, which adds the `operator_feedback` table.
+  `archon` and `archond` speak protocol 8: run `archon daemon stop` before
+  updating the binary; the next command that changes something starts the
+  new `archond`.
+
 ## 1.2.0
 
 Released 2026-10-14.

@@ -220,6 +220,65 @@ completion; statistics and pending completion news use the current ledger figure
 Distillation has one errand per repository at a time and a global default $3 daily
 reservation. Imported history is not distilled. See [configuration](configuration.md#learning).
 
+### Correcting one stage with `archon learning`
+
+```sh
+archon learning correct qi_ID --run prun_ID --stage implement \
+  --cause quality --reason "Ignored the current Git identity rule" \
+  --forget-memory mem_ID
+archon learning why qi_ID
+archon learning undo fb_ID
+archon learning restore-memory fb_ID
+archon learning retry-memory fb_ID
+```
+
+`correct` records what went wrong in one stage of one finished run of the
+item. Archon checks that the run belongs to the item and ran that stage, then
+freezes the repository, pipeline, routing context (pipeline revision, review
+level, task class), the stage run, its model and effort, and the delivered
+commit while Archon still keeps it. Only the operator's `archon` command can
+correct; an agent asking through `archon mcp` is refused.
+
+A `quality` correction counts against a model only when one model choice
+plainly produced the stage: a work stage of a finished run that was not
+reshaped, run by one agent on one model, whose last attempt completed and
+whose outcome holds a successful routing sample for it. Anything else, such
+as a fan-out, a model switch mid-stage or a review stage, is recorded as an
+observation, and the receipt says why there is no model penalty. `scope`,
+`infrastructure` and `budget` corrections are informational.
+
+The corrected run's successful sample of that stage and choice then counts as
+unsuccessful, once, however often the same correction is sent. Only new
+learned defaults in the same repository and routing context change: explicit
+choices and plans already chosen keep theirs. A repository cohort with a
+correction never borrows global evidence, reads only runs that finished in
+the last 90 days, and explores no other model while a correction is active.
+A penalty lasts 90 days. Review duties, gates, CI and shipping checks are
+unchanged.
+
+`why` lists each correction of an item's runs: whether it is active, revoked,
+expired or informational; the corrected choice's results now; what a new
+default selects; the routing explanation kept when the item was planned; and
+the named memory's origin, scope, date and state. `undo` revokes only the
+model penalty, and the record stays. A memory the correction forgot stays
+forgotten.
+
+`--forget-memory` forgets that one Aether memory in the Aether instance
+`archond` is connected to, so fresh stage sessions stop recalling it;
+sessions already running keep what they recalled. Archon stores the memory's
+ID and state, never its text, and shows who wrote it as Aether recorded it.
+The correction is recorded first: when Aether is down or the forget fails,
+the command prints "Correction recorded; memory forget pending/failed" and
+exits 1, and `retry-memory` retries only the forget, only in the same
+instance. An `aetherd` older than protocol 15 is refused before anything is
+recorded. `restore-memory` brings back a memory this correction forgot; it
+refuses when the memory was already forgotten or superseded before the
+correction, has been restored or forgotten again since, or is superseded now.
+Aether's `/memory` (`u`) restores any memory.
+
+With `[learning] enabled = false`, `correct` and `undo` are refused and
+nothing is recorded; `restore-memory` and `retry-memory` still work.
+
 ## Agents talking to the orchestrator
 
 Every stage agent can call Archon's `message_orchestrator(text, kind)` in
