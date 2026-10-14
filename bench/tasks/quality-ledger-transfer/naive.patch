@@ -1,0 +1,22 @@
+--- a/ledger.py
++++ b/ledger.py
+@@ -5,10 +5,16 @@
+ 
+ class Ledger:
+     def __init__(self, balances):
+-        raise NotImplementedError
++        self._balances = dict(balances)
+ 
+     def transfer(self, source, destination, amount):
+-        raise NotImplementedError
++        if amount <= 0:
++            raise ValueError("amount must be positive")
++        if self._balances[source] < amount:
++            return False
++        self._balances[source] -= amount
++        self._balances[destination] += amount
++        return True
+ 
+     def snapshot(self):
+-        raise NotImplementedError
++        return dict(self._balances)

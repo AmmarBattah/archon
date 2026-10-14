@@ -1,6 +1,8 @@
 use super::*;
+use crate::metrics::ArchonItem;
 use crate::metrics::tests::result;
 use crate::workspace::tests::scratch;
+use archon_core::autonomy::ReviewLevel;
 
 fn trial(task: &str, arm: Arm, success: bool, wall: f64, cost: f64) -> TrialResult {
     TrialResult {
@@ -172,4 +174,126 @@ fn metrics_only_some_trials_reported_show_their_n() {
         "output tokens came from all three: {md}"
     );
     assert!(md.contains("2/3 · 13 ± 6 · 2.00 ± 1.41 (n=2) ·"), "{md}");
+}
+
+fn routed(pipeline: &str, review: Option<ReviewLevel>) -> ArchonItem {
+    ArchonItem {
+        pipeline: pipeline.into(),
+        run_pipelines: Vec::new(),
+        review,
+    }
+}
+
+#[test]
+fn routing_buckets_measure_whole_trials_without_duplicating_items() {
+    let mut pass = trial("a", Arm::Archon, true, 10.0, 1.0);
+    pass.archon_work = Some(vec![routed("direct", Some(ReviewLevel::Standard)); 2]);
+    let mut fail = pass.clone();
+    fail.success = false;
+    fail.wall_secs = 30.0;
+    fail.cost_usd = None;
+    fail.timed_out = true;
+    let mut infra = pass.clone();
+    infra.success = false;
+    infra.error = Some("provider unavailable".into());
+    infra.wall_secs = 999.0;
+    let summary = Summary::build(&[pass, fail, infra], None).unwrap();
+    let pipeline = &summary.pipelines["direct"];
+    assert_eq!(
+        (pipeline.trials, pipeline.successes, pipeline.infra),
+        (2, 1, 1)
+    );
+    assert_eq!(
+        (pipeline.success_rate, pipeline.wall_secs.mean),
+        (0.5, 20.0)
+    );
+    assert_eq!(pipeline.cost_usd.unwrap().n, 1);
+    assert_eq!(pipeline.cost_usd.unwrap().mean, 1.0);
+    assert_eq!(pipeline.timeouts, 1);
+    assert_eq!(summary.reviews["standard"], *pipeline);
+    let md = render_markdown(&summary).unwrap();
+    assert!(md.contains("## Per pipeline") && md.contains("## Per review level"));
+    assert!(md.contains("| direct | 2 | 1/2 (50%) | 20 ± 14 | 1.00 ± 0.00 (n=1)"));
+}
+
+#[test]
+fn routing_distinguishes_unknown_empty_mixed_and_non_archon_trials() {
+    let unknown = trial("a", Arm::Archon, true, 1.0, 1.0);
+    let mut empty = unknown.clone();
+    empty.archon_work = Some(Vec::new());
+    let mut mixed = unknown.clone();
+    let mut item = routed("adaptive", Some(ReviewLevel::Strict));
+    item.run_pipelines = vec!["direct".into(), "adaptive".into()];
+    mixed.archon_work = Some(vec![item, routed("adaptive", None)]);
+    let other = trial("a", Arm::Codex, false, 999.0, 999.0);
+    let summary = Summary::build(&[unknown, empty, mixed, other], None).unwrap();
+    assert_eq!(summary.pipelines.len(), 3);
+    assert_eq!(summary.pipelines["unknown (no capture)"].trials, 1);
+    assert_eq!(summary.pipelines["no work (empty queue)"].trials, 1);
+    assert_eq!(summary.pipelines["mixed: adaptive + direct"].trials, 1);
+    assert_eq!(summary.reviews["mixed: strict + unknown"].trials, 1);
+    assert_eq!(summary.pipelines.values().map(|a| a.trials).sum::<u32>(), 3);
+    assert_eq!(summary.reviews.values().map(|a| a.trials).sum::<u32>(), 3);
+}
+
+#[test]
+fn no_review_is_distinct_from_missing_review_and_metadata_round_trips() {
+    let mut none = trial("a", Arm::Archon, true, 10.0, 1.0);
+    none.archon_work = Some(vec![routed("direct", Some(ReviewLevel::None))]);
+    let mut unknown = none.clone();
+    unknown.archon_work.as_mut().unwrap()[0].review = None;
+    let encoded = serde_json::to_string(&none).unwrap();
+    assert_eq!(serde_json::from_str::<TrialResult>(&encoded).unwrap(), none);
+    let summary = Summary::build(&[none, unknown], None).unwrap();
+    assert_eq!(summary.reviews["none"].trials, 1);
+    assert_eq!(summary.reviews["unknown"].trials, 1);
+    let mut legacy = serde_json::to_value(&summary).unwrap();
+    legacy.as_object_mut().unwrap().remove("pipelines");
+    legacy.as_object_mut().unwrap().remove("reviews");
+    let parsed: Summary = serde_json::from_value(legacy).unwrap();
+    assert!(parsed.pipelines.is_empty() && parsed.reviews.is_empty());
+}
+
+#[test]
+fn old_result_files_hydrate_captures_but_persisted_metadata_wins() {
+    let tmp = scratch();
+    let result = trial("a", Arm::Archon, true, 1.0, 1.0);
+    let path = tmp.path().join("results.jsonl");
+    std::fs::write(&path, serde_json::to_string(&result).unwrap()).unwrap();
+    assert!(read_results(&path).unwrap()[0].archon_work.is_none());
+    let logs = tmp.path().join("trials/a/archon/1/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let capture = logs.join("archon-items.json");
+    std::fs::write(&capture, r#"[{"item":{"pipeline":"direct"},"runs":[]}]"#).unwrap();
+    let loaded = read_results(&path).unwrap();
+    assert_eq!(loaded[0].archon_work, Some(vec![routed("direct", None)]));
+    let summary = write_summary(tmp.path()).unwrap();
+    assert_eq!(summary.reviews["unknown"].trials, 1);
+    std::fs::write(&path, serde_json::to_string(&loaded[0]).unwrap()).unwrap();
+    std::fs::write(&capture, "broken capture").unwrap();
+    assert_eq!(read_results(&path).unwrap(), loaded);
+    std::fs::write(&path, serde_json::to_string(&result).unwrap()).unwrap();
+    let error = read_results(&path).unwrap_err();
+    assert!(format!("{error:#}").contains("archon-items.json"));
+}
+
+#[test]
+fn invalid_routing_and_capture_paths_are_rejected() {
+    let mut invalid = trial("a", Arm::Codex, true, 1.0, 1.0);
+    invalid.archon_work = Some(Vec::new());
+    assert!(Summary::build(&[invalid.clone()], None).is_err());
+    invalid.arm = Arm::Archon;
+    invalid.archon_work = Some(vec![routed(" ", None)]);
+    assert!(Summary::build(&[invalid.clone()], None).is_err());
+    invalid.archon_work = None;
+    invalid.task = "../outside".into();
+    let tmp = scratch();
+    let path = tmp.path().join("results.jsonl");
+    std::fs::write(&path, serde_json::to_string(&invalid).unwrap()).unwrap();
+    assert!(
+        read_results(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid task id")
+    );
 }

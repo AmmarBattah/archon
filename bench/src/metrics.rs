@@ -5,6 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use archon_core::Timestamp;
+use archon_core::autonomy::ReviewLevel;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -92,6 +93,19 @@ pub struct TrialResult {
     /// Grading remarks, such as a result branch left out on a merge conflict.
     #[serde(default)]
     pub note: Option<String>,
+    /// Captured queue work; absent means unknown, an empty list means no work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archon_work: Option<Vec<ArchonItem>>,
+}
+
+/// Routing observed at capture time, without attributing the trial verdict to items.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchonItem {
+    pub pipeline: String,
+    #[serde(default)]
+    pub run_pipelines: Vec<String>,
+    /// Selected review policy, not proof that reviewers ran or passed.
+    pub review: Option<ReviewLevel>,
 }
 
 impl TrialResult {
@@ -167,6 +181,7 @@ pub(crate) mod tests {
             started_at: None,
             finished_at: None,
             note: None,
+            archon_work: None,
         }
     }
 
@@ -198,5 +213,6 @@ pub(crate) mod tests {
         let parsed: TrialResult = serde_json::from_str(line).unwrap();
         assert_eq!(parsed.arm, Arm::Codex);
         assert!(!parsed.timed_out && parsed.cached_input_tokens.is_none());
+        assert!(parsed.archon_work.is_none());
     }
 }

@@ -1,13 +1,14 @@
 //! Aggregation of `results.jsonl` into `summary.md` and the chart-ready
 //! `chart.json`: mean ± sample stdev per metric, success rate and pass@k.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::arms::archon::read_archon_work;
 use crate::metrics::{Arm, RunManifest, TrialResult};
 
 /// Mean and sample standard deviation of `n` values (stdev 0 when n = 1).
@@ -154,6 +155,11 @@ pub struct Summary {
     pub tasks: BTreeMap<String, Vec<Aggregate>>,
     /// Infrastructure failures, left out of every aggregate.
     pub infra: Vec<InfraFailure>,
+    /// Disjoint whole-trial buckets; mixed routing remains one observation.
+    #[serde(default)]
+    pub pipelines: BTreeMap<String, Aggregate>,
+    #[serde(default)]
+    pub reviews: BTreeMap<String, Aggregate>,
 }
 
 /// One trial left out of the aggregates, and why.
@@ -168,6 +174,7 @@ pub struct InfraFailure {
 impl Summary {
     pub fn build(results: &[TrialResult], manifest: Option<RunManifest>) -> anyhow::Result<Self> {
         ensure!(!results.is_empty(), "no trial results to summarize");
+        validate_routing(results)?;
         let mut cells: BTreeMap<(&str, Arm), Vec<&TrialResult>> = BTreeMap::new();
         for r in results {
             cells.entry((r.task.as_str(), r.arm)).or_default().push(r);
@@ -206,8 +213,79 @@ impl Summary {
             arms,
             tasks,
             infra,
+            pipelines: routing_buckets(results, k, false),
+            reviews: routing_buckets(results, k, true),
         })
     }
+}
+
+fn validate_routing(results: &[TrialResult]) -> anyhow::Result<()> {
+    for r in results {
+        let Some(items) = &r.archon_work else {
+            continue;
+        };
+        ensure!(r.arm == Arm::Archon, "{} trial has Archon routing", r.arm);
+        ensure!(
+            items.iter().all(|item| {
+                !item.pipeline.trim().is_empty()
+                    && item.run_pipelines.iter().all(|p| !p.trim().is_empty())
+            }),
+            "{} trial {} has an empty pipeline name",
+            r.task,
+            r.trial
+        );
+    }
+    Ok(())
+}
+
+fn routing_buckets(results: &[TrialResult], k: u32, review: bool) -> BTreeMap<String, Aggregate> {
+    assert!(k > 0, "pass@k needs at least one graded trial");
+    let mut groups: BTreeMap<String, Vec<&TrialResult>> = BTreeMap::new();
+    let archon = results.iter().filter(|r| r.arm == Arm::Archon);
+    for r in archon.clone() {
+        groups.entry(routing_label(r, review)).or_default().push(r);
+    }
+    let buckets: BTreeMap<String, Aggregate> = groups
+        .into_iter()
+        .filter_map(|(label, trials)| Some((label, Aggregate::of(Arm::Archon, &trials, k)?)))
+        .collect();
+    assert_eq!(
+        buckets.values().map(|a| a.trials as usize).sum::<usize>(),
+        archon.filter(|r| !r.is_infra_failure()).count(),
+        "each graded Archon trial belongs to exactly one bucket"
+    );
+    buckets
+}
+
+fn routing_label(result: &TrialResult, review: bool) -> String {
+    assert_eq!(result.arm, Arm::Archon, "only Archon has pipeline routing");
+    let Some(items) = &result.archon_work else {
+        return "unknown (no capture)".into();
+    };
+    if items.is_empty() {
+        return "no work (empty queue)".into();
+    }
+    let mut labels = BTreeSet::new();
+    for item in items {
+        if review {
+            labels.insert(
+                item.review
+                    .map_or_else(|| "unknown".into(), |r| r.to_string()),
+            );
+        } else {
+            labels.insert(item.pipeline.clone());
+            labels.extend(item.run_pipelines.iter().cloned());
+        }
+    }
+    assert!(
+        !labels.is_empty(),
+        "each captured item supplies a routing label"
+    );
+    let labels: Vec<String> = labels.into_iter().collect();
+    if labels.len() == 1 {
+        return labels[0].clone();
+    }
+    format!("mixed: {}", labels.join(" + "))
 }
 
 pub fn read_results(path: &Path) -> anyhow::Result<Vec<TrialResult>> {
@@ -217,10 +295,37 @@ pub fn read_results(path: &Path) -> anyhow::Result<Vec<TrialResult>> {
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
         .map(|(i, line)| {
-            serde_json::from_str(line)
-                .with_context(|| format!("{}:{}: bad result line", path.display(), i + 1))
+            let mut result: TrialResult = serde_json::from_str(line)
+                .with_context(|| format!("{}:{}: bad result line", path.display(), i + 1))?;
+            hydrate_routing(
+                &mut result,
+                path.parent().context("results path has no parent")?,
+            )?;
+            Ok(result)
         })
         .collect()
+}
+
+fn hydrate_routing(result: &mut TrialResult, dir: &Path) -> anyhow::Result<()> {
+    if result.arm != Arm::Archon || result.archon_work.is_some() {
+        return Ok(());
+    }
+    let mut components = Path::new(&result.task).components();
+    ensure!(
+        matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none(),
+        "invalid task id {:?} in results",
+        result.task
+    );
+    ensure!(result.trial > 0, "trial numbers must be positive");
+    let logs = dir
+        .join("trials")
+        .join(&result.task)
+        .join("archon")
+        .join(result.trial.to_string())
+        .join("logs");
+    result.archon_work = read_archon_work(&logs)?;
+    Ok(())
 }
 
 pub fn read_manifest(dir: &Path) -> anyhow::Result<Option<RunManifest>> {
@@ -285,6 +390,8 @@ pub fn render_markdown(summary: &Summary) -> anyhow::Result<String> {
         )?;
     }
     render_task_table(&mut out, summary)?;
+    render_routing_table(&mut out, "Per pipeline", &summary.pipelines)?;
+    render_routing_table(&mut out, "Per review level", &summary.reviews)?;
     render_infra(&mut out, &summary.infra)?;
     out.push_str(METHOD_NOTES);
     Ok(out)
@@ -335,6 +442,40 @@ fn render_manifest(out: &mut String, m: &RunManifest) -> anyhow::Result<()> {
         writeln!(out, "- **Stopped early:** {reason}")?;
     }
     out.push('\n');
+    Ok(())
+}
+
+fn render_routing_table(
+    out: &mut String,
+    title: &str,
+    buckets: &BTreeMap<String, Aggregate>,
+) -> anyhow::Result<()> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "\n## {title}\n\n{ROUTING_NOTES}\n")?;
+    writeln!(
+        out,
+        "| Bucket | Trials | Pass rate | Wall s | Cost $ | Infra | Timeouts |"
+    )?;
+    writeln!(out, "|---|---:|---:|---:|---:|---:|---:|")?;
+    for (label, a) in buckets {
+        assert_eq!(a.arm, Arm::Archon, "routing buckets contain Archon only");
+        assert!(a.successes <= a.trials, "passes cannot exceed trials");
+        writeln!(
+            out,
+            "| {} | {} | {}/{} ({}) | {} | {} | {} | {} |",
+            label.replace('|', "\\|").replace(['\n', '\r'], " "),
+            a.trials,
+            a.successes,
+            a.trials,
+            percent(a.success_rate),
+            stat(&a.wall_secs, 0),
+            opt_stat(a.cost_usd.as_ref(), 2, a.trials),
+            a.infra,
+            a.timeouts
+        )?;
+    }
     Ok(())
 }
 
@@ -402,6 +543,8 @@ fn cell_text(c: &Aggregate) -> String {
 
 /// How much of an infrastructure failure's error `summary.md` quotes.
 const INFRA_ERROR_CHARS: usize = 200;
+
+pub(crate) const ROUTING_NOTES: &str = "Archon whole-trial observations: each trial appears once per table. Mixed buckets retain all selected and attempted pipelines or selected review levels. Pass rate is the trial grader verdict; cost and wall time cover the whole trial, including orchestration. These are not per-item outcomes or causal comparisons. Review levels are captured policy, not proof of completed review; historical policy changes are unavailable. Unknown means missing metadata; no work means a captured empty queue. Infrastructure failures are excluded from metrics.";
 
 fn percent(x: f64) -> String {
     format!("{:.0}%", x * 100.0)

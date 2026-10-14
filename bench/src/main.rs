@@ -19,6 +19,8 @@ use archon_bench::verify;
 use archon_core::model::{Effort, ModelRef};
 use clap::{Args, Parser, Subcommand};
 
+mod smoke_cli;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "archon-bench",
@@ -38,6 +40,8 @@ enum BenchCommand {
     List,
     /// Run trials and write results.jsonl, run.json, summary.md, chart.json and report.html.
     Run(Box<RunArgs>),
+    /// Run the fixed eight-trial quality gate against the stored baseline.
+    Smoke(Box<smoke_cli::SmokeArgs>),
     /// Re-render summary.md, chart.json and report.html from a results directory.
     Report {
         results: PathBuf,
@@ -45,7 +49,7 @@ enum BenchCommand {
         #[arg(long)]
         lavish: bool,
     },
-    /// Check every grader: fails on the untouched fixture, passes with the reference.
+    /// Check graders against untouched, reference and optional naive fixtures.
     Verify {
         /// Task ids; empty checks every task.
         #[arg(long, value_delimiter = ',')]
@@ -143,13 +147,14 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        BenchCommand::Run(args) => run(&cli.tasks, *args).await,
+        BenchCommand::Run(args) => run(&cli.tasks, *args).await.map(|_| ()),
+        BenchCommand::Smoke(args) => smoke_cli::run(&cli.tasks, *args).await,
         BenchCommand::Report { results, lavish } => render(&results, lavish),
         BenchCommand::Verify { only } => verify_all(&cli.tasks, &only).await,
     }
 }
 
-async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<()> {
+async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<Option<PathBuf>> {
     let tasks = BenchTask::select(BenchTask::load_all(tasks_root)?, &args.only)?;
     let protected = Protected::for_run(tasks_root, &args.results_dir)?;
     let work_dir = match &args.work_dir {
@@ -185,10 +190,11 @@ async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<()> {
             "{}",
             plan::render_dry_run(&tasks, &specs, &settings, &options, &versions)?
         );
-        return Ok(());
+        return Ok(None);
     }
     let dir = runner::run(tasks, settings, options).await?;
-    render(&dir, args.lavish)
+    render(&dir, args.lavish)?;
+    Ok(Some(dir))
 }
 
 fn program_of(arm: Arm) -> &'static str {
@@ -291,6 +297,9 @@ async fn verify_all(tasks_root: &Path, only: &[String]) -> anyhow::Result<()> {
             checked.reference.success,
             checked.reference.score
         );
+        if let Some(naive) = &checked.naive {
+            println!("\tnaive: pass={} score={:?}", naive.success, naive.score);
+        }
         if !checked.holds() {
             broken.push(checked.task);
         }

@@ -13,23 +13,25 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use archon_aether::AetherClient;
 use archon_aether::wire::EventQuery;
 use archon_client::ArchonClient;
 use archon_core::aether_ids::AetherAgentId;
+use archon_core::autonomy::ReviewLevel;
 use archon_core::error::ArchonError;
 use archon_core::id::RepoId;
 use archon_core::notify::{FeedEntry, FeedItem};
 use archon_core::protocol::{ClientKind, ItemDetail, ItemQuery, Reply, RepoAdd, Request};
 use archon_core::queue::{QueueItem, QueueState};
 use archon_core::repo::ShipMode;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::arms::aether::{endpoint, fetch_events};
 use crate::arms::{ArmOutcome, TrialInput, archon_config_toml, archon_daemon_command};
 use crate::grade::ResultSource;
-use crate::metrics::Arm;
+use crate::metrics::{ArchonItem, Arm};
 use crate::usage::{Usage, aether_usage};
 use crate::workspace::BASE_BRANCH;
 
@@ -42,6 +44,60 @@ const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 /// Aether agent statuses in which the orchestrator still has work to do.
 const BUSY_STATUSES: &[&str] = &["created", "ready", "running"];
+
+/// Read only captured routing fields so legacy captures never acquire policy defaults.
+pub fn read_archon_work(logs: &Path) -> anyhow::Result<Option<Vec<ArchonItem>>> {
+    let path = logs.join("archon-items.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    parse_archon_work(&text)
+        .map(Some)
+        .with_context(|| format!("parsing {}", path.display()))
+}
+
+fn parse_archon_work(text: &str) -> anyhow::Result<Vec<ArchonItem>> {
+    #[derive(Deserialize)]
+    struct Policy {
+        review: Option<ReviewLevel>,
+    }
+    #[derive(Deserialize)]
+    struct Item {
+        pipeline: String,
+        autonomy: Option<Policy>,
+    }
+    #[derive(Deserialize)]
+    struct Run {
+        pipeline: String,
+    }
+    #[derive(Deserialize)]
+    struct Detail {
+        item: Item,
+        #[serde(default)]
+        runs: Vec<Run>,
+    }
+    let details: Vec<Detail> = serde_json::from_str(text)?;
+    details
+        .into_iter()
+        .map(|detail| {
+            ensure!(
+                !detail.item.pipeline.trim().is_empty(),
+                "empty item pipeline"
+            );
+            ensure!(
+                detail.runs.iter().all(|r| !r.pipeline.trim().is_empty()),
+                "empty run pipeline"
+            );
+            Ok(ArchonItem {
+                pipeline: detail.item.pipeline,
+                run_pipelines: detail.runs.into_iter().map(|r| r.pipeline).collect(),
+                review: detail.item.autonomy.and_then(|p| p.review),
+            })
+        })
+        .collect()
+}
 
 pub async fn run_archon(input: &TrialInput<'_>) -> ArmOutcome {
     let socket = archon_client::default_socket();

@@ -1,5 +1,5 @@
 //! Every bundled grader must fail on the untouched fixture and pass once the
-//! task's reference solution is applied.
+//! task's reference solution is applied; optional naive solutions must fail.
 
 use std::path::Path;
 
@@ -25,9 +25,11 @@ async fn every_grader_fails_untouched_and_passes_with_its_reference() {
     }
     let mut broken: Vec<Verification> = Vec::new();
     let mut checked = 0;
+    let mut naive_checked = 0;
     while let Some(joined) = running.join_next().await {
         let verification = joined.unwrap().unwrap();
         checked += 1;
+        naive_checked += usize::from(verification.naive.is_some());
         if !verification.holds() {
             broken.push(verification);
         }
@@ -39,5 +41,9 @@ async fn every_grader_fails_untouched_and_passes_with_its_reference() {
             kept.display()
         );
     }
-    assert!(checked >= 8, "only {checked} tasks were verified");
+    assert!(checked >= 11, "only {checked} tasks were verified");
+    assert!(
+        naive_checked >= 3,
+        "only {naive_checked} naive fixes were verified"
+    );
 }

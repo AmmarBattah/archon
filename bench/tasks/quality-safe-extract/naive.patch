@@ -1,0 +1,20 @@
+--- a/safe_extract.py
++++ b/safe_extract.py
+@@ -1,5 +1,16 @@
+ """Extract validated regular-file entries. See SPEC.md."""
++
++from pathlib import Path
+ 
+ 
+ def extract(entries, root):
+-    raise NotImplementedError
++    root = Path(root).resolve()
++    names = []
++    for name, data in entries:
++        target = (root / name).resolve()
++        if not str(target).startswith(str(root)):
++            raise ValueError("path escapes root")
++        target.parent.mkdir(parents=True, exist_ok=True)
++        target.write_bytes(data)
++        names.append(name)
++    return names

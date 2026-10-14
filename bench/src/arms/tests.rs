@@ -297,6 +297,56 @@ fn succeeded(repo: &RepoId, branch: &str, minute: i64) -> ItemDetail {
     }
 }
 
+#[test]
+fn captured_items_preserve_routing_without_inventing_legacy_review() {
+    let tmp = crate::workspace::tests::scratch();
+    let path = tmp.path().join("archon-items.json");
+    let detail = succeeded(&RepoId::new(), "result", 1);
+    let mut capture = serde_json::to_value(vec![detail.clone()]).unwrap();
+    std::fs::write(&path, serde_json::to_string(&capture).unwrap()).unwrap();
+    let items = super::archon::read_archon_work(tmp.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(items[0].pipeline, detail.item.pipeline);
+    assert_eq!(items[0].run_pipelines, vec![detail.item.pipeline]);
+    assert_eq!(items[0].review, Some(detail.item.autonomy.review));
+    capture[0]["item"]
+        .as_object_mut()
+        .unwrap()
+        .remove("autonomy");
+    std::fs::write(&path, serde_json::to_string(&capture).unwrap()).unwrap();
+    let items = super::archon::read_archon_work(tmp.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(items[0].review, None);
+}
+
+#[test]
+fn missing_empty_and_malformed_item_captures_stay_distinct() {
+    let tmp = crate::workspace::tests::scratch();
+    let path = tmp.path().join("archon-items.json");
+    assert_eq!(super::archon::read_archon_work(tmp.path()).unwrap(), None);
+    std::fs::write(&path, "[]").unwrap();
+    assert_eq!(
+        super::archon::read_archon_work(tmp.path()).unwrap(),
+        Some(Vec::new())
+    );
+    for bad in [
+        "{}",
+        "null",
+        "not json",
+        r#"[{"item":{"pipeline":""}}]"#,
+        r#"[{"item":{"pipeline":"direct","autonomy":{"review":"typo"}}}]"#,
+        r#"[{"item":{"pipeline":"direct"},"runs":[{"pipeline":" "}]}]"#,
+    ] {
+        std::fs::write(&path, bad).unwrap();
+        assert!(
+            super::archon::read_archon_work(tmp.path()).is_err(),
+            "{bad}"
+        );
+    }
+}
+
 fn feed(seq: u64, entry: FeedEntry) -> FeedItem {
     FeedItem {
         id: FeedItemId::new(),

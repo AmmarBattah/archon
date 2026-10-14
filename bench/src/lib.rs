@@ -9,6 +9,7 @@ pub mod plan;
 pub mod process;
 pub mod report;
 pub mod runner;
+pub mod smoke;
 pub mod summary;
 pub mod task;
 pub mod usage;
