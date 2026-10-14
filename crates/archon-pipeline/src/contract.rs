@@ -409,9 +409,9 @@ const REVIEW_CHECK_RULES: &str = "\
 - Delegate with `wait: false`, then use `wait_for` with `any: true`. On a blocking \
 fail, `cancel_agent` the reviewers still reading before you edit: they share your \
 workspace, and cancelled reviews do not count. Then fix and commit. Replace each \
-cancelled reviewer with a new whole-change read at the new head. Each completed read, \
-even a fail, needs only a delta pass with `base` = the head it read, and the fix at \
-least one; an amend or rebase needs whole-change re-review.\n\
+cancelled reviewer with a new whole-change read at the new head. Completed reads, \
+even fails, need only delta passes from the head they read (one can cover several), \
+and the fix at least one; an amend or rebase needs whole-change re-review.\n\
 - Archon checks a pass against Aether and the branch. Each agent named must be a \
 different one you delegated to yourself that completed with that verdict, and as many \
 as the review asks must have passed the branch head, or an earlier head whose later \
@@ -666,7 +666,7 @@ mod tests {
                 "On a blocking fail, `cancel_agent` the reviewers still reading before you edit",
                 "cancelled reviews do not count. Then fix and commit",
                 "Replace each cancelled reviewer with a new whole-change read at the new head",
-                "Each completed read, even a fail, needs only a delta pass with `base` = the head it read",
+                "Completed reads, even fails, need only delta passes from the head they read (one can cover several)",
                 "and the fix at least one",
                 "an amend or rebase needs whole-change re-review",
                 "a passing reviewer read with `base` at or before it",

@@ -533,8 +533,8 @@ mod tests {
         let fixed = [
             read("agt_fail", false, "c3", None),
             read("agt_pass", true, "c3", None),
-            read("agt_delta_a", true, "c4", Some("c3")),
-            read("agt_delta_b", true, "c4", Some("c3")),
+            read("agt_delta", true, "c4", Some("c3")),
+            read("agt_whole", true, "c4", None),
         ];
         assert_eq!(count(&fixed, "c4", 3).unwrap(), [1, 2, 3]);
         let missing = count(&fixed[..3], "c4", 3).unwrap_err();
