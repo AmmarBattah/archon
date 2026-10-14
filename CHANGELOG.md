@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- A reviewer's verdict that marks an abbreviated commit with a trailing `...`
+  or `…`, such as `"head": "5d240fa..."`, is now accepted. Before, a passing
+  review written that way failed the stage. The id must still name a commit
+  in the run's workspace.
+
 ## 1.2.1
 
 Released 2026-10-15.
