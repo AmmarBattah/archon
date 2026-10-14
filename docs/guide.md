@@ -237,15 +237,18 @@ item. Archon checks that the run belongs to the item and ran that stage, then
 freezes the repository, pipeline, routing context (pipeline revision, review
 level, task class), the stage run, its model and effort, and the delivered
 commit while Archon still keeps it. Only the operator's `archon` command can
-correct; an agent asking through `archon mcp` is refused.
+correct or curate: an agent is refused, through `archon mcp` or any other
+client that forwards its request.
 
 A `quality` correction counts against a model only when one model choice
-plainly produced the stage: a work stage of a finished run that was not
-reshaped, run by one agent on one model, whose last attempt completed and
-whose outcome holds a successful routing sample for it. Anything else, such
-as a fan-out, a model switch mid-stage or a review stage, is recorded as an
-observation, and the receipt says why there is no model penalty. `scope`,
-`infrastructure` and `budget` corrections are informational.
+plainly produced the stage: a stage that ran as a work stage, by the kind
+Archon recorded when it ran, of a finished run that was not reshaped, run by
+one agent on one model, whose last attempt completed and whose outcome holds
+a successful routing sample for it. Anything else, such as a fan-out, a model
+switch mid-stage, a review stage or a stage that ran before Archon recorded
+its kind, is recorded as an observation, and the receipt says why there is
+no model penalty. `scope`, `infrastructure` and `budget` corrections are
+informational.
 
 The corrected run's successful sample of that stage and choice then counts as
 unsuccessful, once, however often the same correction is sent. Only new
@@ -264,14 +267,15 @@ model penalty, and the record stays. A memory the correction forgot stays
 forgotten.
 
 `--forget-memory` forgets that one Aether memory in the Aether instance
-`archond` is connected to, so fresh stage sessions stop recalling it;
+`archond` last connected to, so fresh stage sessions stop recalling it;
 sessions already running keep what they recalled. Archon stores the memory's
 ID and state, never its text, and shows who wrote it as Aether recorded it.
 The correction is recorded first: when Aether is down or the forget fails,
 the command prints "Correction recorded; memory forget pending/failed" and
 exits 1, and `retry-memory` retries only the forget, only in the same
-instance. An `aetherd` older than protocol 15 is refused before anything is
-recorded. `restore-memory` brings back a memory this correction forgot; it
+instance. A forget is refused before anything is recorded when `archond` has
+never connected to Aether or is switching to another instance, and when the
+`aetherd` is older than protocol 15. `restore-memory` brings back a memory this correction forgot; it
 refuses when the memory was already forgotten or superseded before the
 correction, has been restored or forgotten again since, or is superseded now.
 Aether's `/memory` (`u`) restores any memory.

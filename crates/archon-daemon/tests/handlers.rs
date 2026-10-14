@@ -1,8 +1,9 @@
-//! Request handlers: operator-only requests refused to MCP clients, enqueue
+//! Request handlers: operator-only requests refused to agents, enqueue
 //! validation and model policy, item updates and retries, repository checks.
 
 mod common;
 
+use archon_core::aether_ids::AetherAgentId;
 use archon_core::autonomy::{AutonomyPatch, MergeMode};
 use archon_core::config::Config;
 use archon_core::cost::{CostGroup, CostQuery, CostReport, DayBound};
@@ -30,10 +31,9 @@ async fn item_count(h: &Harness) -> usize {
     }
 }
 
-#[tokio::test]
-async fn mcp_clients_are_refused_operator_only_requests() {
-    let h = Harness::new().await;
-    let operator_only = [
+/// A request of each operator-only kind.
+fn operator_only_requests() -> Vec<Request> {
+    vec![
         Request::Shutdown,
         Request::RepoRemove { repo: repo_ref() },
         Request::RepoUpdate {
@@ -60,14 +60,31 @@ async fn mcp_clients_are_refused_operator_only_requests() {
                 operator_users: None,
             },
         },
-    ];
-    for request in operator_only {
+    ]
+}
+
+#[tokio::test]
+async fn agents_are_refused_operator_only_requests_through_any_client() {
+    let h = Harness::new().await;
+    h.orchestrator(Request::Status).await.unwrap();
+    for request in operator_only_requests() {
         assert!(request.is_operator_only(), "{request:?}");
-        let refused = handlers::handle(&h.ctx, ClientKind::ArchonMcp, request)
-            .await
-            .expect_err("refused");
-        assert!(matches!(refused, ArchonError::Forbidden(_)), "{refused:?}");
-        assert_eq!(ErrorReply::from(&refused).code, ErrorCode::Forbidden);
+        let forwarded = Request::ForAgent {
+            caller: AetherAgentId::parse(common::ORCHESTRATOR).unwrap(),
+            request: Box::new(request.clone()),
+        };
+        // An agent's request is refused whichever client carries it.
+        for (client, request) in [
+            (ClientKind::ArchonMcp, request),
+            (ClientKind::ArchonCli, forwarded.clone()),
+            (ClientKind::ArchonBench, forwarded),
+        ] {
+            let refused = handlers::handle(&h.ctx, client, request)
+                .await
+                .expect_err("refused");
+            assert!(matches!(refused, ArchonError::Forbidden(_)), "{refused:?}");
+            assert_eq!(ErrorReply::from(&refused).code, ErrorCode::Forbidden);
+        }
     }
     let repos = handlers::handle(&h.ctx, ClientKind::ArchonMcp, Request::RepoList).await;
     let Ok(Reply::Repos(repos)) = repos else {

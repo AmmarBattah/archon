@@ -2605,8 +2605,9 @@ defined in `archon_core::protocol` and served by `archon-daemon`.
 - `ClientKind` is recorded per connection. The socket's file mode is the
   security boundary. `ClientKind` guards against mistakes, not attacks.
   Every `Request::is_operator_only()` request (`Say`, `Answer`,
-  `RepoUpdate`, a `RepoAdd` with `auto_merge`, a hard pause, ...) is refused
-  for `archon-mcp`. `RecordChatAnswer` is not one of them: it is the
+  `RepoUpdate`, a `RepoAdd` with `auto_merge`, a hard pause, the
+  `archon learning` mutations, ...) is refused for `archon-mcp`, and inside
+  a `ForAgent` from any client. `RecordChatAnswer` is not one of them: it is the
   orchestrator's, checked by caller identity, and cannot answer a gate (§5.2).
 - `ForAgent {caller, request}` carries a tool call `archon mcp` forwards
   for the agent Aether named as making it. `archond` authorizes the caller
@@ -4149,7 +4150,9 @@ remain audit observations and can revoke lesson wins, but without attributed
 quality feedback they do not blame every model. A completed reviewer reporting
 FAIL performed its review; a builder's defect does not penalize that reviewer.
 Infrastructure, timeout, budget, blocked, escalation and shipping failures are
-excluded from model quality samples.
+excluded from model quality samples. Each `StageRun` records the `kind` its stage
+had in the run's frozen pipeline when it was spawned; `archon learning` credits
+a model only for a stage recorded as `work`, never by the current catalog.
 
 **Routing.** Evidence is keyed by repository, pipeline and content revision,
 review level, task class (`task:<class>`, otherwise `general`), stage, and known diff

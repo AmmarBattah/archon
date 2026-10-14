@@ -91,6 +91,7 @@ mod tests {
     fn plan(stage: &str, attempt: u32, fan_index: u32, fan_count: u32) -> SpawnPlan {
         SpawnPlan {
             stage_id: stage.into(),
+            kind: archon_core::catalog::StageKind::Work,
             attempt,
             fan_index,
             fan_count,

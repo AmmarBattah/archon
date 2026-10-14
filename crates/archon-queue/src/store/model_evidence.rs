@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use archon_core::Timestamp;
 use archon_core::cost::DayRange;
 use archon_core::error::ArchonError;
-use archon_core::feedback::{OperatorFeedback, feedback_window};
+use archon_core::feedback::feedback_window;
 use archon_core::id::{FeedbackId, PipelineRunId, RepoId};
 use archon_core::model::ModelChoice;
 use archon_core::model_evidence::{
@@ -20,6 +20,7 @@ use rusqlite::{Connection, params};
 
 use super::codec::{SqlContext, from_json};
 use super::delegated::BENEATH;
+use super::operator_feedback as feedback;
 
 #[derive(Default)]
 struct Samples {
@@ -302,8 +303,11 @@ pub struct RouteQuery<'a> {
 #[derive(Debug, Clone)]
 pub struct CohortEvidence {
     pub routes: Vec<RouteEvidence>,
-    /// Corrections penalizing a choice of this repository cohort now.
+    /// Corrections penalizing a sample this repository cohort reads now.
     pub penalties: Vec<FeedbackId>,
+    /// A correction of this repository cohort penalizes now, its sample
+    /// read or not: the cohort explores no other model.
+    pub corrected: bool,
     /// The cohort has had a credited quality correction: it reads only runs
     /// of the last 90 days, and never pools global evidence.
     pub feedback_history: bool,
@@ -355,7 +359,8 @@ impl super::Store {
     }
 
     /// The cohort's evidence `as_of`. In a repository cohort each active
-    /// quality correction turns the one sample it names unsuccessful.
+    /// quality correction turns the one sample it names unsuccessful; the
+    /// corrections are read by indexed columns, only for the samples read.
     pub fn cohort_evidence(
         &self,
         query: &RouteQuery<'_>,
@@ -366,30 +371,27 @@ impl super::Store {
                 "route needs pipeline and stage".into(),
             ));
         }
-        let corrections = match query.repo {
-            Some(repo) => super::operator_feedback::cohort_corrections(
-                &self.conn,
-                repo,
-                query.pipeline,
-                query.stage,
-                query.context,
-                as_of,
-            )?,
-            None => Vec::new(),
-        };
-        let penalizing: Vec<&OperatorFeedback> =
-            corrections.iter().filter(|f| f.penalizing(as_of)).collect();
-        let masks: HashSet<(&PipelineRunId, &ModelChoice)> = penalizing
-            .iter()
-            .filter_map(|f| f.penalized().map(|(_, choice)| (&f.run, choice)))
-            .collect();
-        let window = (!corrections.is_empty()).then(|| (as_of - feedback_window(), as_of));
+        let history = feedback::has_cohort_feedback(&self.conn, query, as_of)?;
+        let window = history.then(|| (as_of - feedback_window(), as_of));
         let outcomes = self.route_outcomes(query, window)?;
-        let groups = route_samples(&outcomes, query, &masks);
+        let masks = if history {
+            let runs: Vec<&PipelineRunId> = outcomes.iter().map(|o| &o.run).collect();
+            feedback::active_masks(&self.conn, &runs, query.stage, as_of)?
+        } else {
+            Vec::new()
+        };
+        let masked: HashSet<(&PipelineRunId, &ModelChoice)> =
+            masks.iter().map(|m| (&m.run, &m.choice)).collect();
+        let groups = route_samples(&outcomes, query, &masked);
+        assert!(history || masked.is_empty(), "no mask without feedback");
+        let corrected =
+            !masks.is_empty() || (history && feedback::cohort_corrected(&self.conn, query, as_of)?);
+        assert!(history || !corrected, "a correction is feedback history");
         Ok(CohortEvidence {
             routes: finish_routes(groups, query)?,
-            penalties: penalizing.iter().map(|f| f.id.clone()).collect(),
-            feedback_history: window.is_some(),
+            penalties: masks.into_iter().map(|m| m.feedback).collect(),
+            corrected,
+            feedback_history: history,
         })
     }
 }

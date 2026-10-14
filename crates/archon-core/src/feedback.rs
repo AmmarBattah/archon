@@ -144,8 +144,9 @@ pub enum MemoryBefore {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryCuration {
     pub memory: AetherMemoryId,
-    /// The Aether instance the forget is bound to, from its first contact.
-    pub instance_id: Option<String>,
+    /// The Aether instance the forget is bound to when it is recorded, before
+    /// Aether is called; it never changes.
+    pub instance_id: String,
     pub state: CurationState,
     pub before: Option<MemoryBefore>,
     /// Aether's `forgotten_at` from the forget's reply.
@@ -164,8 +165,7 @@ impl MemoryCuration {
             CurationState::Applied => self.forgotten_at.is_some() && self.restored_at.is_none(),
             CurationState::Restored => self.forgotten_at.is_some() && self.restored_at.is_some(),
         };
-        let bound = self.instance_id.as_deref().is_none_or(|id| !id.is_empty());
-        if !consistent || !bound {
+        if !consistent || self.instance_id.is_empty() {
             return Err(ArchonError::Invalid(format!(
                 "memory curation of {} is inconsistent in state {}",
                 self.memory,

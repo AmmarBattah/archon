@@ -108,9 +108,8 @@ fn request(run: &PipelineRun, cause: CorrectionCause, reason: &str) -> Correctio
     }
 }
 
-fn facts(kind: Option<StageKind>, observed_at: Timestamp) -> CorrectionFacts {
+fn facts(observed_at: Timestamp) -> CorrectionFacts {
     CorrectionFacts {
-        stage_kind: kind,
         delivery_commit: Some("abc123".into()),
         aether_instance: None,
         observed_at,
@@ -179,7 +178,7 @@ fn one_quality_correction_moves_the_default_once() {
         "Ignored the identity rule",
     );
     let (first, replayed) = store
-        .record_operator_correction(&wrong, &facts(Some(StageKind::Work), t(100)))
+        .record_operator_correction(&wrong, &facts(t(100)))
         .unwrap();
     assert!(!replayed);
     assert!(
@@ -196,7 +195,7 @@ fn one_quality_correction_moves_the_default_once() {
     );
 
     let (again, replayed) = store
-        .record_operator_correction(&wrong, &facts(Some(StageKind::Work), t(150)))
+        .record_operator_correction(&wrong, &facts(t(150)))
         .unwrap();
     assert!(replayed && again.id == first.id && again.observed_at == first.observed_at);
     let other = request(
@@ -205,7 +204,7 @@ fn one_quality_correction_moves_the_default_once() {
         "Also skipped the tests",
     );
     let (second, _) = store
-        .record_operator_correction(&other, &facts(Some(StageKind::Work), t(110)))
+        .record_operator_correction(&other, &facts(t(110)))
         .unwrap();
     assert_ne!(second.id, first.id);
     assert_eq!(
@@ -220,7 +219,7 @@ fn undoing_every_correction_of_a_sample_restores_the_default_after_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("archon.db");
     let (store, repo, ctx, cheap) = cohort(&path);
-    let work = facts(Some(StageKind::Work), t(100));
+    let work = facts(t(100));
     let mut ids = Vec::new();
     for reason in ["Ignored the identity rule", "Also skipped the tests"] {
         let wrong = request(&cheap[2], CorrectionCause::Quality, reason);
@@ -267,7 +266,7 @@ fn informational_ambiguous_and_foreign_corrections_penalize_no_model() {
     store.insert_repo(&alpha).unwrap();
     let standard = context("standard");
     let cheap = two_choices(&mut store, &alpha, &standard);
-    let work = facts(Some(StageKind::Work), t(100));
+    let work = facts(t(100));
     for cause in [
         CorrectionCause::Scope,
         CorrectionCause::Budget,
@@ -279,10 +278,18 @@ fn informational_ambiguous_and_foreign_corrections_penalize_no_model() {
         assert!(event.penalized().is_none(), "{cause:?} is informational");
     }
     for kind in [Some(StageKind::Review), None] {
-        let reason = format!("{kind:?}");
-        let quality = request(&cheap[1], CorrectionCause::Quality, &reason);
+        let ran_as = |stage| vec![StageRun { kind, ..stage }];
+        let elsewhere = context("strict");
+        let run = shaped_run(
+            &mut store,
+            &alpha,
+            (&model("cheap"), 0.1),
+            &elsewhere,
+            ran_as,
+        );
+        let quality = request(&run, CorrectionCause::Quality, "ran as another kind");
         let (event, _) = store
-            .record_operator_correction(&quality, &facts(kind, t(100)))
+            .record_operator_correction(&quality, &facts(t(100)))
             .unwrap();
         assert!(
             matches!(event.attribution.credit, Credit::Unavailable { .. }),
@@ -318,7 +325,7 @@ fn a_correction_masks_only_its_own_repository_and_review_cohort() {
     two_choices(&mut store, &alpha, &strict);
     two_choices(&mut store, &beta, &standard);
     let quality = request(&cheap[3], CorrectionCause::Quality, "real defect");
-    let work = facts(Some(StageKind::Work), t(100));
+    let work = facts(t(100));
     store.record_operator_correction(&quality, &work).unwrap();
     assert_eq!(
         standing(&store, Some(&alpha), &standard, t(200)).1,
@@ -373,7 +380,7 @@ fn ambiguous_stage_histories_are_recorded_without_credit() {
         ]
     });
     let before = standing(&store, Some(&repo), &ctx, t(200));
-    let work = facts(Some(StageKind::Work), t(100));
+    let work = facts(t(100));
     for (run, expected) in [(&fanned, "several agents"), (&mixed, "more than one model")] {
         let quality = request(run, CorrectionCause::Quality, expected);
         let (event, _) = store.record_operator_correction(&quality, &work).unwrap();
@@ -391,7 +398,7 @@ fn ambiguous_stage_histories_are_recorded_without_credit() {
 }
 
 #[test]
-fn a_cohort_with_typed_feedback_reads_ninety_days_and_disabled_learning_records_nothing() {
+fn a_cohort_with_typed_feedback_reads_ninety_days() {
     let mut store = store();
     let (alpha, beta) = (repo("alpha"), repo("beta"));
     store.insert_repo(&alpha).unwrap();
@@ -401,7 +408,7 @@ fn a_cohort_with_typed_feedback_reads_ninety_days_and_disabled_learning_records_
     two_choices(&mut store, &beta, &ctx);
     let quality = request(&cheap[0], CorrectionCause::Quality, "stale rule");
     let (event, _) = store
-        .record_operator_correction(&quality, &facts(Some(StageKind::Work), t(100)))
+        .record_operator_correction(&quality, &facts(t(100)))
         .unwrap();
     let aged = t(50) + days(91);
     let query = |repo: &Repo, as_of| {
@@ -416,9 +423,16 @@ fn a_cohort_with_typed_feedback_reads_ninety_days_and_disabled_learning_records_
     };
     let fresh = query(&alpha, t(200));
     assert!(fresh.feedback_history && fresh.penalties == vec![event.id.clone()]);
+    assert!(fresh.corrected);
+    let unread = query(&alpha, t(75) + days(90));
+    assert!(unread.routes.is_empty() && unread.penalties.is_empty());
+    assert!(
+        unread.corrected,
+        "its sample aged out first, yet the correction still stops exploration"
+    );
     let old = query(&alpha, aged);
     assert!(old.routes.is_empty(), "every sample is older than 90 days");
-    assert!(old.feedback_history && old.penalties.is_empty());
+    assert!(old.feedback_history && old.penalties.is_empty() && !old.corrected);
     assert!(
         !event.penalizing(t(100) + days(90)),
         "the penalty expired too"
@@ -433,7 +447,12 @@ fn a_cohort_with_typed_feedback_reads_ninety_days_and_disabled_learning_records_
         vec![event],
         "history stays"
     );
+}
 
+#[test]
+fn disabled_learning_records_no_correction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, repo, ctx, cheap) = cohort(&dir.path().join("archon.db"));
     store
         .configure_learning(&LearningConfig {
             enabled: false,
@@ -443,8 +462,38 @@ fn a_cohort_with_typed_feedback_reads_ninety_days_and_disabled_learning_records_
     let refused = request(&cheap[1], CorrectionCause::Quality, "while disabled");
     assert!(
         store
-            .record_operator_correction(&refused, &facts(Some(StageKind::Work), t(300)))
+            .record_operator_correction(&refused, &facts(t(300)))
             .is_err()
     );
     assert!(store.item_feedback(&cheap[1].item).unwrap().is_empty());
+    assert_eq!(standing(&store, Some(&repo), &ctx, t(300)).1, counts(5));
+}
+
+#[test]
+fn routing_reads_a_corrections_columns_never_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archon.db");
+    let (store, repo, ctx, cheap) = cohort(&path);
+    let quality = request(&cheap[1], CorrectionCause::Quality, "stale rule");
+    let (event, _) = store
+        .record_operator_correction(&quality, &facts(t(100)))
+        .unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let blanked = raw
+        .execute(
+            "UPDATE operator_feedback SET data = '{}' WHERE id = ?1",
+            [event.id.as_str()],
+        )
+        .unwrap();
+    assert_eq!(blanked, 1);
+    let query = RouteQuery {
+        repo: Some(&repo.id),
+        pipeline: "direct",
+        stage: "implement",
+        size: None,
+        context: Some(&ctx),
+    };
+    let evidence = store.cohort_evidence(&query, t(200)).unwrap();
+    assert!(evidence.feedback_history && evidence.penalties == vec![event.id]);
+    assert_eq!(standing(&store, Some(&repo), &ctx, t(200)).1, counts(4));
 }

@@ -17,6 +17,7 @@ use archon_core::id::FeedbackId;
 use archon_core::outcome::CorrectionCause::Quality;
 use archon_core::protocol::Request;
 use archon_core::run::PipelineRun;
+use archon_queue::store::keys;
 use common::Harness;
 use feedback_common::*;
 use serde_json::{Value, json};
@@ -34,9 +35,16 @@ async fn fake_aether(h: &Harness) -> FakeAether {
         .unwrap()
 }
 
+/// Links archond to `fake` as its pump does: the instance is recorded first.
 async fn connect(h: &Harness, fake: &FakeAether) {
     let client = AetherClient::connect(&fake.endpoint()).await.unwrap();
+    known_instance(h, &client.welcome().instance_id).await;
     h.ctx.aether.replace(Some(Arc::new(client))).unwrap();
+}
+
+async fn known_instance(h: &Harness, instance: &str) {
+    let mut store = h.ctx.store.lock().await;
+    store.kv_set(keys::AETHER_INSTANCE, instance).unwrap();
 }
 
 /// Serves `records` as Aether does: read by id, forgotten and restored in place.
@@ -114,7 +122,7 @@ async fn a_correction_forgets_exactly_the_named_memory_and_restores_it_apart_fro
     let id = first.view.feedback.id.clone();
     let applied = curation(&first);
     assert_eq!(applied.state, CurationState::Applied);
-    assert_eq!(applied.instance_id.as_deref(), Some("fake-instance-1"));
+    assert_eq!(applied.instance_id, "fake-instance-1");
     assert_eq!(applied.before, Some(MemoryBefore::Current));
     let view = first.view.memory.as_ref().expect("read back from Aether");
     assert_eq!(
@@ -180,37 +188,50 @@ async fn restore_once(h: &Harness, fake: &FakeAether, memories: &Memories, feedb
 }
 
 #[tokio::test]
-async fn a_forget_that_did_not_apply_is_retried_only_in_its_own_instance() {
+async fn a_forget_is_refused_before_anything_is_recorded_while_no_instance_is_known() {
     let h = Harness::new().await;
+    let run = sample(&h, &model("cheap"), 0.2).await;
+    let error = correct(&h, forgetting(&run, STALE)).await.unwrap_err();
+    assert!(matches!(error, ArchonError::Unavailable(_)), "{error:?}");
+    assert!(error.to_string().contains("no Aether instance"), "{error}");
+    assert!(learning_why(&h, &run.item).await.feedback.is_empty());
+    let plain = correct(&h, request(&run, "implement", Quality))
+        .await
+        .unwrap();
+    assert!(plain.view.feedback.curation.is_none());
+}
+
+#[tokio::test]
+async fn a_forget_made_while_aether_is_down_is_retried_only_in_the_last_known_instance() {
+    let h = Harness::new().await;
+    known_instance(&h, "fake-instance-1").await;
     let run = sample(&h, &model("cheap"), 0.2).await;
     let down = correct(&h, forgetting(&run, STALE)).await.unwrap();
     let id = down.view.feedback.id.clone();
     let failed = curation(&down);
     assert_eq!(
-        (failed.state, failed.instance_id.as_ref()),
-        (CurationState::Failed, None)
+        (failed.state, failed.instance_id.as_str()),
+        (CurationState::Failed, "fake-instance-1"),
+        "bound before anything is sent"
     );
     assert!(failed.error.as_ref().unwrap().contains("not connected"));
     assert!(down.view.penalizing, "the model feedback stands");
 
     let fake = fake_aether(&h).await;
     let memories = serve(&fake, vec![fake::memory(STALE, "demo", "stale")]);
-    fake.script("forget_memory", Scripted::Hangup { notice: None });
-    connect(&h, &fake).await;
     let retry = Request::LearningRetryMemory {
         feedback: id.clone(),
     };
+    refused_in_another_instance(&h, &fake, retry.clone()).await;
+    fake.set_instance_id("fake-instance-1");
+    fake.script("forget_memory", Scripted::Hangup { notice: None });
+    connect(&h, &fake).await;
     let lost = receipt(&h, retry.clone()).await.unwrap();
     assert_eq!(curation(&lost).state, CurationState::Failed);
-    assert_eq!(
-        curation(&lost).instance_id.as_deref(),
-        Some("fake-instance-1")
-    );
+    assert_eq!(curation(&lost).instance_id, "fake-instance-1");
     assert_eq!(curation(&lost).before, Some(MemoryBefore::Current));
     memories.lock().unwrap()[0]["forgotten_at"] = json!(FORGOTTEN_AT);
 
-    refused_in_another_instance(&h, &fake, retry.clone()).await;
-    fake.set_instance_id("fake-instance-1");
     connect(&h, &fake).await;
     let applied = receipt(&h, retry).await.unwrap();
     let applied = curation(&applied);

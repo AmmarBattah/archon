@@ -357,7 +357,8 @@ CREATE INDEX lesson_uses_by_run ON lesson_uses (run);
 "#;
 
 /// Version 11: operator corrections of one stage of a finished run. The
-/// columns beside `data` are its frozen attribution, for bounded joins.
+/// columns beside `data` are its frozen attribution, so that routing reads
+/// them through indexes and never the records.
 const V11: &str = r#"
 CREATE TABLE operator_feedback (
     id                 TEXT PRIMARY KEY,
@@ -370,6 +371,9 @@ CREATE TABLE operator_feedback (
     effort             TEXT,
     repo               TEXT,
     pipeline           TEXT NOT NULL,
+    revision           TEXT,
+    review             TEXT,
+    task_class         TEXT,
     cause              TEXT NOT NULL
                        CHECK (cause IN ('quality', 'scope', 'infrastructure', 'budget')),
     reason             TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 1000),
@@ -380,12 +384,17 @@ CREATE TABLE operator_feedback (
     curation           TEXT CHECK (curation IN ('pending', 'applied', 'failed', 'restored')),
     data               TEXT NOT NULL CHECK (json_valid(data)),
     CHECK ((stage_run IS NULL) = (model IS NULL) AND (model IS NULL) = (effort IS NULL)),
-    CHECK ((memory_id IS NULL) = (curation IS NULL))
+    CHECK ((revision IS NULL) = (review IS NULL) AND (review IS NULL) = (task_class IS NULL)),
+    CHECK (stage_run IS NULL OR revision IS NOT NULL),
+    CHECK ((memory_id IS NULL) = (curation IS NULL)
+           AND (memory_id IS NULL) = (aether_instance_id IS NULL))
 );
 CREATE UNIQUE INDEX operator_feedback_unrevoked_request ON operator_feedback (request_key)
     WHERE revoked_at IS NULL;
 CREATE INDEX operator_feedback_by_run ON operator_feedback (run, stage_run);
-CREATE INDEX operator_feedback_by_cohort ON operator_feedback (repo, pipeline, stage, observed_at)
+CREATE INDEX operator_feedback_by_cohort
+    ON operator_feedback
+        (repo, pipeline, stage, revision, review, task_class, observed_at, revoked_at)
     WHERE stage_run IS NOT NULL AND cause = 'quality';
 "#;
 
@@ -860,19 +869,20 @@ mod tests {
     fn insert_feedback(conn: &Connection, id: &str, values: &str) -> rusqlite::Result<()> {
         conn.execute_batch(&format!(
             "INSERT INTO operator_feedback (id, request_key, item, run, stage, stage_run, model,
-                 effort, repo, pipeline, cause, reason, observed_at, revoked_at, memory_id,
-                 curation, data)
+                 effort, repo, pipeline, revision, review, task_class, cause, reason,
+                 observed_at, revoked_at, aether_instance_id, memory_id, curation, data)
              VALUES ('{id}', {values})"
         ))
     }
 
     /// Columns after the id of a valid attributed quality correction.
     const V11_ROW: &str = "'k1', 'qi_new', 'prun_new', 'answer', 'stg_a', 'codex/astra', 'high',
-        'repo_a', 'ask', 'quality', 'wrong file', 't1', NULL, 'mem_a', 'pending', '{}'";
+        'repo_a', 'ask', 'rev', 'strict', 'general', 'quality', 'wrong file', 't1', NULL,
+        'aether-1', 'mem_a', 'pending', '{}'";
 
     /// Rows V11 must refuse, each under its own request key so that only
     /// the named defect can refuse it.
-    fn refused_v11_rows() -> [(&'static str, String); 7] {
+    fn refused_v11_rows() -> [(&'static str, String); 10] {
         [
             ("a replayed unrevoked request", V11_ROW.to_owned()),
             (
@@ -904,6 +914,22 @@ mod tests {
             (
                 "data that is not JSON",
                 V11_ROW.replace("'{}'", "'nope'").replace("'k1'", "'k7'"),
+            ),
+            (
+                "a memory forget bound to no Aether instance",
+                V11_ROW
+                    .replace("'aether-1'", "NULL")
+                    .replace("'k1'", "'k8'"),
+            ),
+            (
+                "a partial routing context",
+                V11_ROW.replace("'strict'", "NULL").replace("'k1'", "'k9'"),
+            ),
+            (
+                "a model credit without its routing context",
+                V11_ROW
+                    .replace("'rev', 'strict', 'general'", "NULL, NULL, NULL")
+                    .replace("'k1'", "'k10'"),
             ),
         ]
     }

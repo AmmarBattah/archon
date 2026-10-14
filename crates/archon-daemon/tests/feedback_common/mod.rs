@@ -4,6 +4,7 @@
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
 use archon_core::Timestamp;
+use archon_core::catalog::StageKind;
 use archon_core::error::ArchonError;
 use archon_core::feedback::{ChoiceStanding, CorrectionRequest, FeedbackReceipt, LearningWhy};
 use archon_core::id::{QueueItemId, StageRunId};
@@ -24,6 +25,18 @@ pub async fn sample(h: &Harness, choice: &ModelChoice, cost: f64) -> PipelineRun
     sample_with(h, &[("implement", choice)], cost, archon_core::now(), None).await
 }
 
+/// One finished run of `implement` alone that ran as `kind`; `None` is a run
+/// recorded before Archon kept the kind each stage ran as.
+pub async fn sample_ran_as(
+    h: &Harness,
+    choice: &ModelChoice,
+    cost: f64,
+    kind: Option<StageKind>,
+) -> PipelineRun {
+    let only = [("implement", choice)];
+    recorded_sample(h, &only, cost, archon_core::now(), None, |_| kind).await
+}
+
 /// One finished run, finished `at`, whose stage runs ran `attempts` in order;
 /// `task` puts its outcome in another task-class cohort.
 pub async fn sample_with(
@@ -32,6 +45,31 @@ pub async fn sample_with(
     cost: f64,
     at: Timestamp,
     task: Option<&str>,
+) -> PipelineRun {
+    recorded_sample(h, attempts, cost, at, task, |stage| {
+        Some(kind_in_pipeline(stage))
+    })
+    .await
+}
+
+/// The kind of `stage` in the harness pipeline.
+pub fn kind_in_pipeline(stage: &str) -> StageKind {
+    match stage {
+        "implement" => StageKind::Work,
+        "review" => StageKind::Review,
+        "ship" => StageKind::Ship,
+        other => panic!("the harness pipeline has no stage {other:?}"),
+    }
+}
+
+/// [`sample_with`], each stage run recording the kind `ran_as` says.
+async fn recorded_sample(
+    h: &Harness,
+    attempts: &[(&str, &ModelChoice)],
+    cost: f64,
+    at: Timestamp,
+    task: Option<&str>,
+    ran_as: impl Fn(&str) -> Option<StageKind>,
 ) -> PipelineRun {
     assert!(!attempts.is_empty(), "a run ran a stage");
     let item = h.enqueue(&format!("sample {}", attempts[0].1.model)).await;
@@ -43,6 +81,7 @@ pub async fn sample_with(
             id: StageRunId::new(),
             run: run.id.clone(),
             stage_id: (*stage).into(),
+            kind: ran_as(stage),
             attempt,
             fan_index: 0,
             choice: (*choice).clone(),

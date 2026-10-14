@@ -287,6 +287,7 @@ mod tests {
             id: StageRunId::new(),
             run: run.id.clone(),
             stage_id: "implement".into(),
+            kind: None,
             attempt,
             fan_index: 0,
             choice: archon_core::model::ModelChoice {

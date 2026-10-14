@@ -217,7 +217,7 @@ fn memory_lines(view: &FeedbackView) -> Vec<String> {
         return Vec::new();
     };
     let id = &view.feedback.id;
-    let instance = curation.instance_id.as_deref().unwrap_or("(none yet)");
+    let instance = &curation.instance_id;
     let mut lines = vec![match curation.state {
         CurationState::Applied => format!(
             "Memory {} forgotten in Aether instance {instance}; applies to fresh stage \
@@ -369,7 +369,7 @@ mod tests {
     fn a_forget_that_did_not_apply_fails_the_command_and_says_so() {
         let failed = MemoryCuration {
             memory: AetherMemoryId::parse("mem_01J00000000000000000000000").unwrap(),
-            instance_id: None,
+            instance_id: "aether-instance-1".into(),
             state: CurationState::Failed,
             before: None,
             forgotten_at: None,

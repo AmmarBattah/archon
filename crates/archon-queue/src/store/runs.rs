@@ -307,13 +307,14 @@ fn check_stage_shape(stage: &StageRun) -> Result<(), ArchonError> {
 fn check_stage_change(stored: &StageRun, next: &StageRun) -> Result<(), ArchonError> {
     let same_identity = stored.run == next.run
         && stored.stage_id == next.stage_id
+        && stored.kind == next.kind
         && stored.attempt == next.attempt
         && stored.fan_index == next.fan_index
         && stored.choice == next.choice
         && stored.started_at == next.started_at;
     if !same_identity {
         return Err(ArchonError::Invalid(format!(
-            "stage run {} cannot change its run, stage, attempt, slot, model or start",
+            "stage run {} cannot change its run, stage, kind, attempt, slot, model or start",
             stored.id
         )));
     }

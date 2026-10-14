@@ -26,7 +26,8 @@ pub(super) fn feedback(
             run.id, run.item, request.item
         )));
     }
-    let (credit, outcome) = credit(store, &run, &request.stage, facts.stage_kind)?;
+    let (credit, outcome) = credit(store, &run, &request.stage)?;
+    let curation = pending_curation(request, facts)?;
     let attribution = Attribution {
         repo: store.item(&request.item)?.repo,
         pipeline: run.pipeline.clone(),
@@ -45,19 +46,37 @@ pub(super) fn feedback(
         attribution,
         observed_at: facts.observed_at,
         revoked_at: None,
-        curation: request.forget_memory.clone().map(|memory| MemoryCuration {
-            memory,
-            instance_id: facts.aether_instance.clone(),
-            state: CurationState::Pending,
-            before: None,
-            forgotten_at: None,
-            restored_at: None,
-            error: None,
-            updated_at: facts.observed_at,
-        }),
+        curation,
     };
     feedback.check()?;
     Ok(feedback)
+}
+
+/// The forget the request asks for, bound to its Aether instance now.
+fn pending_curation(
+    request: &CorrectionRequest,
+    facts: &CorrectionFacts,
+) -> Result<Option<MemoryCuration>, ArchonError> {
+    let Some(memory) = &request.forget_memory else {
+        return Ok(None);
+    };
+    let Some(instance) = facts.aether_instance.as_ref().filter(|id| !id.is_empty()) else {
+        return Err(ArchonError::Invalid(format!(
+            "a forget of memory {memory} needs the Aether instance it is bound to"
+        )));
+    };
+    let curation = MemoryCuration {
+        memory: memory.clone(),
+        instance_id: instance.clone(),
+        state: CurationState::Pending,
+        before: None,
+        forgotten_at: None,
+        restored_at: None,
+        error: None,
+        updated_at: facts.observed_at,
+    };
+    curation.check()?;
+    Ok(Some(curation))
 }
 
 /// The model credit for `stage` of `run`, with the run's outcome.
@@ -65,7 +84,6 @@ fn credit(
     store: &Store,
     run: &PipelineRun,
     stage: &str,
-    kind: Option<StageKind>,
 ) -> Result<(Credit, Option<Outcome>), ArchonError> {
     let mut stages = store.stage_runs(&run.id)?;
     stages.retain(|s| s.stage_id == stage);
@@ -84,7 +102,6 @@ fn credit(
     let evidence = Evidence {
         run,
         stages: &stages,
-        kind,
         reshaped,
         outcome: outcome.as_ref(),
     };
@@ -102,7 +119,6 @@ fn credit(
 struct Evidence<'a> {
     run: &'a PipelineRun,
     stages: &'a [StageRun],
-    kind: Option<StageKind>,
     reshaped: bool,
     outcome: Option<&'a Outcome>,
 }
@@ -118,7 +134,7 @@ fn model_credit<'a>(evidence: &Evidence<'a>) -> Result<&'a StageRun, &'static st
     if evidence.reshaped {
         return Err("the run was reshaped while it ran");
     }
-    if evidence.kind != Some(StageKind::Work) {
+    if recorded_kind(stages)? != StageKind::Work {
         return Err("only a work stage's model is credited");
     }
     let last = stages
@@ -143,6 +159,19 @@ fn model_credit<'a>(evidence: &Evidence<'a>) -> Result<&'a StageRun, &'static st
     }
     sampled(evidence.outcome, last)?;
     Ok(last)
+}
+
+/// The kind every attempt of the stage ran as, recorded when it ran. The
+/// current catalog may have changed the stage since, so it is never asked.
+fn recorded_kind(stages: &[StageRun]) -> Result<StageKind, &'static str> {
+    let first = stages.first().expect("the stage ran in the run");
+    let Some(kind) = first.kind else {
+        return Err("the stage's kind was not recorded when it ran");
+    };
+    if stages.iter().any(|s| s.kind != Some(kind)) {
+        return Err("the stage's attempts ran as different kinds");
+    }
+    Ok(kind)
 }
 
 /// Whether `stage` is a successful routing sample of the run's outcome.

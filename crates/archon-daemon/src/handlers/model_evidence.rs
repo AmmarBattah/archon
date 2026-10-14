@@ -71,7 +71,7 @@ pub(super) async fn report(
     Ok(Reply::ModelEvidence(Box::new(report)))
 }
 
-pub(super) async fn current_spec(
+async fn current_spec(
     ctx: &DaemonContext,
     repo: Option<&RepoId>,
     pipeline: &str,

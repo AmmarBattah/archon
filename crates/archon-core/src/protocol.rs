@@ -346,7 +346,8 @@ pub enum Request {
 }
 
 impl Request {
-    /// Requests the MCP proxy may not forward (operator-only actions).
+    /// Operator-only actions: archond refuses them over MCP and for any
+    /// agent, whichever client forwards them.
     pub fn is_operator_only(&self) -> bool {
         match self {
             Self::Shutdown

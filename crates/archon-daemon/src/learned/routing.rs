@@ -146,14 +146,14 @@ fn select_plan(
             });
         }
         // A cohort under an active operator correction gets no exploration.
-        let exploring = cohort.penalties.is_empty()
-            && item.is_some_and(|id| exploration(id, config.explore_rate));
+        let exploring =
+            !cohort.corrected && item.is_some_and(|id| exploration(id, config.explore_rate));
         let Some((chosen, explored)) = choose(&cohort.routes, exploring) else {
             continue;
         };
         policy.check(&chosen.route.choice)?;
         assert!(chosen.route.passed <= chosen.route.runs);
-        assert!(!explored || cohort.penalties.is_empty());
+        assert!(!explored || !cohort.corrected);
         reasons.insert(
             stage.id.clone(),
             explanation(chosen, explored, &query, &cohort),
@@ -290,6 +290,8 @@ fn explanation(
             "; after operator corrections {} (no exploration)",
             ids.join(", ")
         )
+    } else if cohort.corrected {
+        "; under an active operator correction (no exploration)".to_owned()
     } else if cohort.feedback_history {
         "; runs of the last 90 days (operator feedback history)".to_owned()
     } else {

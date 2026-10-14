@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use archon_aether::AetherClient;
 use archon_aether::memory::MemoryRecord;
-use archon_core::catalog::StageKind;
+use archon_core::aether_ids::AetherMemoryId;
 use archon_core::error::ArchonError;
 use archon_core::feedback::{
     CorrectionRequest, CurationState, FeedbackReceipt, FeedbackView, LearningWhy, MemoryBefore,
@@ -16,11 +16,9 @@ use archon_core::feedback::{
 use archon_core::id::{FeedbackId, QueueItemId, RepoId};
 use archon_core::policy::ModelPolicy;
 use archon_core::protocol::Reply;
-use archon_core::run::PipelineRun;
-use archon_queue::store::{CorrectionFacts, RouteQuery};
+use archon_queue::store::{CorrectionFacts, RouteQuery, keys};
 
 use crate::context::DaemonContext;
-use crate::executor::frozen;
 use crate::resolve::RepoEnv;
 
 pub(super) async fn correct(
@@ -29,7 +27,7 @@ pub(super) async fn correct(
 ) -> Result<Reply, ArchonError> {
     request.check()?;
     let aether_instance = match &request.forget_memory {
-        Some(_) => memory_instance(ctx)?,
+        Some(memory) => Some(memory_instance(ctx, memory).await?),
         None => None,
     };
     let facts = correction_facts(ctx, &request, aether_instance).await?;
@@ -39,6 +37,11 @@ pub(super) async fn correct(
         .await
         .record_operator_correction(&request, &facts)?;
     assert_eq!(feedback.run, request.run, "recorded for the named run");
+    let bound = feedback.curation.as_ref().map(|c| &c.instance_id);
+    assert!(
+        replayed || bound == facts.aether_instance.as_ref(),
+        "a new forget is bound before Aether is called"
+    );
     let feedback = match feedback.curation.as_ref().map(|c| c.state) {
         Some(CurationState::Pending | CurationState::Failed) => forget(ctx, feedback).await?,
         _ => feedback,
@@ -205,10 +208,7 @@ async fn forget(
     let reason = format!("archon {}: {}", feedback.id, feedback.reason);
     let mut next = curation;
     let result = match bound_client(ctx, &next) {
-        Ok(client) => {
-            next.instance_id = Some(client.welcome().instance_id.clone());
-            forget_in(&client, &mut next, &reason).await
-        }
+        Ok(client) => forget_in(&client, &mut next, &reason).await,
         Err(error) => Err(error),
     };
     next.updated_at = archon_core::now();
@@ -265,11 +265,11 @@ fn bound_client(
     ctx: &DaemonContext,
     curation: &MemoryCuration,
 ) -> Result<Arc<AetherClient>, ArchonError> {
+    assert!(!curation.instance_id.is_empty(), "checked when recorded");
     let client = ctx.aether.client()?;
     let connected = &client.welcome().instance_id;
-    if let Some(bound) = &curation.instance_id
-        && bound != connected
-    {
+    let bound = &curation.instance_id;
+    if bound != connected {
         return Err(ArchonError::Invalid(format!(
             "memory {} is curated in Aether instance {bound}, but archond is connected to \
              {connected}; nothing was sent",
@@ -280,57 +280,52 @@ fn bound_client(
     Ok(client)
 }
 
-/// The instance a requested forget binds to: none while Aether is down. One
-/// that cannot curate memories is refused before anything is recorded.
-fn memory_instance(ctx: &DaemonContext) -> Result<Option<String>, ArchonError> {
+/// The instance a requested forget binds to: the one archond last connected
+/// to, which its pump records before using a link. Without one, or with a
+/// connected instance that cannot curate memories, nothing is recorded.
+async fn memory_instance(
+    ctx: &DaemonContext,
+    memory: &AetherMemoryId,
+) -> Result<String, ArchonError> {
+    let known = ctx.store.lock().await.kv_get(keys::AETHER_INSTANCE)?;
+    let Some(instance) = known.filter(|id| !id.is_empty()) else {
+        return Err(ArchonError::Unavailable(format!(
+            "archond has never connected to Aether, so no Aether instance is known to hold \
+             memory {memory}; nothing was recorded"
+        )));
+    };
     let client = match ctx.aether.client() {
         Ok(client) => client,
-        Err(ArchonError::Unavailable(_)) => return Ok(None),
+        Err(ArchonError::Unavailable(_)) => return Ok(instance),
         Err(error) => return Err(error),
     };
+    let connected = &client.welcome().instance_id;
+    if connected != &instance {
+        return Err(ArchonError::Unavailable(format!(
+            "archond is reconnecting from Aether instance {instance} to {connected}; nothing \
+             was recorded, try again"
+        )));
+    }
     client.check_memory_protocol()?;
-    let instance = client.welcome().instance_id.clone();
-    assert!(!instance.is_empty(), "a welcome names its instance");
-    Ok(Some(instance))
+    Ok(instance)
 }
 
+/// The facts the store cannot know: the delivered commit, and the Aether
+/// instance a requested forget is bound to.
 async fn correction_facts(
     ctx: &DaemonContext,
     request: &CorrectionRequest,
     aether_instance: Option<String>,
 ) -> Result<CorrectionFacts, ArchonError> {
-    let (run, repo, delivery_commit) = {
+    let delivery_commit = {
         let store = ctx.store.lock().await;
-        let run = store.run(&request.run)?;
-        let repo = store.item(&run.item)?.repo;
-        let commit = crate::executor::shipped_commit(&store, &run.id)?;
-        (run, repo, commit)
+        crate::executor::shipped_commit(&store, &request.run)?
     };
-    let stage_kind = stage_kind(ctx, &run, repo.as_ref(), &request.stage).await?;
     Ok(CorrectionFacts {
-        stage_kind,
         delivery_commit,
         aether_instance,
         observed_at: archon_core::now(),
     })
-}
-
-/// The stage's kind in the run's frozen pipeline, else the current catalog
-/// once the finished run's snapshot is gone; `None` credits no model.
-async fn stage_kind(
-    ctx: &DaemonContext,
-    run: &PipelineRun,
-    repo: Option<&RepoId>,
-    stage: &str,
-) -> Result<Option<StageKind>, ArchonError> {
-    let spec = match frozen::thaw(ctx, &run.id, &run.pipeline).await {
-        Ok(spec) => Some(spec),
-        Err(error) => {
-            tracing::debug!(run = %run.id, %error, "run snapshot unavailable; using catalog");
-            super::model_evidence::current_spec(ctx, repo, &run.pipeline).await?
-        }
-    };
-    Ok(spec.and_then(|spec| spec.stage(stage).map(|s| s.kind)))
 }
 
 async fn receipt(
