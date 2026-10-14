@@ -2,7 +2,7 @@
 
 use super::{emit, read_map, read_text};
 use crate::cli::InitiativeCommand;
-use crate::connect::{connect, reply_data, unexpected};
+use crate::connect::{connect_or_start, connect_running, reply_data, unexpected};
 use archon_client::ArchonClient;
 use archon_core::error::ArchonError;
 use archon_core::id::{InitiativeId, id_prefix};
@@ -24,16 +24,17 @@ pub async fn run(command: Option<InitiativeCommand>, json: bool) -> anyhow::Resu
 }
 
 /// A connection and the request for `command`; a file it names is read
-/// before archond is started for it.
+/// before archond is started for it, and reading starts nothing.
 async fn prepare(command: InitiativeCommand) -> anyhow::Result<(ArchonClient, Request)> {
     Ok(match command {
-        InitiativeCommand::List => (connect().await?, Request::ListInitiatives),
+        InitiativeCommand::List => (connect_running().await?, Request::ListInitiatives),
         InitiativeCommand::Create { file } => {
             let request = Request::EnqueueInitiative(read_map(&file)?);
-            (connect().await?, request)
+            (connect_or_start().await?, request)
         }
         InitiativeCommand::Show { initiative } => {
-            let (client, initiative) = connect_for(&initiative).await?;
+            let client = connect_running().await?;
+            let initiative = resolve(&client, &initiative).await?;
             (client, Request::GetInitiative { initiative })
         }
         InitiativeCommand::Update {
@@ -68,9 +69,10 @@ fn contract_change(
     })
 }
 
-/// A connection and the initiative `text` names.
+/// A connection, starting archond for a change, and the initiative `text`
+/// names.
 async fn connect_for(text: &str) -> anyhow::Result<(ArchonClient, InitiativeId)> {
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let initiative = resolve(&client, text).await?;
     Ok((client, initiative))
 }

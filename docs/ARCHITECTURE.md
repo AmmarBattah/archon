@@ -78,10 +78,10 @@ Contents:
 
 | Process | What it is | Lifetime |
 | --- | --- | --- |
-| `archond` (`archon daemon run`) | The Archon daemon: store, dispatcher, pipeline engine, Aether link, orchestrator supervisor, feed, lavish plugin. | Long-running; autostarted by any `archon` client. |
+| `archond` (`archon daemon run`) | The Archon daemon: store, dispatcher, pipeline engine, Aether link, orchestrator supervisor, feed, lavish plugin. | Long-running; one per data directory (§9). Autostarted by commands that change something, the TUI, the chat and `archon mcp`, never by a command that only reads. |
 | `archon` | The CLI, a client of `archond`. With no subcommand it opens the terminal UI (`archon tui`, §4.7); `archon chat` is the quiet operator chat (§12). | Per command. |
 | `archon mcp` | Stdio MCP server. Aether spawns it as the `archon` MCP server, and it proxies each tool call to `archond`. | Owned by `aetherd`. |
-| `aetherd` (Archon's own) | In dedicated mode (the default), an unmodified `aether daemon` with its config, store and socket under Archon's directories (§4.7). | Started by any `archon` command that needs `archond`; stopped by `archon daemon stop` (not with `--keep-aether`). |
+| `aetherd` (Archon's own) | In dedicated mode (the default), an unmodified `aether daemon` with its config, store and socket under Archon's directories (§4.7). | Started by any `archon` command that starts `archond`; stopped by `archon daemon stop` (not with `--keep-aether`). |
 | orchestrator | One long-lived root Aether agent (`role = "archon-orchestrator"`). Uses native tools plus `mcp__archon__*`. | Created once and supervised by `archond`. |
 | run node | One passive root Aether agent per pipeline run (`role = "archon-run:<pipeline>"`), never started. Its children are the run's stage agents, so Aether's tree shows one subtree per item. | Created with the run's first stage agent; cancelled when the run finishes. |
 | stage agents | One Aether agent per stage attempt and fan-out slot, a child of its run node. | Created and settled per stage. |
@@ -683,7 +683,8 @@ Not covered: a config that was brought up to date by hand or by an older
 binary's `--resync` while `aetherd` kept running leaves no marker, so
 nothing tells Archon the daemon is stale. `archond` notices the unnamed
 calls (§11) and its notice names the restart: `archon daemon stop`,
-after which any command starts it again.
+after which `archon daemon start`, or any command that starts archond,
+starts it again.
 
 **Shared mode.** `[aether] mode = "shared"` keeps the earlier behaviour.
 Archon uses the operator's `aetherd` (`[aether] socket`/`address`, else
@@ -2546,6 +2547,30 @@ mode the instance's `aether/`), `ARCHON_DATA_DIR` (store `archon.db`,
 (`$XDG_RUNTIME_DIR/archon/archond.sock`; the instance's `aetherd.sock` sits
 beside it).
 
+One `archond` per data directory: before it opens the store, `archond` takes
+an exclusive `flock` on `<data>/data.lock` and writes its pid and socket
+into it, and holds it until it exits (`archon_queue::DataLock`). The socket's
+own lock (`archond.sock.lock`) keeps two daemons off one socket; this one
+keeps two daemons on different sockets off one store, and the one turned
+away names the holder's pid and socket. `Store::open`, used by
+`archon gc --offline`, tests and tools, takes the same lock shared, so such a
+user and `archond` exclude each other; read-only opens take no lock.
+
+The three overrides move together. When some of them point away from their
+defaults and some do not (a private `ARCHON_CONFIG_DIR` and `ARCHON_SOCKET`
+over the default data directory, say), an `archond` started there would
+serve one setup's store under another's name, so nothing starts one
+implicitly: the CLI's and `archon mcp`'s autostart refuse with the variables
+named, `archon gc` does not collect offline, reads add a note, and
+`archon doctor` warns (`archon_core::paths::partial_override`). An explicit
+`archon daemon run`, foreground or `--detach`, still starts and warns.
+
+Commands that only read connect to a running `archond` and never start it or
+Archon's `aetherd`; without one they fail with ``archond is not running
+(start it with `archon daemon start`)``. Commands that change something,
+the TUI and the chat start both as before and say so on stderr, naming the
+data directory and socket (`crates/archon/src/connect.rs`).
+
 Paths in `config.toml` (`[aether] socket`, `[orchestrator]
 instructions_file`, `[worktrees] root`) are resolved when the file is read,
 never against a process's working directory: a leading `~/` expands to the
@@ -3608,7 +3633,7 @@ rubric), and a review task (seeded bug must be reported).
 | A delegating stage agent settles while its children run | The stage's settle: its stored request has `leaf: false`. | `kv.descendant_stop:<stage run>` is written with the settle. No agent of that run is created (next stage or replacement), and archond does not deliver the run (§8.7), until Archon has cancelled the settled agent and Aether holds no agent beneath it in a non-terminal state; the agent is first left to end its own turn, up to 60 s. The cancel is sent once; the check is repeated each dispatcher pass and after a restart. Agents still running 120 s after the cancel are named in one `Blocker` and the run keeps waiting; a refused cancel fails the run with a `Blocker` (§6.3). |
 | Aether names no caller on Archon's tools | An unnamed call that changes Archon reaches `archond`. | One `Blocker` with the fix; such calls are accepted only from an orchestrator that cannot delegate, and new generations start without `delegate`, until the orchestrator makes a named call of any kind (§11). In dedicated mode the registration is repaired and Archon's `aetherd` restarted by the next command (§4.7). |
 | Orchestrator missing (first start) | No `kv.orchestrator_agent`. | Create it (§4.4). |
-| `archon mcp` cannot reach `archond` | Connect error in the proxy. | `connect_or_start` autostarts `archond` (`archon daemon run --detach`, which waits until the daemon listens and fails as soon as it exits). If that fails, return a tool error with the launcher's stderr and the startup log since the last start mark (each detached start appends to `archond.log`, moving it to `archond.log.1` past 16 MiB). |
+| `archon mcp` cannot reach `archond` | Connect error in the proxy. | `connect_or_start` autostarts `archond`, except where the path overrides mix moved and default locations (§9), when it returns that as the error (`archon daemon run --detach`, which waits until the daemon listens and fails as soon as it exits). If that fails, return a tool error with the launcher's stderr and the startup log since the last start mark (each detached start appends to `archond.log`, moving it to `archond.log.1` past 16 MiB). |
 | Stage exceeds deadline | Timer. | `cancel` the agent, mark the stage `timed_out`, and let the driver treat it as a failed verdict or failed work. |
 | A steer is stored but Aether does not take what the live agents are owed | `update_agent`, `interrupt` or `send_message` unanswered, or a crash after the store. | The steps stay in `kv.steer_owed:<stage run>` and every sweep repeats them in order, each message under its own key so it is delivered once. A step Aether refuses is dropped with a progress note; what the steer stored reaches the stage's next agents (§6.6). |
 | `archond` restarts on a steered run | Startup reconcile. | `frozen::thaw` applies the run's `run_edits` to its frozen pipeline and the driver takes its recorded aborts before `RunDriver::resume`, so the run has the stages and decisions the steers left (§6.6). |
@@ -3617,7 +3642,7 @@ rubric), and a review task (seeded bug must be reported).
 | A resumed attempt's final message leaves out the ship record it owes | `ShipRecord::read` of its `structured` as it settles. | The agent is asked once for the record alone (§6.7); a second miss fails the stage, saying what is wrong with the record. |
 | Worktree creation fails | git exit status. | Item `failed` with git's stderr. The feed gets a `Blocker`. |
 | Disk low or full | Free space below `limits.min_free_gb` at a dispatch pass, or a stage or `create_agent` failed with `database or disk is full`, `No space left on device` or `ENOSPC`. | The disk hold (§7.3): no dispatch, and one `Blocker` with the free space, the path and `archon gc`. With `worktrees.auto_gc` on, a worktree gc pass (§13.2) runs before the held dispatch. When `archond` cannot start, `archon gc --offline` collects without it. A stage that failed on a full disk is retried once space is back, without using an infra retry (§6.3); a `create_agent` that keeps failing so fails its run after 5 tries. |
-| Archon's store on a full disk | SQLite `SQLITE_FULL`, mapped to `ArchonError::DiskFull` (`store: disk full: ...`). | Standby: the pump, dispatcher, trigger delivery, pruning and `archond`'s own gc passes stop, since memory may no longer match a store whose write failed. The socket keeps serving reads (`status`, items, repos, pipelines, questions, the feed, reports, the spend report), so `archon status` and `archon gc` work, and refuses everything else with the `DiskFull` error. Staying up also keeps clients that autostart `archond` from restarting it in a loop. Once free space ends the disk hold, `archond` exits cleanly, and the next command starts it, which recovers as after a crash. A store that fails to open on a full disk ends the start with the same error. |
+| Archon's store on a full disk | SQLite `SQLITE_FULL`, mapped to `ArchonError::DiskFull` (`store: disk full: ...`). | Standby: the pump, dispatcher, trigger delivery, pruning and `archond`'s own gc passes stop, since memory may no longer match a store whose write failed. The socket keeps serving reads (`status`, items, repos, pipelines, questions, the feed, reports, the spend report), so `archon status` and `archon gc` work, and refuses everything else with the `DiskFull` error. Staying up also keeps clients that autostart `archond` from restarting it in a loop. Once free space ends the disk hold, `archond` exits cleanly, and the next command that starts it does, which recovers as after a crash. A store that fails to open on a full disk ends the start with the same error. |
 | Budget exhausted | Ledger update. | Daily/total budgets stop dispatching while running agents finish. An exhausted item budget fails its run and cancels its live agents. Post a `Blocker` and a trigger. Aether's own `cost_budget` also stops the agents that carried one. |
 | Model policy violated | §7.4. | Refuse the request, or cancel the agent. `Blocker`. |
 | Pipeline file broken | Catalog load. | Excluded and reported. Queued items naming it fail at dispatch with the parse error. |

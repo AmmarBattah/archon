@@ -232,7 +232,10 @@ Uninstalling the program leaves your data in place. To remove that as well:
 | Data: the queue database, worktrees (by default), logs, reports, the Aether instance's data | `~/.local/share/archon` | `~/Library/Application Support/archon` |
 
 `XDG_CONFIG_HOME` and `XDG_DATA_HOME` move the Linux directories, and
-`ARCHON_CONFIG_DIR` and `ARCHON_DATA_DIR` move them on either system. A
+`ARCHON_CONFIG_DIR` and `ARCHON_DATA_DIR` move them on either system. For a
+second, private setup set both, and `ARCHON_SOCKET` too: where only some of
+the three are set, no command starts archond for you
+([why](guide.md#which-commands-start-archond)). A
 repository's own settings are in its `.archon/` directory. Worktrees hold
 unmerged work: look before you delete the data directory.
 

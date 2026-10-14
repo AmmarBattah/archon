@@ -8,7 +8,7 @@ use archon_core::notify::Question;
 use archon_core::protocol::{Reply, Request};
 
 use super::{emit, to_json};
-use crate::connect::{connect, unexpected};
+use crate::connect::{connect_or_start, connect_running, unexpected};
 use crate::format;
 use crate::ops;
 use crate::questions::{QuestionRef, find_open};
@@ -21,7 +21,7 @@ pub async fn say(words: &[String], json: bool) -> anyhow::Result<ExitCode> {
         )
         .into());
     }
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     ops::say(&client, text).await?;
     emit(
         json,
@@ -42,7 +42,7 @@ pub async fn answer(question: &str, words: &[String], json: bool) -> anyhow::Res
         )
         .into());
     }
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let open = open_questions(&client).await?;
     let Some(found) = find_open(&open, &reference) else {
         return Err(archon_core::ArchonError::InvalidTransition(format!(
@@ -68,7 +68,7 @@ pub async fn answer(question: &str, words: &[String], json: bool) -> anyhow::Res
 }
 
 pub async fn questions(json: bool) -> anyhow::Result<ExitCode> {
-    let client = connect().await?;
+    let client = connect_running().await?;
     let open = open_questions(&client).await?;
     let text = format::questions(&open);
     emit(json, || to_json(&open), &text)?;

@@ -1,5 +1,6 @@
-//! Reaching `archond` from the CLI: autostarting for ordinary commands,
-//! connect-only where starting a daemon would be surprising.
+//! Reaching `archond` from the CLI. A command that only reads connects to
+//! the running daemon and never starts one; a command that changes
+//! something, or opens the chat or the terminal UI, starts it and says so.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -29,16 +30,70 @@ pub fn archon_bin() -> anyhow::Result<PathBuf> {
     Ok(bin)
 }
 
-/// Connect, starting the daemon (and in dedicated mode Archon's own aetherd first)
-/// when nothing listens; after starting that aetherd, wait for archond's link to it.
-pub async fn connect() -> anyhow::Result<ArchonClient> {
-    let fresh_aether = ensure_aether().await?;
+/// What a command that only reads says when no archond answers.
+pub const NOT_RUNNING: &str = "archond is not running (start it with `archon daemon start`)";
+
+/// Connect to the running archond for a command that only reads: it never
+/// starts archond or Aether.
+pub async fn connect_running() -> anyhow::Result<ArchonClient> {
+    match connect_existing().await? {
+        Some(client) => Ok(client),
+        None => Err(ArchonError::Unavailable(not_running_text()).into()),
+    }
+}
+
+/// [`NOT_RUNNING`], and where the config dir, data dir and socket mix moved
+/// and default locations, why `archon daemon start` would refuse too.
+pub fn not_running_text() -> String {
     let socket = archon_client::default_socket();
-    let bin = archon_bin()?;
-    let client = ArchonClient::connect_or_start(&socket, ClientKind::ArchonCli, &bin).await?;
+    match archon_core::paths::partial_override(&socket) {
+        Some(mix) => format!("{NOT_RUNNING}. Note: {mix}"),
+        None => NOT_RUNNING.to_owned(),
+    }
+}
+
+/// Connect for a command that changes something or is interactive, starting
+/// archond (and in dedicated mode Archon's own aetherd first) when nothing
+/// listens; after starting that aetherd, wait for archond's link to it.
+/// Starts nothing where the locations mix moved and default ones.
+pub async fn connect_or_start() -> anyhow::Result<ArchonClient> {
+    let socket = archon_client::default_socket();
+    if let Some(mix) = archon_core::paths::partial_override(&socket) {
+        return match connect_existing().await? {
+            Some(client) => Ok(client),
+            None => Err(ArchonError::Unavailable(format!(
+                "archond is not running, and it is not started for you: {mix}. To start \
+                 this mix on purpose, run `archon daemon run --detach`"
+            ))
+            .into()),
+        };
+    }
+    let fresh_aether = ensure_aether().await?;
+    let client = match connect_existing().await? {
+        Some(client) => client,
+        None => start(&socket).await?,
+    };
     if fresh_aether {
         await_link(&client, LINK_WAIT).await?;
     }
+    Ok(client)
+}
+
+/// Start archond on `socket`, saying so first: the operator learns which
+/// data directory the new daemon owns.
+async fn start(socket: &Path) -> anyhow::Result<ArchonClient> {
+    assert!(
+        archon_core::paths::partial_override(socket).is_none(),
+        "a mix of moved and default locations is never started"
+    );
+    let bin = archon_bin()?;
+    eprintln!(
+        "archon: archond is not running; starting it (data {}, socket {})",
+        archon_core::paths::data_dir().display(),
+        socket.display()
+    );
+    let client = ArchonClient::connect_or_start(socket, ClientKind::ArchonCli, &bin).await?;
+    assert!(client.welcome().pid > 0, "a started archond names its pid");
     Ok(client)
 }
 

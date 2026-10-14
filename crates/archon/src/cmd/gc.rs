@@ -47,6 +47,13 @@ pub async fn run(
 }
 
 async fn collect_offline(older_than: Option<Age>, force: bool) -> anyhow::Result<GcReport> {
+    let socket = archon_client::default_socket();
+    if let Some(mix) = archon_core::paths::partial_override(&socket) {
+        return Err(ArchonError::Unavailable(format!(
+            "archond is not running, and gc does not collect without it here: {mix}"
+        ))
+        .into());
+    }
     let config = Config::load_default()?;
     let paths = DaemonPaths::resolve(&config, archon_bin()?);
     let pass = tokio::task::spawn_blocking(move || {

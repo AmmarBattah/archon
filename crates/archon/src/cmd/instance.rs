@@ -339,7 +339,7 @@ async fn tui_command(mut args: TuiArgs) -> anyhow::Result<Command> {
             args.normal = true;
         }
     }
-    let client = crate::connect::connect().await?;
+    let client = crate::connect::connect_or_start().await?;
     let agent = attach(&client).await.context(
         "attaching to Archon's orchestrator; try `archon tui` again after Aether reconnects",
     )?;

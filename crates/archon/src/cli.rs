@@ -68,10 +68,11 @@ pub enum Command {
     },
     /// List open questions.
     Questions,
-    /// Daemon, orchestrator, caps, spend and Aether link status.
+    /// Daemon, orchestrator, caps, spend and Aether link status. Never
+    /// starts Archon or Aether.
     Status {
-        /// Observe existing daemons without starting Archon or Aether.
-        #[arg(long)]
+        /// Kept for older scripts: `status` never starts anything.
+        #[arg(long, hide = true)]
         no_start: bool,
     },
     /// Spend over a range of days, grouped, with a total.

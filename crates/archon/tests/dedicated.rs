@@ -355,8 +355,9 @@ fn an_upgrade_repairs_the_old_registration_and_restarts_archons_aetherd() {
     let detail = found["detail"].as_str().unwrap();
     assert!(detail.contains("send_caller_meta = true"), "{detail}");
 
-    let status = env.run(&["status"]);
-    let told = String::from_utf8_lossy(&status.stderr);
+    // A write repairs it; a read such as `status` starts and changes nothing.
+    let start = env.run(&["daemon", "start"]);
+    let told = String::from_utf8_lossy(&start.stderr);
     assert!(told.contains("restarting Archon's own aetherd"), "{told}");
     assert!(
         told.contains("goes on once archond has reconnected"),
@@ -367,7 +368,7 @@ fn an_upgrade_repairs_the_old_registration_and_restarts_archons_aetherd() {
     let repaired = std::fs::read_to_string(&config).unwrap();
     assert!(repaired.contains("send_caller_meta = true"), "{repaired}");
     assert_eq!(registration_check(&env)["level"], "ok");
-    let quiet = env.run(&["status"]);
+    let quiet = env.run(&["daemon", "start"]);
     assert!(quiet.stderr.is_empty(), "once: {quiet:?}");
 
     downgrade_registration(&env);
@@ -383,20 +384,21 @@ fn an_upgrade_repairs_the_old_registration_and_restarts_archons_aetherd() {
 }
 
 #[test]
-fn no_start_status_observes_an_outage_without_invoking_aether() {
+fn status_observes_an_outage_without_invoking_aether() {
     let env = Env::new();
     let daemon = env.start_archond();
-    let out = env.run(&["status", "--no-start"]);
+    let out = env.run(&["status"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("aether: disconnected"));
-    let out = env.run(&["--json", "status", "--no-start"]);
+    let out = env.run(&["--json", "status"]);
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(status["aether"]["state"], "disconnected");
     assert!(env.calls().is_empty(), "status must not start Aether");
     env.run(&["daemon", "stop"]);
     common::wait_for_exit(daemon);
-    let out = env.command(&["status", "--no-start"]).output().unwrap();
+    let out = env.command(&["status"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("aether: disconnected"));
+    // Older scripts still pass `--no-start`, which changes nothing now.
     let out = env
         .command(&["--json", "status", "--no-start"])
         .output()

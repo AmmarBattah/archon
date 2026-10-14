@@ -70,7 +70,7 @@ pub async fn run(json: bool) -> anyhow::Result<ExitCode> {
         Ok(client) => aether_ok(client.welcome(), config.aether.mode),
         Err(_) if dedicated && !crate::instance::lifecycle::is_listening(&instance.socket) => {
             let detail = format!(
-                "Archon's aetherd is not running ({}); any archon command starts it",
+                "Archon's aetherd is not running ({}); `archon daemon start` starts it",
                 instance.socket.display()
             );
             check("aether", Level::Warn, detail)
@@ -92,6 +92,7 @@ pub async fn run(json: bool) -> anyhow::Result<ExitCode> {
     }
     checks.push(check_mcp_health(aether.as_ref().ok()).await);
     checks.extend(mcp_tools::check_mcp_tools(aether.as_ref().ok(), config.aether.mode).await);
+    checks.push(check_locations(&archon_client::default_socket()));
     let archond = connect_existing().await;
     checks.push(check_archond(&archond));
     let registry = Registry::read(&archond, config.aether.mode).await;
@@ -536,9 +537,32 @@ fn check_archond(archond: &anyhow::Result<Option<ArchonClient>>) -> Check {
         Ok(None) => check(
             "archond",
             Level::Warn,
-            "not running; any archon command starts it",
+            "not running; `archon daemon start` starts it",
         ),
         Err(e) => check("archond", Level::Fail, e.to_string()),
+    }
+}
+
+/// Whether the config dir, data dir and `socket` all keep their defaults or
+/// all leave them; a mix of the two never starts archond.
+fn check_locations(socket: &Path) -> Check {
+    let locations = archon_core::paths::locations(socket);
+    assert_eq!(locations[2].path, socket, "the socket checked is this one");
+    match archon_core::paths::PartialOverride::among(locations) {
+        Some(mix) => check(
+            "locations",
+            Level::Warn,
+            format!("{mix}; until then no archon command starts archond"),
+        ),
+        None => check(
+            "locations",
+            Level::Ok,
+            format!(
+                "data {}, socket {}",
+                archon_core::paths::data_dir().display(),
+                socket.display()
+            ),
+        ),
     }
 }
 

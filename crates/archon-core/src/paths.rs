@@ -3,21 +3,27 @@
 
 use std::path::{Path, PathBuf};
 
+pub const CONFIG_DIR_VAR: &str = "ARCHON_CONFIG_DIR";
+pub const DATA_DIR_VAR: &str = "ARCHON_DATA_DIR";
+pub const SOCKET_VAR: &str = "ARCHON_SOCKET";
+
 /// `config.toml` and user pipelines (`pipelines/<name>/`).
 pub fn config_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("ARCHON_CONFIG_DIR") {
-        return PathBuf::from(dir);
-    }
+    std::env::var_os(CONFIG_DIR_VAR).map_or_else(default_config_dir, PathBuf::from)
+}
+
+/// SQLite store, worktrees, orchestrator workspace, logs, reports.
+pub fn data_dir() -> PathBuf {
+    std::env::var_os(DATA_DIR_VAR).map_or_else(default_data_dir, PathBuf::from)
+}
+
+fn default_config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("archon")
 }
 
-/// SQLite store, worktrees, orchestrator workspace, logs, reports.
-pub fn data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("ARCHON_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
+fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("archon")
@@ -29,6 +35,14 @@ pub fn store_path() -> PathBuf {
     data_dir().join(STORE_FILE_NAME)
 }
 
+/// The lock archond holds in its data directory for as long as it runs, so
+/// a second daemon never opens the same store (see `archon_queue::DataLock`).
+pub const DATA_LOCK_FILE_NAME: &str = "data.lock";
+
+pub fn data_lock_path_for(data_dir: &Path) -> PathBuf {
+    data_dir.join(DATA_LOCK_FILE_NAME)
+}
+
 pub fn log_dir() -> PathBuf {
     data_dir().join("logs")
 }
@@ -36,13 +50,14 @@ pub fn log_dir() -> PathBuf {
 /// The Archon daemon's Unix socket. Prefers the runtime dir so a reboot
 /// clears it, exactly as Aether does for its own.
 pub fn socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("ARCHON_SOCKET") {
-        return PathBuf::from(path);
+    std::env::var_os(SOCKET_VAR).map_or_else(|| default_socket_in(&data_dir()), PathBuf::from)
+}
+
+fn default_socket_in(data_dir: &Path) -> PathBuf {
+    match dirs::runtime_dir() {
+        Some(runtime) => runtime.join("archon").join("archond.sock"),
+        None => data_dir.join("archond.sock"),
     }
-    if let Some(runtime) = dirs::runtime_dir() {
-        return runtime.join("archon").join("archond.sock");
-    }
-    data_dir().join("archond.sock")
 }
 
 pub fn pid_path_for(socket: &Path) -> PathBuf {
@@ -63,4 +78,215 @@ pub const STARTUP_LOG_MARK: &str = "--- archond starting";
 /// `.archon/pipelines/<name>/`.
 pub fn repo_archon_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".archon")
+}
+
+/// One of Archon's three locations: where it resolves, and where it would
+/// with no `ARCHON_*` variable set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub variable: &'static str,
+    pub path: PathBuf,
+    pub default: PathBuf,
+}
+
+impl Location {
+    /// Compared as absolute paths, without touching the filesystem.
+    pub fn moved(&self) -> bool {
+        match (
+            std::path::absolute(&self.path),
+            std::path::absolute(&self.default),
+        ) {
+            (Ok(path), Ok(default)) => path != default,
+            // No working directory to resolve against: compare as written.
+            _ => self.path != self.default,
+        }
+    }
+}
+
+/// The config directory, the data directory and `socket`, as this process
+/// resolves them. A socket left unset follows a moved data directory where
+/// there is no runtime directory, so it counts as moved with it.
+pub fn locations(socket: &Path) -> [Location; 3] {
+    let default_data = default_data_dir();
+    [
+        Location {
+            variable: CONFIG_DIR_VAR,
+            path: config_dir(),
+            default: default_config_dir(),
+        },
+        Location {
+            variable: DATA_DIR_VAR,
+            path: data_dir(),
+            default: default_data.clone(),
+        },
+        Location {
+            variable: SOCKET_VAR,
+            path: socket.to_owned(),
+            default: default_socket_in(&default_data),
+        },
+    ]
+}
+
+/// Some locations point away from their defaults and some do not, such as a
+/// private config and socket with the default data directory. An archond
+/// started on such a mix would serve one setup's data under another's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialOverride {
+    pub moved: Vec<Location>,
+    pub kept: Vec<Location>,
+}
+
+impl PartialOverride {
+    /// `None` when the locations are all at their defaults or all moved.
+    pub fn among(locations: [Location; 3]) -> Option<Self> {
+        let (moved, kept): (Vec<_>, Vec<_>) = locations.into_iter().partition(Location::moved);
+        assert_eq!(moved.len() + kept.len(), 3, "every location is sorted");
+        if moved.is_empty() || kept.is_empty() {
+            return None;
+        }
+        Some(Self { moved, kept })
+    }
+}
+
+impl std::fmt::Display for PartialOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        assert!(!self.moved.is_empty() && !self.kept.is_empty(), "a mix");
+        let point = if self.moved.len() == 1 {
+            "points"
+        } else {
+            "point"
+        };
+        let are = if self.kept.len() == 1 { "is" } else { "are" };
+        write!(
+            f,
+            "{} {point} away from the default, but {} {are} still the default, so an archond \
+             started here would mix two setups. Set {CONFIG_DIR_VAR}, {DATA_DIR_VAR} and \
+             {SOCKET_VAR} together, or none of them",
+            listed(&self.moved),
+            listed(&self.kept)
+        )
+    }
+}
+
+/// `A (/a)`, `A (/a) and B (/b)`.
+fn listed(locations: &[Location]) -> String {
+    let named: Vec<String> = locations
+        .iter()
+        .map(|l| format!("{} ({})", l.variable, l.path.display()))
+        .collect();
+    match named.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// Whether starting archond on `socket` would mix moved and default
+/// locations; such a start is refused unless the operator runs it directly.
+pub fn partial_override(socket: &Path) -> Option<PartialOverride> {
+    PartialOverride::among(locations(socket))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(variable: &'static str, path: &str, default: &str) -> Location {
+        Location {
+            variable,
+            path: path.into(),
+            default: default.into(),
+        }
+    }
+
+    fn mix(config: &str, data: &str, socket: &str) -> Option<PartialOverride> {
+        PartialOverride::among([
+            at(CONFIG_DIR_VAR, config, "/home/u/.config/archon"),
+            at(DATA_DIR_VAR, data, "/home/u/.local/share/archon"),
+            at(SOCKET_VAR, socket, "/run/user/1/archon/archond.sock"),
+        ])
+    }
+
+    #[test]
+    fn all_default_or_all_moved_is_no_mix() {
+        let defaults = mix(
+            "/home/u/.config/archon",
+            "/home/u/.local/share/archon/",
+            "/run/user/1/archon/./archond.sock",
+        );
+        assert_eq!(defaults, None, "the same places, however written");
+        assert_eq!(mix("/p/config", "/p/data", "/p/archond.sock"), None);
+    }
+
+    #[test]
+    fn a_private_config_and_socket_with_the_default_data_is_a_mix() {
+        let found = mix(
+            "/p/config",
+            "/home/u/.local/share/archon",
+            "/p/archond.sock",
+        )
+        .expect("a mix");
+        let moved: Vec<_> = found.moved.iter().map(|l| l.variable).collect();
+        assert_eq!(moved, [CONFIG_DIR_VAR, SOCKET_VAR]);
+        assert_eq!(found.kept[0].variable, DATA_DIR_VAR);
+        let text = found.to_string();
+        assert!(
+            text.starts_with(
+                "ARCHON_CONFIG_DIR (/p/config) and ARCHON_SOCKET (/p/archond.sock) point away"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("but ARCHON_DATA_DIR (/home/u/.local/share/archon) is still"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn any_one_location_moved_alone_is_a_mix() {
+        let config = mix(
+            "/p/c",
+            "/home/u/.local/share/archon",
+            "/run/user/1/archon/archond.sock",
+        );
+        let data = mix(
+            "/home/u/.config/archon",
+            "/p/d",
+            "/run/user/1/archon/archond.sock",
+        );
+        let socket = mix(
+            "/home/u/.config/archon",
+            "/home/u/.local/share/archon",
+            "/p/s",
+        );
+        for found in [config, data, socket] {
+            let found = found.expect("a mix");
+            assert_eq!((found.moved.len(), found.kept.len()), (1, 2));
+            assert!(found.to_string().contains(" points away"), "{found}");
+            assert!(
+                found.to_string().contains(" are still the default"),
+                "{found}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_socket_follows_the_data_dir_without_a_runtime_dir() {
+        let data = Path::new("/p/data");
+        let socket = default_socket_in(data);
+        match dirs::runtime_dir() {
+            Some(runtime) => assert!(socket.starts_with(runtime), "{}", socket.display()),
+            None => assert_eq!(socket, data.join("archond.sock")),
+        }
+        assert_eq!(
+            data_lock_path_for(data),
+            data.join("data.lock"),
+            "the lock sits beside the store"
+        );
+        assert_ne!(
+            data_lock_path_for(data),
+            default_socket_in(data).with_extension("lock"),
+            "it never is the socket's own lock, even beside it"
+        );
+    }
 }

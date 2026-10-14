@@ -8,7 +8,7 @@ use archon_core::protocol::{Reply, Request};
 
 use super::{emit, to_json};
 use crate::cli::ReportCommand;
-use crate::connect::{connect, unexpected};
+use crate::connect::{connect_or_start, connect_running, unexpected};
 use crate::format;
 
 pub async fn run(command: Option<ReportCommand>, json: bool) -> anyhow::Result<ExitCode> {
@@ -20,7 +20,7 @@ pub async fn run(command: Option<ReportCommand>, json: bool) -> anyhow::Result<E
 }
 
 async fn list(json: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_running().await?;
     let reports = match client.request(Request::ListReports).await? {
         Reply::Reports(reports) => reports,
         other => return Err(unexpected(&other, "reports")),
@@ -32,7 +32,7 @@ async fn reopen(report: &str, json: bool) -> anyhow::Result<()> {
     let report = ReportId::parse(report.trim()).map_err(|e| {
         archon_core::ArchonError::Invalid(format!("{report:?} is not a report id (rpt_…): {e}"))
     })?;
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let published = match client.request(Request::ReopenReport { report }).await? {
         Reply::Report(published) => published,
         other => return Err(unexpected(&other, "report")),

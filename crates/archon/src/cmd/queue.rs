@@ -12,7 +12,7 @@ use archon_core::queue::Caps;
 
 use super::{emit, to_json};
 use crate::cli::QueueCommand;
-use crate::connect::{connect, reply_data, unexpected};
+use crate::connect::{connect_or_start, connect_running, reply_data, unexpected};
 use crate::format;
 use crate::views;
 
@@ -24,7 +24,7 @@ pub async fn run(command: QueueCommand, json: bool) -> anyhow::Result<ExitCode> 
         QueueCommand::List { state, repo, limit } => list(&state, repo, limit, json).await?,
         QueueCommand::Show { item, full } => show(&item, full, json).await?,
         QueueCommand::Cancel { item, reason } => {
-            let client = connect().await?;
+            let client = connect_or_start().await?;
             let item = views::resolve_item(&client, &item).await?;
             let done = format!("Cancelled {item}.");
             change(&client, Request::CancelItem { item, reason }, &done, json).await?;
@@ -65,7 +65,7 @@ async fn list(
         limit,
         ..ItemQuery::default()
     };
-    let client = connect().await?;
+    let client = connect_running().await?;
     if json {
         let rows = views::fetch_summaries(&client, query).await?;
         return emit(true, || to_json(&rows), "");
@@ -75,7 +75,7 @@ async fn list(
 }
 
 async fn show(item: &str, full: bool, json: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_running().await?;
     let item = views::resolve_item(&client, item).await?;
     if json {
         let reply = client.request(Request::GetItem { item }).await?;
@@ -86,7 +86,7 @@ async fn show(item: &str, full: bool, json: bool) -> anyhow::Result<()> {
 }
 
 async fn retry(item: &str, fresh: bool, append: Option<String>, json: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let item = views::resolve_item(&client, item).await?;
     let done = match fresh {
         true => format!("Queued {item} again, fresh from the base branch."),
@@ -117,7 +117,7 @@ async fn change(
 }
 
 /// Show the caps, or change some of them: `SetCaps` takes the full set, so
-/// the current caps are read first.
+/// the current caps are read first. Only a change starts archond.
 async fn caps(
     agents: Option<u32>,
     per_repo: Option<u32>,
@@ -125,9 +125,12 @@ async fn caps(
     total: Option<f64>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let client = connect().await?;
-    let mut caps = views::fetch_status(&client).await?.caps;
     let changed = agents.is_some() || per_repo.is_some() || daily.is_some() || total.is_some();
+    let client = match changed {
+        true => connect_or_start().await?,
+        false => connect_running().await?,
+    };
+    let mut caps = views::fetch_status(&client).await?.caps;
     if changed {
         apply_caps(&mut caps, agents, per_repo, daily, total)?;
         set_caps(&client, &caps).await?;

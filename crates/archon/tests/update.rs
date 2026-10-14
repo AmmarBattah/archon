@@ -249,7 +249,7 @@ fn update_replaces_the_binary_with_the_latest_release() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("archond is not running; the next archon command starts 9.9.9."),
+        stdout.contains("archond is not running; `archon daemon start`, or the next command that needs it, starts 9.9.9."),
         "{stdout}"
     );
     assert!(

@@ -47,6 +47,7 @@ use archon_core::repo::Repo;
 use archon_core::run::{OperatorGate, PipelineRun, StageRun};
 use archon_core::steer::RunEdit;
 
+use crate::data_lock::DataLock;
 use crate::dispatch::DispatchSnapshot;
 
 pub use model_evidence::ModelEvidenceSnapshot;
@@ -110,19 +111,43 @@ pub struct Store {
     learning_config_loaded: std::cell::Cell<bool>,
     learning_models: std::cell::RefCell<Vec<archon_core::model::ModelRef>>,
     learning_models_at: std::cell::Cell<Option<archon_core::Timestamp>>,
+    /// The data directory's lock for an on-disk store opened read-write.
+    /// Declared last, so it is released only after the connection closes.
+    lock: Option<DataLock>,
 }
 
 impl Store {
     /// Opens (creating if needed) the on-disk store and brings its schema up
-    /// to date. Refuses a store written by a newer Archon.
+    /// to date. Refuses a store written by a newer Archon, and one whose
+    /// data directory an archond owns: this holds its lock shared, so any
+    /// number of these may share a store, but no archond starts meanwhile.
     pub fn open(path: &Path) -> Result<Self, ArchonError> {
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| ArchonError::io(format!("create {}", dir.display()), e))?;
-        }
+        let dir = store_dir(path);
+        std::fs::create_dir_all(dir)
+            .map_err(|e| ArchonError::io(format!("create {}", dir.display()), e))?;
+        let lock = DataLock::share(dir)?;
+        Self::open_locked(path, lock)
+    }
+
+    /// Opens archond's store under its exclusive [`DataLock`] on the
+    /// store's directory, which the store then holds for as long as it is
+    /// open: no other process opens it read-write meanwhile.
+    pub fn open_owned(path: &Path, lock: DataLock) -> Result<Self, ArchonError> {
+        assert!(lock.is_exclusive(), "archond opens its store exclusively");
+        assert_eq!(
+            store_dir(path),
+            lock.data_dir(),
+            "the lock is on the store's own directory"
+        );
+        Self::open_locked(path, lock)
+    }
+
+    fn open_locked(path: &Path, lock: DataLock) -> Result<Self, ArchonError> {
         let conn = rusqlite::Connection::open(path)
             .map_err(|e| codec::store_error(&format!("open {}", path.display()), &e))?;
-        Self::init(conn, true)
+        let mut store = Self::init(conn, true)?;
+        store.lock = Some(lock);
+        Ok(store)
     }
 
     /// Opens the on-disk store read-only, as `archon gc --offline` reads it
@@ -154,6 +179,7 @@ impl Store {
             learning_config_loaded: Default::default(),
             learning_models: Default::default(),
             learning_models_at: Default::default(),
+            lock: None,
         })
     }
 
@@ -173,6 +199,7 @@ impl Store {
             learning_config_loaded: Default::default(),
             learning_models: Default::default(),
             learning_models_at: Default::default(),
+            lock: None,
         })
     }
 
@@ -610,6 +637,13 @@ impl Store {
     }
 }
 
+/// The directory holding the store file, whose lock guards it.
+fn store_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +678,26 @@ mod tests {
             .unwrap();
         let refused = Store::open_read_only(&path).unwrap_err().to_string();
         assert!(refused.contains("schema version"), "{refused}");
+    }
+
+    #[test]
+    fn archond_and_other_writers_never_share_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().canonicalize().unwrap();
+        let path = data.join("archon.db");
+        let socket = Path::new("/run/a/archond.sock");
+        let tool = Store::open(&path).unwrap();
+        let held = DataLock::acquire(&data, socket).unwrap_err().to_string();
+        assert!(held.contains("open without archond"), "{held}");
+        drop(tool);
+
+        let daemon = Store::open_owned(&path, DataLock::acquire(&data, socket).unwrap()).unwrap();
+        let refused = Store::open(&path).unwrap_err().to_string();
+        assert!(refused.contains("owns the data directory"), "{refused}");
+        let second = DataLock::acquire(&data, Path::new("/run/b/archond.sock"));
+        assert!(second.is_err(), "the store keeps archond's lock while open");
+        drop(daemon);
+        Store::open(&path).expect("free once archond's store is closed");
     }
 
     #[test]

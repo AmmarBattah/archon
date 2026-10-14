@@ -7,14 +7,14 @@ use archon_core::steer::{InsertStage, Steer, Then};
 
 use crate::cli::{AfterAbort, QueueSteerArgs};
 use crate::cmd::emit;
-use crate::connect::{connect, reply_data, unexpected};
+use crate::connect::{connect_or_start, reply_data, unexpected};
 use crate::views;
 
 pub async fn run(args: QueueSteerArgs, json: bool) -> anyhow::Result<()> {
     let name = args.item.clone();
     let steer = steer_of(args);
     steer.check()?;
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let item = views::resolve_item(&client, &name).await?;
     let request = Request::SteerItem {
         item: item.clone(),

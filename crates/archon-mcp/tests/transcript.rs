@@ -376,8 +376,12 @@ async fn an_unreachable_daemon_is_a_tool_error_and_the_next_call_reconnects() {
     let down = mcp.call(1, "list_repos", json!({})).await;
     assert_eq!(down["isError"], true);
     let message = text(&down);
+    // Not started either way: the binary is missing, or this process's
+    // default dirs beside a temp socket are a mix that is never started.
+    let not_started = ["could not be started", "it is not started for you"];
     assert!(
-        message.contains("daemon is unavailable") && message.contains("could not be started"),
+        message.contains("daemon is unavailable")
+            && not_started.iter().any(|t| message.contains(t)),
         "{message}"
     );
     assert!(message.contains("archon daemon start"), "{message}");

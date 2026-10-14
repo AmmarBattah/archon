@@ -16,7 +16,7 @@ use archon_daemon::DaemonOptions;
 
 use super::{emit, instance};
 use crate::cli::DaemonCommand;
-use crate::connect::{archon_bin, connect, connect_existing};
+use crate::connect::{archon_bin, connect_existing, connect_or_start};
 use crate::instance::{Instance, create_private_dir, effective_aether};
 
 const STOP_WAIT: Duration = Duration::from_secs(10);
@@ -34,7 +34,7 @@ pub async fn run(command: DaemonCommand, json: bool) -> anyhow::Result<ExitCode>
         DaemonCommand::Run { detach: false } => foreground().await,
         DaemonCommand::Run { detach: true } => detach(json).await,
         DaemonCommand::Start => {
-            let client = connect().await?;
+            let client = connect_or_start().await?;
             report_running(&client, json)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -73,6 +73,7 @@ async fn status(json: bool) -> anyhow::Result<ExitCode> {
 }
 
 async fn foreground() -> anyhow::Result<ExitCode> {
+    warn_if_mixed();
     let mut config = Config::load_default()?;
     // Dedicated mode: archond talks only to Archon's own aetherd.
     config.aether = effective_aether(&config.aether, &Instance::resolve()?);
@@ -84,9 +85,18 @@ async fn foreground() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// A daemon run directly is the operator's choice even where the locations
+/// mix moved and default ones, which autostart refuses; it is still said.
+fn warn_if_mixed() {
+    if let Some(mix) = archon_core::paths::partial_override(&archon_client::default_socket()) {
+        eprintln!("archon: warning: {mix}. Starting archond anyway, as it was asked for directly.");
+    }
+}
+
 /// Start `archon daemon run` in its own process group, appending to the startup log
 /// beside the socket, and wait until it listens; fail as soon as it exits first.
 async fn detach(json: bool) -> anyhow::Result<ExitCode> {
+    warn_if_mixed();
     let socket = archon_client::default_socket();
     let socket =
         std::path::absolute(&socket).with_context(|| format!("resolving {}", socket.display()))?;

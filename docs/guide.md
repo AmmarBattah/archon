@@ -519,7 +519,9 @@ Known limitations:
   orchestrator created since starts an empty transcript. `archon questions`
   always lists every open question.
 
-`archon` starts Archon's `aetherd` and `archond` when they are not running.
+`archon` starts Archon's `aetherd` and `archond` when they are not running,
+as any command that changes something does; a command that only reads never
+starts either ([which commands start archond](#which-commands-start-archond)).
 `archon aether <args…>` runs any `aether` command against Archon's instance,
 for example `archon aether agents`. `archon daemon stop` stops both
 daemons (`--keep-aether` stops only archond). In the TUI's tree each work item is one subtree: a node named after
@@ -600,11 +602,11 @@ report and exit status. Successful JSON output keeps its existing shape. For
 `log --follow --json`, a failure envelope is the final JSON line after any
 feed entries already emitted.
 
-`archon status --no-start` observes the existing archond without starting
-Archon or Aether, including in dedicated mode. A running archond reports
+`archon status` observes the existing archond without starting Archon or
+Aether, including in dedicated mode. A running archond reports
 `aether: disconnected` during an Aether outage. If archond is also down,
 the command returns an `unavailable` error (exit 1): its Aether link cannot
-be observed. Ordinary `archon status` retains autostart behavior.
+be observed. `--no-start` is still accepted, and changes nothing.
 
 Queue detail and list views put `awaiting approval` first when the current
 run needs a proposal/report decision or a blocking Aether question, with
@@ -647,6 +649,43 @@ Terminal and modern VTE), chat reports show an `open report` hyperlink. Its
 target contains the full URL or encoded absolute file path. Pipes, unknown
 or dumb terminals, and `NO_COLOR` use the full location as plain text;
 `archon reports` and JSON retain the full location in all cases.
+
+### Which commands start archond
+
+A command that only reads never starts `archond` or Archon's `aetherd`. With
+no daemon running it prints ``archond is not running (start it with
+`archon daemon start`)`` and exits 1 (`unavailable` under `--json`). These
+are `status`, `questions`, `log`, `cost`, `model-evidence`, `queue list`,
+`queue show`, `queue wait`, `queue caps` without a change, `repo list`,
+`initiatives` and `initiatives show`, `autonomy` without a change,
+`github-watcher` without a change, `orchestrator status` and `reports`.
+`lessons`, `pipelines` and `doctor` read their files directly instead.
+
+A command that changes something (`say`, `answer`, `queue add`, `cancel`,
+`retry` and `steer`, `repo add`, `pause`, `lessons accept` and the other
+lesson changes, `reports reopen`, `orchestrator restart`, …), the TUI, the
+line chat and `archon daemon start` start archond when it is not running,
+and in dedicated mode Archon's `aetherd` first. They say so on stderr, with
+the data directory and socket the new archond owns. `archon mcp` starts
+archond for Aether's agents in the same way.
+
+Archon keeps its files in three places: the config directory, the data
+directory and archond's socket. `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR` and
+`ARCHON_SOCKET` move them, and a private or test setup must set all three.
+Where only some of them are set, a command could start an archond that
+serves the default store under a private name, so nothing starts archond:
+commands that would start it fail and say which variables are set, reads add
+the same note, and `archon doctor` warns. `archon daemon run` (foreground or
+`--detach`) still starts archond, as it is asked for directly, and prints the
+same warning.
+
+One archond owns a data directory. It holds a lock on `<data>/data.lock`,
+which records its pid and socket, from before it opens the store until it
+exits. A second archond started on the same data directory, under any
+socket, exits with an error that names the first one's pid and socket.
+`archon gc --offline` and other tools that open the store hold that lock
+shared: they are refused while archond runs, and archond does not start
+while they hold it.
 
 ### Steering an item
 

@@ -59,6 +59,8 @@ pub struct DaemonOptions {
 /// the server and every worker; it serves while Aether is down and in standby.
 pub async fn run(options: DaemonOptions) -> Result<(), ArchonError> {
     let endpoint = Endpoint::from_config(&options.config.aether)?;
+    // Holds the data directory's lock from before the store opens until the
+    // store is dropped with the context, after the socket is gone.
     let ctx = build_context(options)?;
     let ctx = Arc::new(ctx);
     // Bound under the daemon lock before recovery, so a second daemon never
@@ -237,11 +239,7 @@ fn build_context(options: DaemonOptions) -> Result<DaemonContext, ArchonError> {
         std::fs::create_dir_all(dir)
             .map_err(|e| ArchonError::io(format!("creating {}", dir.display()), e))?;
     }
-    let mut store = Store::open(&paths.store)?;
-    store.configure_learning(&config.learning)?;
-    if !config.learning.enabled {
-        store.cancel_queued_distillations()?;
-    }
+    let store = open_store(&paths, &config)?;
     let lavish = Lavish::detect(&config.lavish)?;
     let aether = Arc::new(AetherLink::new());
     let backend = Arc::new(AetherBackend::new(aether.clone(), config.models.policy()));
@@ -274,6 +272,28 @@ fn build_context(options: DaemonOptions) -> Result<DaemonContext, ArchonError> {
         collecting: gc::Collecting::new(dispatch),
     };
     Ok(ctx)
+}
+
+/// The store, under the data directory's exclusive lock taken first and
+/// held as long as the store: a second daemon on this data dir stops here,
+/// before it reads or migrates anything.
+fn open_store(paths: &DaemonPaths, config: &Config) -> Result<Store, ArchonError> {
+    assert!(
+        paths.data_dir.is_dir(),
+        "the data directory is created first"
+    );
+    assert_eq!(
+        paths.store.parent(),
+        Some(paths.data_dir.as_path()),
+        "the store lives in the data directory its lock guards"
+    );
+    let lock = archon_queue::DataLock::acquire(&paths.data_dir, &paths.socket)?;
+    let mut store = Store::open_owned(&paths.store, lock)?;
+    store.configure_learning(&config.learning)?;
+    if !config.learning.enabled {
+        store.cancel_queued_distillations()?;
+    }
+    Ok(store)
 }
 
 /// Relative paths (e.g. from `ARCHON_DATA_DIR=.`) resolve against the

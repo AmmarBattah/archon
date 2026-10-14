@@ -229,7 +229,10 @@ Each has a `summary.md` with Archon's overhead per task.
 
 Point the harness at a sandbox Aether daemon, never the one you work with
 (see [Live tests](../CONTRIBUTING.md#live-tests)), whose environment has the
-same `ARCHON_SOCKET`. Put the sandbox's `archon` binary,
+same `ARCHON_SOCKET`. That environment sets only `ARCHON_SOCKET`, so the
+orchestrator's `archon mcp` proxy connects to the bench's archond but never
+starts one: one started there would serve the default data directory. Put
+the sandbox's `archon` binary,
 built from this checkout, first on `PATH`. Then run:
 
 ```sh

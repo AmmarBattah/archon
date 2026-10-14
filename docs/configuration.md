@@ -2,7 +2,9 @@
 
 `~/.config/archon/config.toml` on Linux (or `$XDG_CONFIG_HOME/archon/config.toml`),
 `~/Library/Application Support/archon/config.toml` on macOS.
-`ARCHON_CONFIG_DIR` overrides the directory on either platform. Every field
+`ARCHON_CONFIG_DIR` overrides the directory on either platform; set it
+together with `ARCHON_DATA_DIR` and `ARCHON_SOCKET`
+([why](guide.md#which-commands-start-archond)). Every field
 is optional, and so is the file: `archon setup` writes one with every key
 commented out when there is none. Unknown keys are an error, so a typo
 cannot silently disable a limit. Only `config.toml` is read. An

@@ -13,7 +13,7 @@ use archon_core::protocol::{Reply, Request};
 
 use super::to_json;
 use crate::cli::LogKind;
-use crate::connect::{connect, unexpected};
+use crate::connect::{connect_running, unexpected};
 use crate::render::{QuestionLabels, Renderer};
 use crate::style::{Palette, terminal_width};
 use crate::views;
@@ -141,7 +141,7 @@ pub async fn log(
     if limit == 0 {
         return Err(archon_core::ArchonError::Invalid("--limit must be at least 1".into()).into());
     }
-    let client = connect().await?;
+    let client = connect_running().await?;
     let mut filter = match item {
         Some(text) => {
             let item = views::resolve_item(&client, text).await?;

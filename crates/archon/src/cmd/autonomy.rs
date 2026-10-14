@@ -8,7 +8,7 @@ use archon_core::protocol::{Reply, RepoRef, Request};
 
 use super::{emit, to_json};
 use crate::cli::{AutonomyArgs, AutonomyCommand};
-use crate::connect::{connect, unexpected};
+use crate::connect::{connect_or_start, connect_running, unexpected};
 use crate::format;
 
 pub async fn run(args: AutonomyArgs, json: bool) -> anyhow::Result<ExitCode> {
@@ -30,7 +30,7 @@ pub async fn run(args: AutonomyArgs, json: bool) -> anyhow::Result<ExitCode> {
 }
 
 async fn show(repo: Option<String>, json: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_running().await?;
     let request = Request::Autonomy {
         repo: repo.map(RepoRef),
     };
@@ -42,7 +42,7 @@ async fn show(repo: Option<String>, json: bool) -> anyhow::Result<()> {
 }
 
 async fn direct(text: &str, hours: Option<u32>, json: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let request = Request::SetDirective {
         text: text.to_owned(),
         expires_in_hours: hours,
@@ -56,7 +56,7 @@ async fn direct(text: &str, hours: Option<u32>, json: bool) -> anyhow::Result<()
 }
 
 async fn clear(directive: Option<DirectiveId>, json: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let request = Request::ClearDirective {
         directive: directive.clone(),
     };
