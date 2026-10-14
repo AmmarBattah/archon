@@ -16,13 +16,16 @@ task failing.
 
 - From 1.0.x: follow "Upgrading" under 1.1.0. Its store migration is
   one-way, so back up `archon.db` first.
-- From a 1.1.0 build: `archon daemon stop`, `archon update`, then `archon
-  orchestrator restart` so the orchestrator gets the new prompt.
+- From a 1.1.0 build: `archon daemon stop`, update the binary, then
+  `archon orchestrator restart`, which starts the new `archond` and gives the
+  orchestrator the new prompt. An installed binary updates with `archon
+  update`; one built with Cargo is rebuilt from the v1.2.0 source.
 - A command that only reads, such as `archon status`, now exits 1 when
   `archond` is not running: start it with `archon daemon start`.
-- Set `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR` and `ARCHON_SOCKET` all
-  together or none of them. With only some set, a command that would start
-  `archond` fails and names them.
+- Keep the config directory, data directory and socket all at their
+  defaults or all elsewhere. A command that would start `archond` over a
+  mix fails, even when all three variables are set; symlinks and `..` are
+  resolved first. `archon daemon run` still starts, with a warning.
 
 ### Fixes
 
@@ -43,10 +46,10 @@ task failing.
   stderr with the data directory and socket. `archon mcp` no longer starts
   `archond` for a read-only tool call either. The guide lists the rule under
   "Which commands start archond".
-- Where `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR` and `ARCHON_SOCKET` are only
-  partly set, such as a private config and socket over the default data
-  directory, no command starts `archond` any more: one started there would
-  serve the default store under the private socket. Such commands fail and
+- Where the config directory, data directory and socket mix default and
+  other locations, such as a private config and socket over the default
+  data directory, no command starts `archond` automatically any more: one
+  started there would serve the default store under the private socket. Such commands fail and
   name the variables, reads add the same note, `archon mcp` does not
   autostart, `archon gc` does not collect offline, and `archon doctor` warns
   in a new `locations` check. `archon daemon run` still starts, with a
