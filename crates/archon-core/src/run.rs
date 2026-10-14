@@ -125,6 +125,8 @@ pub struct StageRun {
     pub model_segments: Vec<ModelSegment>,
     #[serde(default)]
     pub infrastructure_failure: bool,
+    #[serde(default)]
+    pub host_context: crate::config::HostContext,
     /// Aether identifiers, present once Aether acknowledged creation.
     pub aether_agent: Option<AetherAgentId>,
     pub aether_task: Option<AetherTaskId>,
@@ -459,6 +461,7 @@ mod tests {
             fan_index: 0,
             model_segments: Vec::new(),
             infrastructure_failure: false,
+            host_context: Default::default(),
             choice: ModelChoice {
                 model: "claude-code/opus".parse().unwrap(),
                 effort: crate::model::Effort::Low,

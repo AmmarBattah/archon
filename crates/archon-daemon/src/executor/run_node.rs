@@ -350,9 +350,13 @@ async fn create_generation(
     model: &ModelRef,
     network: NetworkPolicy,
 ) -> Result<Created, ArchonError> {
+    let host_context = ctx
+        .backend
+        .host_context(ctx.config.aether.host_context)
+        .await?;
     let claim = {
         let mut store = ctx.store.lock().await;
-        claim_generation(&mut store, run, observed, model, network)?
+        claim_generation(&mut store, run, observed, model, network, host_context)?
     };
     let (generation, request) = match claim {
         Claim::Agent(node) => return Ok(Created::Agent(node)),
@@ -387,6 +391,7 @@ fn claim_generation(
     observed: &StoredNode,
     model: &ModelRef,
     network: NetworkPolicy,
+    host_context: archon_core::config::HostContext,
 ) -> Result<Claim, ArchonError> {
     let current = load_node(store, run)?;
     let moved = current != *observed;
@@ -402,7 +407,8 @@ fn claim_generation(
         }
         (None, None) => current.generation,
     };
-    let request = request(store, run, generation, model, network)?;
+    let mut request = request(store, run, generation, model, network)?;
+    request.host_context = host_context;
     let pending = StoredNode {
         agent: None,
         generation,
@@ -516,6 +522,7 @@ fn request(
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
     Ok(RunNodeRequest {
+        host_context: Default::default(),
         idempotency_key: idempotency_key(run_id, generation),
         role: format!("archon-run:{}", run.pipeline),
         name,
@@ -712,6 +719,7 @@ mod tests {
 
     fn request_for(run: &PipelineRunId, generation: u32) -> RunNodeRequest {
         RunNodeRequest {
+            host_context: Default::default(),
             idempotency_key: idempotency_key(run, generation),
             role: "archon-run:p".into(),
             name: "n".into(),
@@ -753,6 +761,7 @@ mod tests {
             fan_index: 0,
             model_segments: Vec::new(),
             infrastructure_failure: false,
+            host_context: Default::default(),
             choice: archon_core::model::ModelChoice {
                 model: "claude-code/claude-sonnet-5".parse().unwrap(),
                 effort: archon_core::model::Effort::Medium,

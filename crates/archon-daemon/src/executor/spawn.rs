@@ -126,6 +126,24 @@ pub(super) fn save_spawn(
     store.kv_set(&request_key(id), &serde_json::to_string(spawn)?)
 }
 
+fn record_host_context(
+    store: &mut Store,
+    id: &StageRunId,
+    host_context: archon_core::config::HostContext,
+) -> Result<(), ArchonError> {
+    let mut stage = store.stage_run(id)?;
+    assert_eq!(&stage.id, id, "the stored stage matches its key");
+    if stage.host_context == host_context {
+        return Ok(());
+    }
+    assert!(
+        stage.aether_agent.is_none(),
+        "a created agent keeps its context"
+    );
+    stage.host_context = host_context;
+    store.upsert_stage_run(&stage)
+}
+
 /// Delete the stored requests nothing reads any more: of settled stage runs
 /// (a kept agent's once its run's node retired) and of ones never recorded.
 pub(crate) fn prune_settled_requests(store: &mut Store) -> Result<usize, ArchonError> {
@@ -433,6 +451,7 @@ fn reserve_one(
         fan_index: plan.fan_index,
         model_segments: Vec::new(),
         infrastructure_failure: false,
+        host_context: Default::default(),
         choice: plan.choice.clone(),
         aether_agent: None,
         aether_task: None,
@@ -485,6 +504,7 @@ fn build_request(
         "a team run's agents work under its team directory"
     );
     SpawnRequest {
+        host_context: Default::default(),
         idempotency_key: id.as_str().to_owned(),
         role: format!("archon-stage:{}/{}", run.pipeline, plan.stage_id),
         name: naming::stage_agent_name(&item.id, plan, retry, &item.title),
@@ -764,11 +784,20 @@ async fn spawn_bound(
         let model = &spawn.request.choice.model;
         let node = run_node::ensure(ctx, &stage.run, model, default).await?;
         let network = node.network.narrower(default);
+        spawn.request.host_context = ctx
+            .backend
+            .host_context(ctx.config.aether.host_context)
+            .await?;
         spawn.request.parent = Some(node.agent);
         spawn.request.network = Some(network);
         spawn.parent = ParentBinding::Bound;
         save_spawn(&mut *ctx.store.lock().await, &stage.id, &spawn)?;
     }
+    record_host_context(
+        &mut *ctx.store.lock().await,
+        &stage.id,
+        spawn.request.host_context,
+    )?;
     ctx.backend.spawn(spawn.request).await
 }
 

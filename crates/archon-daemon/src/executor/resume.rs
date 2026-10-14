@@ -210,6 +210,14 @@ pub(super) async fn resumed_ok(
         });
     }
     assert!(current.aether_task.is_none(), "a resume opens no task");
+    let previous = store
+        .stage_run_by_agent(&agent)?
+        .ok_or_else(|| ArchonError::Store(format!("kept agent {agent} has no recorded stage")))?;
+    assert_ne!(
+        previous.id, current.id,
+        "a resume continues an earlier attempt"
+    );
+    current.host_context = previous.host_context;
     current.aether_agent = Some(agent);
     current.state = StageState::Running;
     store.upsert_stage_run(&current)?;

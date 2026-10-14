@@ -387,6 +387,10 @@
             }
           ]
         },
+        "host_context": {
+          "$ref": "#/$defs/HostContext",
+          "description": "Engine-native host setup the session loads; omitted on the wire when full."
+        },
         "instructions": {
           "description": "Role- or task-specific instructions layered under the harness policy.",
           "type": [
@@ -6834,6 +6838,14 @@
         "client_version"
       ],
       "type": "object"
+    },
+    "HostContext": {
+      "description": "How much of the engine's own host setup a session loads. Lean leaves out\nengine-native skills and non-Aether MCP servers on Claude Code; other\nengines ignore it. CLAUDE.md, hooks, settings and built-in tools stay.",
+      "enum": [
+        "full",
+        "lean"
+      ],
+      "type": "string"
     },
     "IdempotencyKey": {
       "description": "What makes two calls the same effect.",

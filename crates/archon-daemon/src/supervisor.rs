@@ -237,6 +237,7 @@ pub fn orchestrator_create_agent(
         }),
         parent: None,
         config: Some(AgentConfig {
+            host_context: config.aether.host_context,
             instructions: Some(instructions),
             effort: Some(config.orchestrator.effort),
             cost_budget: None,
@@ -870,12 +871,49 @@ async fn create_generation(
         network,
         delegation,
     );
-    let agent = client.create_agent(request).await?;
-    // An earlier try may have created it under this key with other tools.
-    callers::record_delegation(ctx, &agent).await?;
+    let agent = create_orchestrator(ctx, client, request).await?;
     tracing::info!(agent = %agent.id, generation, delegation, "orchestrator created");
     crate::triggers::collapse_for_new_orchestrator(ctx).await?;
     Ok(agent.id)
+}
+
+async fn create_orchestrator(
+    ctx: &DaemonContext,
+    client: &AetherClient,
+    mut request: CreateAgent,
+) -> Result<archon_aether::wire::Agent, ArchonError> {
+    assert_eq!(request.role, ORCHESTRATOR_ROLE);
+    assert!(request.parent.is_none() && request.start);
+    let key = format!(
+        "host_context:{}",
+        request.idempotency_key.as_ref().expect("keyed generation")
+    );
+    let config = request.config.as_mut().expect("orchestrator config");
+    config.host_context = {
+        let mut store = ctx.store.lock().await;
+        match store.kv_get(&key)? {
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|error| ArchonError::Store(format!("kv {key}: {error}")))?,
+            None => {
+                let effective = client.welcome().effective_host_context(config.host_context);
+                store.kv_set(&key, &serde_json::to_string(&effective)?)?;
+                effective
+            }
+        }
+    };
+    if config.host_context != client.welcome().effective_host_context(config.host_context) {
+        return Err(ArchonError::Unavailable(
+            "Aether version lacks host_context required by the frozen lean orchestrator request"
+                .into(),
+        ));
+    }
+    let agent = client.create_agent(request).await?;
+    callers::record_delegation(ctx, &agent).await?;
+    ctx.store.lock().await.kv_set(
+        &format!("agent_host_context:{}", agent.id),
+        agent.config.host_context.as_str(),
+    )?;
+    Ok(agent)
 }
 
 /// Post a supervisor `Blocker` unless the same one is already standing.

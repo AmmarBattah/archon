@@ -102,6 +102,7 @@ pub struct AetherConfig {
     /// `host:port` for TCP instead of the Unix socket.
     pub address: Option<String>,
     pub token_env: String,
+    pub host_context: HostContext,
 }
 
 impl Default for AetherConfig {
@@ -111,6 +112,7 @@ impl Default for AetherConfig {
             socket: None,
             address: None,
             token_env: "AETHER_TOKEN".into(),
+            host_context: HostContext::Full,
         }
     }
 }
@@ -123,6 +125,30 @@ pub enum AetherMode {
     #[default]
     Dedicated,
     Shared,
+}
+
+/// Host context requested for newly created agents; full preserves host tools.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HostContext {
+    #[default]
+    Full,
+    Lean,
+}
+
+impl HostContext {
+    pub fn is_full(&self) -> bool {
+        *self == Self::Full
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Lean => "lean",
+        }
+    }
 }
 
 impl AetherConfig {
@@ -786,6 +812,24 @@ mod tests {
         "#;
         let config: Config = toml::from_str(text).unwrap();
         assert!(matches!(config.validate(), Err(ArchonError::Config(_))));
+    }
+
+    #[test]
+    fn host_context_defaults_to_full_and_rejects_unknown_values() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert_eq!(defaults.aether.host_context, HostContext::Full);
+        for (text, expected) in [("full", HostContext::Full), ("lean", HostContext::Lean)] {
+            let config: Config =
+                toml::from_str(&format!("[aether]\nhost_context = \"{text}\"\n")).unwrap();
+            assert_eq!(config.aether.host_context, expected);
+            assert!(config.validate().is_ok());
+        }
+        for bad in ["minimal", "Lean", "", "auto"] {
+            assert!(
+                toml::from_str::<Config>(&format!("[aether]\nhost_context = \"{bad}\"\n")).is_err()
+            );
+        }
+        assert!(toml::from_str::<Config>("[aether]\nhost_context = true").is_err());
     }
 
     #[test]

@@ -878,3 +878,40 @@ async fn a_budget_decision_is_persisted_before_create_and_replayed_after_capabil
     assert_eq!(aether.received_named("providers").len(), 1);
     assert_eq!(h.running().await.len(), 1);
 }
+
+#[tokio::test]
+async fn host_context_is_frozen_for_nodes_and_stage_agents() {
+    use archon_core::config::HostContext;
+    for (advertised, requested, effective) in [
+        (true, HostContext::Lean, HostContext::Lean),
+        (false, HostContext::Lean, HostContext::Full),
+        (true, HostContext::Full, HostContext::Full),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let aether = start_aether(dir.path()).await;
+        if advertised {
+            aether.set_features(vec!["host_context".into()]);
+        }
+        script_fleet(&aether);
+        let mut config = Config::default();
+        config.aether.host_context = requested;
+        let h = harness_with_config(&aether, ClientOptions::default(), config).await;
+        let item = h.enqueue("record host context").await;
+        h.dispatch().await;
+        let creates = aether.wait_for("create_agent", 2, WAIT).await;
+        assert_eq!(creates.len(), 2);
+        for create in &creates {
+            let sent = create["config"].get("host_context");
+            assert_eq!(sent, (!effective.is_full()).then_some(&json!("lean")));
+        }
+        let run = h.run(&item.id).await;
+        let stages = h.ctx.store.lock().await.stage_runs(&run.id).unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].host_context, effective);
+        let key = format!("spawn_request:{}", stages[0].id);
+        let raw = h.ctx.store.lock().await.kv_get(&key).unwrap().unwrap();
+        let frozen: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frozen["request"]["host_context"], effective.as_str());
+        assert_eq!(creates[1]["parent"], node_id(1));
+    }
+}

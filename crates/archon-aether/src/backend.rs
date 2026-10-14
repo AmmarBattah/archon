@@ -39,6 +39,18 @@ impl AetherBackend {
     }
 }
 
+fn require_host_context(
+    client: &AetherClient,
+    stored: archon_core::config::HostContext,
+) -> Result<(), ArchonError> {
+    if stored != client.welcome().effective_host_context(stored) {
+        return Err(ArchonError::Unavailable(
+            "Aether version lacks host_context required by the frozen lean creation request".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The agent's `status.state`; `unknown` when Aether sent something else.
 pub fn agent_state(agent: &Agent) -> String {
     agent
@@ -141,6 +153,7 @@ pub fn stage_create_agent(request: &SpawnRequest, network: NetworkPolicy) -> Cre
         }),
         parent: request.parent.clone(),
         config: Some(AgentConfig {
+            host_context: request.host_context,
             instructions: Some(request.instructions.clone()),
             effort: Some(request.choice.effort),
             cost_budget: request
@@ -189,6 +202,7 @@ pub fn run_node_create_agent(request: &RunNodeRequest) -> CreateAgent {
         }),
         parent: None,
         config: Some(AgentConfig {
+            host_context: request.host_context,
             instructions: None,
             effort: None,
             cost_budget: None,
@@ -287,10 +301,25 @@ impl AgentBackend for AetherBackend {
             // daemon sent it, with Aether's default of the moment.
             None => client.daemon_defaults().await?.network_default,
         };
+        require_host_context(&client, request.host_context)?;
         let agent = client
             .create_agent(stage_create_agent(&request, network))
             .await?;
         spawned_from(&client, agent, &request.idempotency_key).await
+    }
+
+    async fn host_context(
+        &self,
+        requested: archon_core::config::HostContext,
+    ) -> Result<archon_core::config::HostContext, ArchonError> {
+        if requested.is_full() {
+            return Ok(requested);
+        }
+        Ok(self
+            .link
+            .client()?
+            .welcome()
+            .effective_host_context(requested))
     }
 
     async fn prepare_spawn(
@@ -344,6 +373,7 @@ impl AgentBackend for AetherBackend {
 
     async fn create_run_node(&self, request: RunNodeRequest) -> Result<CreatedNode, ArchonError> {
         let client = self.link.client()?;
+        require_host_context(&client, request.host_context)?;
         let agent = client.create_agent(run_node_create_agent(&request)).await?;
         let key = &request.idempotency_key;
         if agent.current_task.is_some() {
@@ -468,6 +498,7 @@ mod tests {
 
     fn request() -> SpawnRequest {
         SpawnRequest {
+            host_context: Default::default(),
             idempotency_key: "stg_01".into(),
             role: "archon-stage:direct/implement".into(),
             name: "implement · add a greeting".into(),
@@ -494,6 +525,7 @@ mod tests {
 
     fn node_request() -> RunNodeRequest {
         RunNodeRequest {
+            host_context: Default::default(),
             idempotency_key: "prun_01:node:1".into(),
             role: "archon-run:direct".into(),
             name: "add a greeting".into(),

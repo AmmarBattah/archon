@@ -350,8 +350,12 @@ impl AetherClient {
         self.request(Command::Ping, "ok").await.map(drop)
     }
 
-    pub async fn create_agent(&self, request: CreateAgent) -> Result<Agent, ArchonError> {
+    pub async fn create_agent(&self, mut request: CreateAgent) -> Result<Agent, ArchonError> {
         assert!(!request.role.is_empty(), "Aether requires a role");
+        if let Some(config) = &mut request.config {
+            config.host_context = self.welcome.effective_host_context(config.host_context);
+            assert!(config.host_context.is_full() || self.welcome.supports_host_context());
+        }
         let agent: Agent = self
             .typed(Command::CreateAgent(Box::new(request)), "agent")
             .await?;

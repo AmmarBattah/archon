@@ -443,3 +443,44 @@ async fn a_forwarded_request_names_exactly_one_caller() {
     let asked = harness.ctx.store.lock().await.questions(true).unwrap();
     assert!(asked.is_empty() && !paused(&harness).await, "{asked:?}");
 }
+
+#[tokio::test]
+async fn orchestrator_negotiates_and_records_host_context() {
+    use archon_core::config::{Config, HostContext};
+    for (advertised, requested, effective) in [
+        (true, HostContext::Lean, HostContext::Lean),
+        (false, HostContext::Lean, HostContext::Full),
+        (true, HostContext::Full, HostContext::Full),
+    ] {
+        let mut config = Config::default();
+        config.aether.host_context = requested;
+        let harness = Harness::with(config, None).await;
+        if advertised {
+            harness.fake.set_features(vec!["host_context".into()]);
+        }
+        harness.fake.set_responder(
+            "create_agent",
+            Arc::new(|frame| {
+                let mut agent = orchestrator(ORCH, "ready");
+                agent["config"] = frame["config"].clone();
+                Scripted::reply("agent", agent)
+            }),
+        );
+        harness.connect().await;
+        let id = supervisor::ensure_orchestrator(&harness.ctx).await.unwrap();
+        assert_eq!(id.as_str(), ORCH);
+        let creates = harness.fake.received_named("create_agent");
+        assert_eq!(creates.len(), 1);
+        assert_eq!(
+            creates[0]["config"]["host_context"].as_str(),
+            (!effective.is_full()).then_some("lean")
+        );
+        assert_eq!(
+            harness
+                .kv(&format!("agent_host_context:{id}"))
+                .await
+                .as_deref(),
+            Some(effective.as_str())
+        );
+    }
+}

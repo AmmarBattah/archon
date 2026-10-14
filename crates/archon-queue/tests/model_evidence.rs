@@ -407,3 +407,38 @@ fn snapshot_owns_attempts_and_can_be_classified_after_the_store_is_dropped() {
     );
     assert_eq!(row.median_cost_usd, Some(0.5));
 }
+
+#[test]
+fn lean_and_full_attempts_are_reported_separately() {
+    use archon_core::config::HostContext;
+    let mut store = store();
+    let item = store.insert_item(&item(None, "fixture"), None).unwrap();
+    let run = start(&mut store, &item.id);
+    for (n, context, cost) in [(0, HostContext::Full, 2.0), (1, HostContext::Lean, 1.0)] {
+        let mut stage = running_stage(&run, n, n);
+        stage.host_context = context;
+        stage.started_at = t(100);
+        stage.finished_at = Some(t(160));
+        stage.state = StageState::Completed;
+        stage.cost_usd = cost;
+        store.upsert_stage_run(&stage).unwrap();
+        let mut changed = stage.clone();
+        changed.host_context = if context.is_full() {
+            HostContext::Lean
+        } else {
+            HostContext::Full
+        };
+        assert!(store.upsert_stage_run(&changed).is_err());
+    }
+    let evidence = report(&store, Default::default(), range(0, 0));
+    assert_eq!(evidence.rows.len(), 2);
+    for row in &evidence.rows {
+        assert_eq!(row.attempts, 1);
+        assert_eq!(
+            row.median_cost_usd,
+            Some(if row.host_context.is_full() { 2.0 } else { 1.0 })
+        );
+    }
+    assert!(evidence.text().contains("host_context=lean"));
+    assert!(evidence.text().contains("host_context=full"));
+}
