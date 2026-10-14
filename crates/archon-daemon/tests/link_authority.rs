@@ -481,9 +481,45 @@ async fn orchestrator_negotiates_and_records_host_context() {
                 .await
                 .is_none()
         );
+        let frozen = serde_json::to_string(&effective).unwrap();
         assert_eq!(
             harness.kv("orchestrator_host_context").await,
-            (!effective.is_full()).then(|| "\"lean\"".into())
+            (!requested.is_full()).then_some(frozen)
         );
     }
+}
+
+/// A lean-configured orchestrator that fell back to full keeps full under its
+/// key, even when the reply was lost and Aether gained host_context meanwhile.
+#[tokio::test]
+async fn a_lost_full_fallback_replays_full_after_aether_gains_host_context() {
+    use archon_core::config::{Config, HostContext};
+    let mut config = Config::default();
+    config.aether.host_context = HostContext::Lean;
+    let harness = Harness::with(config, None).await;
+    harness
+        .fake
+        .script("create_agent", Scripted::Hangup { notice: None });
+    harness.connect().await;
+    let lost = supervisor::ensure_orchestrator(&harness.ctx).await;
+    assert!(lost.is_err(), "{lost:?}");
+    assert_eq!(
+        harness.kv("orchestrator_host_context").await.as_deref(),
+        Some("\"full\"")
+    );
+    harness.fake.set_features(vec!["host_context".into()]);
+    harness.fake.set_responder(
+        "create_agent",
+        Arc::new(|frame| {
+            let mut agent = orchestrator(ORCH, "ready");
+            agent["config"] = frame["config"].clone();
+            Scripted::reply("agent", agent)
+        }),
+    );
+    harness.connect().await;
+    supervisor::ensure_orchestrator(&harness.ctx).await.unwrap();
+    let creates = harness.fake.received_named("create_agent");
+    assert_eq!(creates.len(), 2, "{creates:?}");
+    assert_eq!(creates[0]["idempotency_key"], creates[1]["idempotency_key"]);
+    assert!(creates[1]["config"].get("host_context").is_none());
 }

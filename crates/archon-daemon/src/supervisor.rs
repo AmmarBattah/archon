@@ -19,7 +19,7 @@ use archon_aether::wire::{
 use archon_core::Timestamp;
 use archon_core::aether_ids::AetherAgentId;
 use archon_core::autonomy::{AutonomyPolicy, ToolsMode};
-use archon_core::config::Config;
+use archon_core::config::{Config, HostContext};
 use archon_core::error::ArchonError;
 use archon_core::id::{FeedItemId, StoreId};
 use archon_core::model::ModelChoice;
@@ -891,15 +891,17 @@ async fn create_orchestrator(
     assert!(request.parent.is_none() && request.start);
     let config = request.config.as_mut().expect("orchestrator config");
     let mut store = ctx.store.lock().await;
-    let requested = match store.kv_get(HOST_CONTEXT_KEY)? {
-        Some(raw) => serde_json::from_str(&raw)
-            .map_err(|error| ArchonError::Store(format!("kv {HOST_CONTEXT_KEY}: {error}")))?,
-        None => config.host_context,
+    let frozen: Option<HostContext> = match store.kv_get(HOST_CONTEXT_KEY)? {
+        Some(raw) => Some(
+            serde_json::from_str(&raw)
+                .map_err(|error| ArchonError::Store(format!("kv {HOST_CONTEXT_KEY}: {error}")))?,
+        ),
+        None => None,
     };
+    let requested = frozen.unwrap_or(config.host_context);
     config.host_context = client.welcome().effective_host_context(requested);
-    if config.host_context.is_full() {
-        store.kv_delete(HOST_CONTEXT_KEY)?;
-    } else {
+    // A full fallback is frozen too, so a retry under this key never turns lean.
+    if frozen.is_some() || !requested.is_full() {
         store.kv_set(
             HOST_CONTEXT_KEY,
             &serde_json::to_string(&config.host_context)?,
