@@ -36,8 +36,9 @@ pub struct ArmSettings {
     pub claude_bin: PathBuf,
     pub codex_bin: PathBuf,
     pub archon_bin: PathBuf,
-    /// `None`: Aether's own socket resolution.
-    pub aether_socket: Option<PathBuf>,
+    /// Set only once the private sandbox is validated; without it the
+    /// daemon arms fail instead of falling back to a default socket.
+    pub sockets: Option<PrivateSockets>,
     pub archon_model: ModelRef,
     pub aether_model: ModelRef,
     /// The `claude --model` value.
@@ -50,7 +51,29 @@ pub struct ArmSettings {
     pub env: EnvScrub,
 }
 
+/// The benchmark's own daemons, both inside the private sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateSockets {
+    pub aether: PathBuf,
+    /// Equals `ARCHON_SOCKET`: the orchestrator's MCP proxy dials that one.
+    pub archon: PathBuf,
+}
+
 impl ArmSettings {
+    /// The validated sandbox sockets; the daemon arms need them.
+    pub fn private_sockets(&self) -> anyhow::Result<&PrivateSockets> {
+        let sockets = self.sockets.as_ref().context(
+            "no private sandbox: the daemon arms need --aether-socket and ARCHON_SOCKET \
+             validated by the preflight",
+        )?;
+        assert!(
+            sockets.aether.is_absolute() && sockets.archon.is_absolute(),
+            "validated sandbox sockets are absolute"
+        );
+        assert_ne!(sockets.aether, sockets.archon, "the daemons share a socket");
+        Ok(sockets)
+    }
+
     /// The model string recorded in results for `arm`.
     pub fn model_label(&self, arm: Arm) -> String {
         match arm {
@@ -269,7 +292,7 @@ pub fn archon_config(settings: &ArmSettings) -> Config {
     let mut config = Config::default();
     // The bench's archond uses the Aether it was pointed at, not its own.
     config.aether.mode = AetherMode::Shared;
-    config.aether.socket = settings.aether_socket.clone();
+    config.aether.socket = settings.sockets.as_ref().map(|s| s.aether.clone());
     config.orchestrator.model = settings.archon_model.clone();
     config.orchestrator.effort = settings.effort;
     config.models.allow = vec![settings.archon_model.clone()];

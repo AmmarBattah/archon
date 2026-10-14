@@ -29,7 +29,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::arms::aether::{endpoint, fetch_events};
-use crate::arms::{ArmOutcome, TrialInput, archon_config_toml, archon_daemon_command};
+use crate::arms::{
+    ArmOutcome, ArmSettings, PrivateSockets, TrialInput, archon_config_toml, archon_daemon_command,
+};
 use crate::grade::ResultSource;
 use crate::metrics::{ArchonItem, Arm};
 use crate::usage::{Usage, aether_usage};
@@ -100,15 +102,18 @@ fn parse_archon_work(text: &str) -> anyhow::Result<Vec<ArchonItem>> {
 }
 
 pub async fn run_archon(input: &TrialInput<'_>) -> ArmOutcome {
-    let socket = archon_client::default_socket();
-    if let Err(e) = ensure_socket_free(&socket).await {
+    let sockets = match daemon_sockets(input.settings) {
+        Ok(sockets) => sockets,
+        Err(e) => return ArmOutcome::failed(format!("{e:#}"), ResultSource::Workspace),
+    };
+    if let Err(e) = ensure_socket_free(&sockets.archon).await {
         return ArmOutcome::failed(format!("{e:#}"), ResultSource::Workspace);
     }
-    let mut daemon = match Daemon::start(input, &socket) {
+    let mut daemon = match Daemon::start(input, &sockets.archon) {
         Ok(daemon) => daemon,
         Err(e) => return ArmOutcome::failed(format!("{e:#}"), ResultSource::Workspace),
     };
-    let client = connect_when_listening(&socket, &mut daemon).await;
+    let client = connect_when_listening(&sockets.archon, &mut daemon).await;
     let mut outcome = match &client {
         Ok(client) => match session(input, client).await {
             Ok(outcome) => outcome,
@@ -116,8 +121,7 @@ pub async fn run_archon(input: &TrialInput<'_>) -> ArmOutcome {
         },
         Err(e) => ArmOutcome::failed(format!("{e:#}"), ResultSource::Branches(BTreeMap::new())),
     };
-    let aether_socket = input.settings.aether_socket.as_deref();
-    if let Err(e) = daemon.stop(client.as_ref().ok(), aether_socket).await {
+    if let Err(e) = daemon.stop(client.as_ref().ok(), &sockets.aether).await {
         let prior = outcome
             .error
             .take()
@@ -126,6 +130,20 @@ pub async fn run_archon(input: &TrialInput<'_>) -> ArmOutcome {
         outcome.error = Some(format!("{prior}stopping archond: {e:#}"));
     }
     outcome
+}
+
+/// The validated sandbox sockets. The orchestrator's MCP proxy dials the
+/// default socket, so the private archond must listen exactly there.
+fn daemon_sockets(settings: &ArmSettings) -> anyhow::Result<&PrivateSockets> {
+    let sockets = settings.private_sockets()?;
+    let dialled = archon_client::default_socket();
+    ensure!(
+        sockets.archon == dialled,
+        "the private archond would listen at {} but ARCHON_SOCKET resolves to {}",
+        sockets.archon.display(),
+        dialled.display()
+    );
+    Ok(sockets)
 }
 
 async fn ensure_socket_free(socket: &Path) -> anyhow::Result<()> {
@@ -172,7 +190,7 @@ impl Daemon {
     async fn stop(
         &mut self,
         client: Option<&ArchonClient>,
-        aether_socket: Option<&Path>,
+        aether_socket: &Path,
     ) -> anyhow::Result<()> {
         let mut problems = Vec::new();
         let mut orchestrator = None;
@@ -194,7 +212,7 @@ impl Daemon {
     pub(crate) async fn exit_then_cancel(
         &mut self,
         orchestrator: Option<&AetherAgentId>,
-        aether_socket: Option<&Path>,
+        aether_socket: &Path,
         mut problems: Vec<String>,
     ) -> anyhow::Result<()> {
         if tokio::time::timeout(SHUTDOWN_GRACE, self.child.wait())
@@ -227,10 +245,7 @@ async fn orchestrator_agent(client: &ArchonClient) -> anyhow::Result<AetherAgent
     Ok(info.agent)
 }
 
-async fn cancel_orchestrator(
-    agent: &AetherAgentId,
-    aether_socket: Option<&Path>,
-) -> anyhow::Result<()> {
+async fn cancel_orchestrator(agent: &AetherAgentId, aether_socket: &Path) -> anyhow::Result<()> {
     let aether = AetherClient::connect(&endpoint(aether_socket)).await?;
     aether.cancel(agent, "archon-bench: trial finished").await?;
     Ok(())
@@ -493,7 +508,8 @@ async fn fleet_usage(
             .iter()
             .flat_map(|d| d.stages.iter().filter_map(|s| s.aether_agent.clone())),
     );
-    let aether = AetherClient::connect(&endpoint(input.settings.aether_socket.as_deref())).await?;
+    let aether =
+        AetherClient::connect(&endpoint(&input.settings.private_sockets()?.aether)).await?;
     let mut events: BTreeMap<u64, Value> = BTreeMap::new();
     for agent in agents {
         let query = EventQuery {

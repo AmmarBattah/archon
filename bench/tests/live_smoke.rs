@@ -41,7 +41,7 @@ async fn claude_arm_solves_and_is_graded_on_fix_off_by_one() {
         claude_bin: "claude".into(),
         codex_bin: "codex".into(),
         archon_bin: "archon".into(),
-        aether_socket: None,
+        sockets: None,
         archon_model: model.clone(),
         aether_model: model,
         claude_model: "claude-haiku-5-5".into(),

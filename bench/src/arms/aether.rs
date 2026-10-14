@@ -6,7 +6,6 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use archon_aether::client::default_socket_path;
 use archon_aether::wire::{Command, EventQuery, Task, TaskStatus};
 use archon_aether::{AetherClient, Endpoint};
 use archon_core::aether_ids::{AetherAgentId, AetherTaskId};
@@ -27,8 +26,11 @@ const TURN_RUNNING_STATES: &[&str] = &["created", "ready", "running"];
 /// Events fetched per `get_events` page.
 const EVENT_PAGE: usize = 500;
 
-pub fn endpoint(socket: Option<&std::path::Path>) -> Endpoint {
-    Endpoint::Unix(socket.map_or_else(default_socket_path, std::path::Path::to_path_buf))
+/// Always an explicit socket: Aether's own default resolution would reach
+/// the operator's daemon.
+pub fn endpoint(socket: &std::path::Path) -> Endpoint {
+    assert!(socket.is_absolute(), "sandbox sockets are absolute");
+    Endpoint::Unix(socket.to_path_buf())
 }
 
 pub async fn run_aether(input: &TrialInput<'_>) -> ArmOutcome {
@@ -39,7 +41,8 @@ pub async fn run_aether(input: &TrialInput<'_>) -> ArmOutcome {
 }
 
 async fn drive(input: &TrialInput<'_>) -> anyhow::Result<ArmOutcome> {
-    let client = AetherClient::connect(&endpoint(input.settings.aether_socket.as_deref()))
+    let socket = &input.settings.private_sockets()?.aether;
+    let client = AetherClient::connect(&endpoint(socket))
         .await
         .context("connecting to aetherd")?;
     let deadline = archon_core::now()

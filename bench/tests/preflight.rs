@@ -88,3 +88,30 @@ fn bootstrap_and_check_results_cannot_be_combined() {
             .contains("cannot be used with")
     );
 }
+
+/// Output redacts `$HOME`, so the check looks for any socket file name: a
+/// dry run without a private sandbox must neither probe nor print one.
+#[test]
+fn a_dry_run_with_default_env_never_resolves_a_default_socket() {
+    let runtime = tempfile::tempdir().unwrap();
+    let home = std::env::var_os("HOME").expect("HOME locates the default work directory");
+    for args in [
+        vec!["run", "--dry-run", "--arms", "archon,aether"],
+        vec!["smoke", "--dry-run"],
+    ] {
+        let output = bench(&args)
+            .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        for socket in ["aetherd.sock", "archond.sock"] {
+            assert!(!stdout.contains(socket), "{args:?} resolved {socket}");
+            assert!(!stderr.contains(socket), "{args:?} resolved {socket}");
+        }
+        assert!(stdout.contains("aetherd not probed"), "{stdout}");
+        assert!(stderr.contains("no private sandbox"), "{stderr}");
+    }
+}

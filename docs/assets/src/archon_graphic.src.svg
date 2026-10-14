@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1116" viewBox="0 0 1600 1116" role="img" aria-labelledby="archon-title archon-desc">
   <title id="archon-title">Archon 1.0: talk to one orchestrator, command a fleet of agents</title>
-  <desc id="archon-desc">Chat, archon say, watched GitHub mentions and recurring Aether requests reach one orchestrator. A persistent backlog feeds eighteen built-in default pipelines or your own pipelines, defined in TOML with stage prompts, for all repositories or just one. The daemon enforces caps, budgets, model policy and an autonomy ceiling; merging is manual by default. Six illustrated default pipelines show stages, fan-out and bounded failure loops. Ship modes are pr and local. Lavish is optional: use its pages or the CLI for reports, proposals and questions. Archon runs on Aether.</desc>
+  <desc id="archon-desc">Chat, archon say, watched GitHub mentions and recurring Aether requests reach one orchestrator. A persistent backlog feeds ten built-in pipelines or your own pipelines, defined in TOML with stage prompts, for all repositories or just one. The daemon enforces caps, budgets, model policy and an autonomy ceiling; merging is manual by default. Six illustrated built-in pipelines show stages, fan-out and bounded failure loops; archond ships what passed. Ship modes are pr and local. Lavish is optional: use its pages or the CLI for reports, proposals and questions. Archon runs on Aether.</desc>
   <style id="source-fonts">
     @font-face { font-family: "Fira Sans"; font-weight: 400; src: url("fonts/FiraSans-Regular.ttf"); }
     @font-face { font-family: "Fira Sans"; font-weight: 500; src: url("fonts/FiraSans-Medium.ttf"); }
@@ -117,14 +117,14 @@
     <text x="572" y="96" class="mono" font-size="13" fill="#8fb3e8">you ›</text>
     <text x="664" y="96" class="mono" font-size="13" fill="#eef3fa">fix api login; update web with strict review</text>
     <text x="572" y="115" class="mono" font-size="13" fill="#f0c05a">archon ›</text>
-    <text x="664" y="115" class="mono" font-size="13" fill="#c9d6ea">queued: quick-pr → api, strict-pr-review → web</text>
+    <text x="664" y="115" class="mono" font-size="13" fill="#c9d6ea">queued: direct → api, adaptive → web, review strict</text>
 
     <circle cx="578" cy="130" r="4.6" fill="none" stroke="#f4b740" stroke-width="1.8"/>
     <text x="590" y="134" class="mono" font-size="12" fill="#f4b740">question</text>
     <text x="664" y="134" class="mono" font-size="13" fill="#eef3fa">web · keep the legacy /v1 route?</text>
     <path d="M578,143.5 L583,149 L578,154.5 L573,149 Z" fill="#b59cff"/>
     <text x="590" y="153" class="mono" font-size="12" fill="#b59cff">decision</text>
-    <text x="664" y="153" class="mono" font-size="13" fill="#eef3fa">web · chose strict-pr-review for this change</text>
+    <text x="664" y="153" class="mono" font-size="13" fill="#eef3fa">web · chose three reviewers for this change</text>
     <rect x="574" y="164" width="8.5" height="8.5" rx="1.5" fill="#ff7a6b"/>
     <text x="590" y="172" class="mono" font-size="12" fill="#ff7a6b">blocker</text>
     <text x="664" y="172" class="mono" font-size="13" fill="#eef3fa">ops · run failed; intervention needed</text>
@@ -172,7 +172,7 @@
       <rect width="348" height="30" rx="7" fill="#ffffff" stroke="#dde6f2"/>
       <rect x="8" y="6" width="26" height="18" rx="4" fill="#1c2636"/>
       <text x="21" y="19" text-anchor="middle" class="mono-md" font-size="11" fill="#ffffff">P1</text>
-      <text x="44" y="20" class="sans-md" font-size="13.5" fill="#26354a">quick-pr</text>
+      <text x="44" y="20" class="sans-md" font-size="13.5" fill="#26354a">direct</text>
       <rect x="218" y="7" width="38" height="16" rx="8" fill="#eaf2fe"/>
       <text x="237" y="19" text-anchor="middle" class="mono" font-size="11" fill="#2d62c8">api</text>
       <circle cx="284" cy="15" r="3.5" fill="#34b86f"/>
@@ -182,7 +182,7 @@
       <rect width="348" height="30" rx="7" fill="#ffffff" stroke="#dde6f2"/>
       <rect x="8" y="6" width="26" height="18" rx="4" fill="#1c2636"/>
       <text x="21" y="19" text-anchor="middle" class="mono-md" font-size="11" fill="#ffffff">P1</text>
-      <text x="44" y="20" class="sans-md" font-size="13.5" fill="#26354a">strict-pr-review</text>
+      <text x="44" y="20" class="sans-md" font-size="13.5" fill="#26354a">adaptive</text>
       <rect x="218" y="7" width="38" height="16" rx="8" fill="#eaf2fe"/>
       <text x="237" y="19" text-anchor="middle" class="mono" font-size="11" fill="#2d62c8">web</text>
       <circle cx="284" cy="15" r="3.5" fill="#34b86f"/>
@@ -202,7 +202,7 @@
       <rect width="348" height="30" rx="7" fill="#ffffff" stroke="#dde6f2"/>
       <rect x="8" y="6" width="26" height="18" rx="4" fill="#8a9ab3"/>
       <text x="21" y="19" text-anchor="middle" class="mono-md" font-size="11" fill="#ffffff">P3</text>
-      <text x="44" y="20" class="sans-md" font-size="13.5" fill="#26354a">dependency-upgrade</text>
+      <text x="44" y="20" class="sans-md" font-size="13.5" fill="#26354a">refactor</text>
       <rect x="206" y="7" width="50" height="16" rx="8" fill="#eaf2fe"/>
       <text x="231" y="19" text-anchor="middle" class="mono" font-size="11" fill="#2d62c8">infra</text>
       <circle cx="290" cy="15" r="3.5" fill="#f4b740"/>
@@ -250,55 +250,54 @@
 
   <g transform="translate(40,582)">
     <rect width="242" height="180" rx="10" fill="#fbfdff" stroke="#d4dfed" stroke-width="1.5"/>
-    <text x="16" y="28" class="mono-md" font-size="15" fill="#121c2b">quick-pr</text>
-    <text x="16" y="47" class="sans" font-size="12.5" fill="#5b6b83">Small, well-understood changes.</text>
-    <g transform="translate(40,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-hardhat"/></g>
-    <g transform="translate(167,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-ship"/></g>
-    <path d="M84,112 H158" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
-    <text x="57.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">implement</text>
-    <text x="184.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">ship</text>
-    <text x="121" y="170" text-anchor="middle" class="sans" font-size="12.5" fill="#26354a">Ships in the selected mode.</text>
+    <text x="16" y="28" class="mono-md" font-size="15" fill="#121c2b">direct</text>
+    <text x="16" y="47" class="sans" font-size="12.5" fill="#5b6b83">One agent. The default pipeline.</text>
+    <g transform="translate(50,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-hardhat"/></g>
+    <g transform="translate(157,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-review"/></g>
+    <path d="M94,112 H148" stroke="#50658a" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"/>
+    <text x="67.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">implement</text>
+    <text x="174.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">review</text>
+    <text x="121" y="170" text-anchor="middle" class="sans" font-size="12.5" fill="#26354a">Reviewers by level: none, 1 or 3.</text>
   </g>
 
   <g transform="translate(295.6,582)">
     <rect width="242" height="180" rx="10" fill="#fbfdff" stroke="#d4dfed" stroke-width="1.5"/>
-    <text x="16" y="28" class="mono-md" font-size="15" fill="#121c2b">default-pr-review</text>
-    <text x="16" y="47" class="sans" font-size="12.5" fill="#5b6b83">One reviewer and a fix loop.</text>
-    <path d="M115.5,90 C115.5,64 41.5,64 41.5,87" fill="none" stroke="#c28a12" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah)"/>
-    <rect x="58" y="61" width="42" height="15" rx="7.5" fill="#fbfdff"/>
-    <text x="79" y="72" text-anchor="middle" class="mono" font-size="10.5" fill="#b07a0e">fix ×2</text>
+    <text x="16" y="28" class="mono-md" font-size="15" fill="#121c2b">adaptive</text>
+    <text x="16" y="47" class="sans" font-size="12.5" fill="#5b6b83">One build stage: a lead delegates.</text>
+    <path d="M197.5,90 C197.5,62 41.5,62 41.5,87" fill="none" stroke="#c28a12" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah)"/>
+    <rect x="98" y="61" width="42" height="15" rx="7.5" fill="#fbfdff"/>
+    <text x="119" y="72" text-anchor="middle" class="mono" font-size="10.5" fill="#b07a0e">fixes</text>
     <g transform="translate(24,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-hardhat"/></g>
-    <g transform="translate(98,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-review"/></g>
-    <g transform="translate(180,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-ship"/></g>
-    <path d="M65,112 H91" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
-    <path d="M147,112 H173" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
-    <text x="41.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">implement</text>
-    <text x="115.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">review</text>
-    <text x="197.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">ship</text>
-    <text x="121" y="170" text-anchor="middle" class="sans" font-size="12.5" fill="#26354a">Reviewed before it ships.</text>
+    <g transform="translate(98,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-hardhat"/></g>
+    <g transform="translate(180,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-review"/></g>
+    <path d="M65,112 H91" stroke="#50658a" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"/>
+    <path d="M147,112 H173" stroke="#50658a" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ah)"/>
+    <text x="41.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">lead</text>
+    <text x="115.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">workers</text>
+    <text x="197.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">review</text>
+    <text x="121" y="170" text-anchor="middle" class="sans" font-size="12.5" fill="#26354a">Optional workers; review by level.</text>
   </g>
 
   <g transform="translate(551.2,582)">
     <rect width="242" height="180" rx="10" fill="#fbfdff" stroke="#d4dfed" stroke-width="1.5"/>
-    <text x="16" y="28" class="mono-md" font-size="15" fill="#121c2b">strict-pr-review</text>
-    <text x="16" y="47" class="sans" font-size="12.5" fill="#5b6b83">Tests, then three independent reviews.</text>
-    <path d="M141.5,90 C141.5,62 31,62 31,88" fill="none" stroke="#c28a12" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah)"/>
-    <path d="M85.5,91 C85.5,79 42,79 42,91" fill="none" stroke="#c28a12" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah)"/>
-    <rect x="52" y="61" width="80" height="15" rx="7.5" fill="#fbfdff"/>
-    <text x="92" y="72" text-anchor="middle" class="mono" font-size="10.5" fill="#b07a0e">each: fix ×3</text>
-    <g transform="translate(18,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-hardhat"/></g>
-    <g transform="translate(68,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-test"/></g>
-    <g transform="translate(124,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-review"/></g>
-    <use href="#badge-x3" transform="translate(125,98)"/>
-    <g transform="translate(190,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-ship"/></g>
-    <path d="M57,112 H65" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
-    <path d="M114,112 H121" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
-    <path d="M170,112 H187" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
-    <text x="35.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">implement</text>
-    <text x="85.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">test</text>
-    <text x="144" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">review</text>
-    <text x="207.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">ship</text>
-    <text x="121" y="170" text-anchor="middle" class="sans" font-size="12.5" fill="#26354a">Test / review fail → implement.</text>
+    <text x="16" y="28" class="mono-md" font-size="15" fill="#121c2b">refactor</text>
+    <text x="16" y="47" class="sans" font-size="12.5" fill="#5b6b83">Structure changes, behaviour holds.</text>
+    <path d="M207.5,90 C207.5,62 88,62 88,88" fill="none" stroke="#c28a12" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah)"/>
+    <path d="M147.5,91 C147.5,79 100,79 100,91" fill="none" stroke="#c28a12" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#ah)"/>
+    <rect x="116" y="61" width="64" height="15" rx="7.5" fill="#fbfdff"/>
+    <text x="148" y="72" text-anchor="middle" class="mono" font-size="10.5" fill="#b07a0e">fix loops</text>
+    <g transform="translate(12,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-test"/></g>
+    <g transform="translate(76,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-hardhat"/></g>
+    <g transform="translate(130,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-test"/></g>
+    <g transform="translate(190,99.5) scale(2.5)"><use href="#bot"/><use href="#acc-review"/></g>
+    <path d="M60,112 H69" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
+    <path d="M117,112 H124" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
+    <path d="M177,112 H185" stroke="#50658a" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="29.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">baseline</text>
+    <text x="93.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">refactor</text>
+    <text x="147.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">verify</text>
+    <text x="207.5" y="148" text-anchor="middle" class="sans-md" font-size="11.5" fill="#3a4a60">review</text>
+    <text x="121" y="170" text-anchor="middle" class="sans" font-size="12.5" fill="#26354a">Verify ×3, review ×2 → refactor.</text>
   </g>
 
   <g transform="translate(806.8,582)">
@@ -345,7 +344,7 @@
   </g>
 
   <!-- ============ Tier 4: worker fleet and Lavish ============ -->
-  <text x="40" y="787" class="sans" font-size="13.5" fill="#3a4d6b">+12 more = 18 built-in defaults</text>
+  <text x="40" y="787" class="sans" font-size="13.5" fill="#3a4d6b">+4 more = 10 built-in pipelines</text>
   <text x="240" y="789" class="hand" font-size="24" fill="#16202e" transform="rotate(-1 240 789)">or write your own: TOML + stage prompts</text>
   <path d="M596,782 Q634,789 659,769" fill="none" stroke="#1b2536" stroke-width="1.6" stroke-linecap="round" marker-end="url(#ah-ink)"/>
   <path d="M800,762 V798" stroke="#50658a" stroke-width="1.6" marker-end="url(#ah)"/>

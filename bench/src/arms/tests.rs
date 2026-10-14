@@ -27,7 +27,10 @@ pub(crate) fn settings() -> ArmSettings {
         claude_bin: "claude".into(),
         codex_bin: "codex".into(),
         archon_bin: "archon".into(),
-        aether_socket: Some("/run/aether.sock".into()),
+        sockets: Some(PrivateSockets {
+            aether: "/run/aether.sock".into(),
+            archon: "/run/archon.sock".into(),
+        }),
         archon_model: "claude-code/claude-opus-5-5".parse().unwrap(),
         aether_model: "claude-code/claude-opus-5-5".parse().unwrap(),
         claude_model: "claude-opus-5-5".into(),
@@ -563,7 +566,7 @@ async fn aether_arm_reads_usage_and_answer_from_the_daemon() {
     let layout = TrialLayout::under(&tmp.path().join("t"));
     crate::workspace::prepare(&task, &layout).unwrap();
     let mut s = settings();
-    s.aether_socket = Some(daemon.socket_path().to_path_buf());
+    s.sockets.as_mut().unwrap().aether = daemon.socket_path().to_path_buf();
     let input = TrialInput {
         task: &task,
         layout: &layout,
@@ -625,7 +628,7 @@ async fn aether_arm_reads_events_after_the_final_turn_ends() {
     let layout = TrialLayout::under(&tmp.path().join("t"));
     crate::workspace::prepare(&task, &layout).unwrap();
     let mut s = settings();
-    s.aether_socket = Some(daemon.socket_path().to_path_buf());
+    s.sockets.as_mut().unwrap().aether = daemon.socket_path().to_path_buf();
     let input = TrialInput {
         task: &task,
         layout: &layout,
@@ -644,6 +647,30 @@ async fn aether_arm_reads_events_after_the_final_turn_ends() {
         .filter(|c| c == "get_agent" || c == "get_events")
         .collect();
     assert_eq!(order, ["get_agent", "get_agent", "get_agent", "get_events"]);
+}
+
+#[tokio::test]
+async fn daemon_arms_refuse_to_run_without_a_private_sandbox() {
+    let tmp = scratch();
+    let task = bundled("fix-off-by-one");
+    let layout = TrialLayout::under(&tmp.path().join("t"));
+    let mut s = settings();
+    s.sockets = None;
+    let input = TrialInput {
+        task: &task,
+        layout: &layout,
+        settings: &s,
+        timeout: Duration::from_secs(60),
+        key: "k",
+    };
+    for outcome in [
+        aether::run_aether(&input).await,
+        archon::run_archon(&input).await,
+    ] {
+        let error = outcome.error.unwrap();
+        assert!(error.contains("no private sandbox"), "{error}");
+    }
+    assert!(!layout.archon.exists(), "no archond was set up");
 }
 
 fn agent_in(state: &str) -> serde_json::Value {
@@ -684,7 +711,7 @@ async fn archon_teardown_cancels_the_orchestrator_only_after_archond_exits() {
     let orchestrator = AetherAgentId::parse("agt_orch").unwrap();
 
     archond
-        .exit_then_cancel(Some(&orchestrator), Some(aether.socket_path()), Vec::new())
+        .exit_then_cancel(Some(&orchestrator), aether.socket_path(), Vec::new())
         .await
         .unwrap();
 

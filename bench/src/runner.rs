@@ -26,7 +26,7 @@ struct Shared {
     tasks: Vec<BenchTask>,
     settings: ArmSettings,
     options: RunOptions,
-    /// Only one private archond can own the default socket at a time.
+    /// Only one private archond can own the sandbox socket at a time.
     archon_lock: tokio::sync::Mutex<()>,
     ledger: Mutex<Ledger>,
 }
@@ -322,12 +322,7 @@ pub async fn collect_versions(settings: &ArmSettings, arms: &[Arm]) -> BTreeMap<
         versions.insert("archon".to_owned(), version_of(&settings.archon_bin));
     }
     if wanted(Arm::Archon) || wanted(Arm::Aether) {
-        let endpoint = arms::aether::endpoint(settings.aether_socket.as_deref());
-        let aetherd = match AetherClient::connect(&endpoint).await {
-            Ok(client) => client.welcome().daemon_version.clone(),
-            Err(e) => format!("unreachable: {e}"),
-        };
-        versions.insert("aetherd".to_owned(), aetherd);
+        versions.insert("aetherd".to_owned(), aetherd_version(settings).await);
     }
     let home = std::env::var_os("HOME");
     let home = home.as_ref().map(|value| value.to_string_lossy());
@@ -335,6 +330,19 @@ pub async fn collect_versions(settings: &ArmSettings, arms: &[Arm]) -> BTreeMap<
         *version = redact_home(version, home.as_deref());
     }
     versions
+}
+
+/// Only a validated private socket is probed; a default one could be the
+/// operator's daemon.
+async fn aetherd_version(settings: &ArmSettings) -> String {
+    let Some(sockets) = &settings.sockets else {
+        return "aetherd not probed: no private sandbox".to_owned();
+    };
+    let endpoint = arms::aether::endpoint(&sockets.aether);
+    match AetherClient::connect(&endpoint).await {
+        Ok(client) => client.welcome().daemon_version.clone(),
+        Err(e) => format!("unreachable: {e}"),
+    }
 }
 
 async fn start_manifest(
@@ -424,5 +432,17 @@ mod tests {
                 .unwrap()
                 .starts_with("grader remark; capturing Archon routing:")
         );
+    }
+
+    #[tokio::test]
+    async fn versions_never_probe_aetherd_without_a_private_sandbox() {
+        let mut settings = crate::arms::tests::settings();
+        settings.sockets = None;
+        let versions = collect_versions(&settings, &[Arm::Aether]).await;
+        assert_eq!(
+            versions["aetherd"],
+            "aetherd not probed: no private sandbox"
+        );
+        assert_eq!(versions.len(), 1);
     }
 }
