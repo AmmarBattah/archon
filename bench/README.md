@@ -252,8 +252,11 @@ archon-bench report bench/results/<stamp>
 Set up the private environment from [the smoke instructions](results-smoke/README.md)
 first. Every live `run` selecting `archon` or `aether` performs the same sandbox
 preflight as smoke, before collecting versions or starting trials. Plans with
-`--dry-run` remain available without a sandbox or baseline. Recorded version
-strings and connection diagnostics replace the operator's home path with `$HOME`.
+`--dry-run` remain available without a sandbox or baseline. Such a dry run
+resolves, probes and prints no daemon socket: aetherd's version reads `aetherd
+not probed` and the `archon` arm shows `refused`. With a valid sandbox it
+probes only the sandbox's sockets. Recorded version strings and connection
+diagnostics replace the operator's home path with `$HOME`.
 
 ## Quality smoke gate
 

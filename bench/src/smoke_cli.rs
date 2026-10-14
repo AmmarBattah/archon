@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
+use archon_bench::arms::PrivateSockets;
 use archon_bench::{plan, smoke};
 use archon_core::model::{Effort, ModelRef};
 use clap::Args;
@@ -74,7 +75,7 @@ pub async fn run(tasks_root: &Path, args: SmokeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_sockets(aether: Option<&Path>) -> anyhow::Result<()> {
+pub(super) fn validate_sockets(aether: Option<&Path>) -> anyhow::Result<PrivateSockets> {
     let aether = aether.context("daemon arms need --aether-socket for a private sandbox")?;
     let archon = std::env::var_os("ARCHON_SOCKET")
         .map(PathBuf::from)
@@ -99,7 +100,10 @@ pub(super) fn validate_sockets(aether: Option<&Path>) -> anyhow::Result<()> {
             "sandbox config/data directories must be distinct ({name})"
         );
     }
-    Ok(())
+    Ok(PrivateSockets {
+        aether: aether.to_path_buf(),
+        archon,
+    })
 }
 
 fn validate_private_directory(

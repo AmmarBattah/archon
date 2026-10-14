@@ -265,8 +265,12 @@ pub fn describe_arm(arm: Arm, input: &TrialInput<'_>) -> anyhow::Result<Vec<Stri
 }
 
 fn describe_archon(input: &TrialInput<'_>) -> anyhow::Result<Vec<String>> {
-    let socket = archon_client::default_socket();
-    let daemon = archon_daemon_command(input.settings, &input.layout.archon, &socket);
+    let Some(sockets) = &input.settings.sockets else {
+        return Ok(vec![
+            "refused: no private sandbox, so a live run starts no archond".to_owned(),
+        ]);
+    };
+    let daemon = archon_daemon_command(input.settings, &input.layout.archon, &sockets.archon);
     let config = archon_config_toml(input.settings)?.replace('\n', "\n      ");
     let mut lines = vec![
         format!(

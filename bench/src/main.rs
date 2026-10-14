@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure};
-use archon_bench::arms::ArmSettings;
+use archon_bench::arms::{ArmSettings, PrivateSockets};
 use archon_bench::isolation::Protected;
 use archon_bench::metrics::Arm;
 use archon_bench::plan::{self, RunOptions};
@@ -124,7 +124,7 @@ struct RunArgs {
     codex_bin: PathBuf,
     #[arg(long, default_value = "archon")]
     archon_bin: PathBuf,
-    /// aetherd's socket; defaults to Aether's own resolution.
+    /// The private sandbox aetherd's socket; the daemon arms require it.
     #[arg(long)]
     aether_socket: Option<PathBuf>,
 }
@@ -155,14 +155,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<Option<PathBuf>> {
-    if !args.dry_run
-        && args
-            .arms
-            .iter()
-            .any(|arm| matches!(arm, Arm::Archon | Arm::Aether))
-    {
-        smoke_cli::validate_sockets(args.aether_socket.as_deref())?;
-    }
+    let sockets = private_sockets(&args)?;
     let tasks = BenchTask::select(BenchTask::load_all(tasks_root)?, &args.only)?;
     let protected = Protected::for_run(tasks_root, &args.results_dir)?;
     let work_dir = match &args.work_dir {
@@ -171,6 +164,7 @@ async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<Option<PathBuf>
     };
     protected.check_work_dir(&work_dir)?;
     let mut settings = settings(&args)?;
+    settings.sockets = sockets;
     settings.env = protected.scrub_env(std::env::vars_os());
     let options = RunOptions {
         arms: args.arms.clone(),
@@ -205,6 +199,26 @@ async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<Option<PathBuf>
     Ok(Some(dir))
 }
 
+/// The sandbox sockets the daemon arms use. A dry run may go without, but
+/// then nothing resolves, probes or prints a default socket.
+fn private_sockets(args: &RunArgs) -> anyhow::Result<Option<PrivateSockets>> {
+    let daemons = args
+        .arms
+        .iter()
+        .any(|arm| matches!(arm, Arm::Archon | Arm::Aether));
+    if !daemons {
+        return Ok(None);
+    }
+    match smoke_cli::validate_sockets(args.aether_socket.as_deref()) {
+        Ok(sockets) => Ok(Some(sockets)),
+        Err(e) if args.dry_run => {
+            eprintln!("dry run with no private sandbox, so no daemon is probed: {e:#}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn program_of(arm: Arm) -> &'static str {
     match arm {
         Arm::Archon => "archon",
@@ -236,7 +250,7 @@ fn settings(args: &RunArgs) -> anyhow::Result<ArmSettings> {
         claude_bin: args.claude_bin.clone(),
         codex_bin: args.codex_bin.clone(),
         archon_bin: args.archon_bin.clone(),
-        aether_socket: args.aether_socket.clone(),
+        sockets: None,
         archon_model: args
             .archon_model
             .clone()
