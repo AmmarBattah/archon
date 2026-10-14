@@ -49,6 +49,8 @@ starts one.
   it, and relays a success without checking it again with git. Its prompt
   names `autonomy.review`, which it set at the top level and was refused.
   A brief now starts with the request's own words.
+- The orchestrator is told its workspace is its working directory, and to
+  read a repository's code in its mirror, never searching the disk for it.
 
 ## 1.1.0
 

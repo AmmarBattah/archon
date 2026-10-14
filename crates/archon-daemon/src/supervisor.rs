@@ -146,8 +146,9 @@ fn installation(workspace: &Path, user_pipelines: &Path, depth: u32) -> String {
     };
     format!(
         "\n## This installation\n\n\
-         - Your workspace: `{}`. A repository's mirror is `{}/<name>` in it; `{}/` is for a \
-         helper that reads no code.\n\
+         - Your workspace and working directory: `{}`. A repository's mirror is `{}/<name>` \
+         in it: read its code there, and never search the disk for it. `{}/` is for a helper \
+         that reads no code.\n\
          - User pipelines directory: `{}`.\n\
          - Delegation depth: {depth}. To keep within it, {leaf}.\n",
         workspace.display(),
@@ -1429,8 +1430,9 @@ mod tests {
         assert!(prompt.contains(&shown), "the prompt never gives {shown}");
         assert!(
             prompt.contains(
-                "Your workspace: `/data/orchestrator`. A repository's mirror is `repos/<name>` \
-                 in it; `scratch/` is for a helper that reads no code."
+                "Your workspace and working directory: `/data/orchestrator`. A repository's \
+                 mirror is `repos/<name>` in it: read its code there, and never search the disk \
+                 for it. `scratch/` is for a helper that reads no code."
             ),
             "where the mirrors are: {prompt}"
         );
