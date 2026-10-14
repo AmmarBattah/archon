@@ -156,5 +156,5 @@ admins, and only logins you configure carry your authority. Read
 [Queue scripting](docs/queue-scripting.md) ·
 [GitHub watcher](docs/github-watcher.md) · [Architecture](docs/ARCHITECTURE.md)
 
-Project version: **1.2.0**. Licensed under [MIT](LICENSE). For development,
+Project version: **1.2.1**. Licensed under [MIT](LICENSE). For development,
 see [CONTRIBUTING.md](CONTRIBUTING.md).
