@@ -7,6 +7,8 @@ fn evidence() -> (Baseline, RunManifest, Vec<TrialResult>) {
         tasks: TASKS.map(str::to_owned).to_vec(),
         model: "claude-code/claude-haiku-5-5".into(),
         effort: "high".into(),
+        max_usd: DEFAULT_MAX_USD,
+        candidate: false,
         archon_successes: 4,
         archon_trials: 4,
         source_run: "unit-test-fixture".into(),
@@ -26,6 +28,7 @@ fn evidence() -> (Baseline, RunManifest, Vec<TrialResult>) {
     manifest.completed = 8;
     manifest.skipped = 0;
     manifest.spent_usd = 4.0;
+    manifest.max_usd = DEFAULT_MAX_USD;
     manifest.unpriced_trials = 0;
     manifest.stopped_reason = None;
     let mut results = Vec::new();
@@ -151,4 +154,84 @@ fn failing_gate_is_persisted_and_returns_an_error() {
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("gate.json")).unwrap())
             .unwrap();
     assert!(!gate.passed);
+}
+
+#[test]
+fn increased_or_invalid_caps_cannot_pass() {
+    let (mut baseline, mut manifest, results) = evidence();
+    assert!(evaluate(&results, &manifest, &baseline, DEFAULT_MAX_USD + 1.0).is_err());
+    for cap in [DEFAULT_MAX_USD + 1.0, f64::NAN, 0.0, -1.0] {
+        manifest.max_usd = cap;
+        assert!(evaluate(&results, &manifest, &baseline, DEFAULT_MAX_USD).is_err());
+    }
+    for cap in [f64::NAN, 0.0, -1.0] {
+        baseline.max_usd = cap;
+        assert!(baseline.validate().is_err());
+    }
+    manifest.max_usd = 3.99;
+    baseline.max_usd = DEFAULT_MAX_USD;
+    assert!(evaluate(&results, &manifest, &baseline, DEFAULT_MAX_USD).is_err());
+}
+
+fn write_evidence(dir: &Path, manifest: &RunManifest, results: &[TrialResult]) {
+    assert!(dir.is_dir());
+    assert_eq!(manifest.completed, results.len());
+    std::fs::write(
+        dir.join("run.json"),
+        serde_json::to_string(manifest).unwrap(),
+    )
+    .unwrap();
+    let lines: Vec<_> = results
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect();
+    std::fs::write(dir.join("results.jsonl"), lines.join("\n")).unwrap();
+}
+
+#[test]
+fn bootstrap_writes_a_candidate_that_requires_explicit_review() {
+    let (baseline, manifest, results) = evidence();
+    let dir = tempfile::tempdir().unwrap();
+    write_evidence(dir.path(), &manifest, &results);
+    write_candidate(dir.path()).unwrap();
+    let path = dir.path().join("candidate-baseline.json");
+    assert!(
+        Baseline::load(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("review")
+    );
+    let mut candidate: Baseline =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(candidate.candidate);
+    assert_eq!(candidate.max_usd, manifest.max_usd);
+    assert_eq!(candidate.archon_successes, baseline.archon_successes);
+    assert_eq!(candidate.source_run, manifest.stamp);
+    candidate.candidate = false;
+    assert!(
+        evaluate(&results, &manifest, &candidate, candidate.max_usd)
+            .unwrap()
+            .passed
+    );
+    assert!(!dir.path().join("baseline.json").exists());
+}
+
+#[test]
+fn bootstrap_rejects_partial_unpriced_and_zero_pass_evidence() {
+    let (_, mut manifest, mut results) = evidence();
+    let dir = tempfile::tempdir().unwrap();
+    manifest.finished_at = None;
+    write_evidence(dir.path(), &manifest, &results);
+    assert!(write_candidate(dir.path()).is_err());
+    manifest.finished_at = Some(archon_core::now());
+    results[0].cost_usd = None;
+    write_evidence(dir.path(), &manifest, &results);
+    assert!(write_candidate(dir.path()).is_err());
+    results[0].cost_usd = Some(0.5);
+    for result in &mut results {
+        result.success = false;
+    }
+    write_evidence(dir.path(), &manifest, &results);
+    assert!(write_candidate(dir.path()).is_err());
+    assert!(!dir.path().join("candidate-baseline.json").exists());
 }

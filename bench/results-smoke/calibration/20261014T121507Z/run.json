@@ -4,7 +4,7 @@
   "finished_at": null,
   "archon_commit": "3da3e125b810b8acf3076bbf57d536c174a01b07",
   "versions": {
-    "aetherd": "unreachable: io: connecting to aetherd at /home/mengsig/.local/share/archon-bench/qg7b/run/aetherd.sock: No such file or directory (os error 2)",
+    "aetherd": "unreachable: io: connecting to aetherd at $XDG_DATA_HOME/archon-bench/qg7b/run/aetherd.sock: No such file or directory (os error 2)",
     "archon": "archon 1.1.0"
   },
   "models": {

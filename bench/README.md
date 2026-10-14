@@ -45,6 +45,12 @@ Every arm gets the same prompt, effort and time limit, with tool permission
 prompts bypassed. `archon`, `aether` and `claude` use the same model.
 `archon` and `aether` run on the same Aether daemon.
 
+Live test and benchmark runs use `claude-code/claude-haiku-5-5` or
+`codex/gpt-6-luna` under the operator's model rule. Plain `run` defaults to
+Haiku for `archon`, `aether` and `claude`, and Luna for `codex`; these defaults
+are independent of local daemon configuration. Historical Opus/Sol snapshots
+below describe earlier runs, not the current test defaults.
+
 ## Isolation and anti-gaming
 
 - Each trial starts from a fresh copy of the fixtures, `git init`ed with one
@@ -232,13 +238,19 @@ archon-bench run --dry-run
 archon-bench run --trials 3 --parallel 3 --effort high \
   --model claude-code/claude-haiku-5-5 \
   --arms archon,aether \
-  --aether-socket ~/.local/share/archon-live/aether.sock \
+  --aether-socket "$AETHER_SOCKET" \
   --max-usd 37
 archon-bench report bench/results/<stamp>
 ```
 
 (`archon-bench` is `cargo run -p archon-bench --`.) Results land in
 `bench/results/<stamp>/`, which is gitignored.
+
+Set up the private environment from [the smoke instructions](results-smoke/README.md)
+first. Every live `run` selecting `archon` or `aether` performs the same sandbox
+preflight as smoke, before collecting versions or starting trials. Plans with
+`--dry-run` remain available without a sandbox or baseline. Recorded version
+strings and connection diagnostics replace the operator's home path with `$HOME`.
 
 ## Quality smoke gate
 
@@ -269,7 +281,8 @@ ARCHON_SOCKET=<private-sandbox>/run/archond.sock archon-bench smoke \
 ```
 
 All four `ARCHON_CONFIG_DIR`, `ARCHON_DATA_DIR`, `AETHER_CONFIG_DIR` and
-`AETHER_DATA_DIR` must also be set to existing private directories. Retain this
+`AETHER_DATA_DIR` must also be set to existing, distinct private directories
+below that sandbox root; aliases to the same directory are rejected. Retain this
 entire environment for every diagnostic: ordinary Archon CLI commands can
 autostart a daemon, even a queue read. Prefer saved captures. Both sockets must be under `$XDG_DATA_HOME/archon-bench` (normally
 `~/.local/share/archon-bench`), with real parent directories. The sandbox
@@ -289,12 +302,31 @@ that file must point to a separately measured Luna baseline. Do not compare
 a different model against Haiku's threshold. Aether's accuracy is reported as the comparison arm; Archon's rate
 is the quality gate. The command never updates the baseline automatically.
 
+Bootstrap the first baseline after setting up the private environment:
+
+```sh
+archon-bench smoke --bootstrap --archon-bin "$sandbox/bin/archon" \
+  --aether-socket "$AETHER_SOCKET"
+```
+
+This runs the exact preset under the shared preflight without reading
+`baseline.json`. Only complete, priced, within-budget evidence with a positive
+Archon pass count produces `<results>/<stamp>/candidate-baseline.json`.
+Review the run, its failures, model, effort, budget and provenance. In a reviewed
+commit, copy the candidate to `bench/results-smoke/baseline.json` and change
+`candidate` to `false`. Candidate files are rejected by the gate until reviewed;
+bootstrap never promotes or overwrites the stored baseline.
+
 `--max-usd` stops admission once completed spend reaches the limit and also
 checks total spend at the end. It is **not a provider hard billing cap**: an
 already running trial may exceed it. Serial execution limits the overshoot
 to that trial. A partial or over-budget run exits nonzero; keep its evidence,
 investigate, and explicitly budget a new run. Costs use the same billed or
 estimated accounting as the full suite.
+
+The baseline records `max_usd`; neither the requested check cap nor the
+recorded run cap may exceed it. Total spend must satisfy both the run cap and
+the requested check cap. Increasing the budget requires a reviewed baseline.
 
 To check committed evidence without paying again:
 

@@ -5,7 +5,7 @@
 - Effort: `high`; trials per task and arm: 1; parallel: 1
 - Model `aether`: `claude-code/claude-haiku-5-5`
 - Model `archon`: `claude-code/claude-haiku-5-5`
-- Version `aetherd`: `unreachable: io: connecting to aetherd at /home/mengsig/.local/share/archon-bench/qg7h/run/aetherd.sock: No such file or directory (os error 2)`
+- Version `aetherd`: `unreachable: io: connecting to aetherd at $XDG_DATA_HOME/archon-bench/qg7h/run/aetherd.sock: No such file or directory (os error 2)`
 - Version `archon`: `archon 1.1.0`
 - Trials: 8 planned, 0 completed, 0 skipped; spent $0.00 of $0.70
 

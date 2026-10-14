@@ -35,6 +35,17 @@ class HistoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "distinct"):
                 history.read_rows([root, root])
 
+    def test_null_cost_and_null_cost_mean_raise_value_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for cost in [None, dict(n=1, mean=None)]:
+                self.write_chart(root)
+                data = json.loads((root / "chart.json").read_text())
+                data["arms"][0]["cost_usd"] = cost
+                (root / "chart.json").write_text(json.dumps(data))
+                with self.assertRaisesRegex(ValueError, "partly unpriced"):
+                    history.read_rows([root])
+
 
 if __name__ == "__main__":
     unittest.main()

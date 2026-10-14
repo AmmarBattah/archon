@@ -24,12 +24,14 @@ def read_rows(directories):
         if {arm["arm"] for arm in selected} != set(ARMS) or len(selected) != 2:
             raise ValueError(f"{directory} needs exactly one summary for each arm")
         for arm in selected:
-            if arm["trials"] <= 0 or arm["cost_usd"]["n"] != arm["trials"]:
+            cost = arm["cost_usd"]
+            if (arm["trials"] <= 0 or cost is None
+                    or cost["n"] != arm["trials"] or cost["mean"] is None):
                 raise ValueError(f"{directory} has empty or partly unpriced trials")
             row = dict(version=directory.name.removeprefix("results-"), arm=arm["arm"],
                        trials=arm["trials"], tasks=len(data["tasks"]),
                        pass_rate=100 * arm["success_rate"],
-                       cost_usd=arm["cost_usd"]["mean"], wall_secs=arm["wall_secs"]["mean"])
+                       cost_usd=cost["mean"], wall_secs=arm["wall_secs"]["mean"])
             if any(not math.isfinite(row[key]) or row[key] < 0 for key, _ in METRICS):
                 raise ValueError(f"{directory} has invalid metrics")
             rows.append(row)

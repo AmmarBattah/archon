@@ -126,12 +126,12 @@ fn the_default_work_dir_is_outside_the_checkout() {
         work_dir_from(xdg.map(Into::into), home.map(Into::into))
     };
     assert_eq!(
-        dir(Some("/x/data"), Some("/home/u")).unwrap(),
+        dir(Some("/x/data"), Some("/users/u")).unwrap(),
         Path::new("/x/data/archon-bench/work")
     );
     assert_eq!(
-        dir(Some("relative"), Some("/home/u")).unwrap(),
-        Path::new("/home/u/.local/share/archon-bench/work")
+        dir(Some("relative"), Some("/users/u")).unwrap(),
+        Path::new("/users/u/.local/share/archon-bench/work")
     );
     assert!(dir(None, None).is_err());
     let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("tasks");

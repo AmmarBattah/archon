@@ -9,8 +9,10 @@ complete, reviewed Haiku run supplies it. `smoke --dry-run` still prints the pla
 Completed Haiku cells: Archon fix-off-by-one passed (90 s, $0.0327), Aether
 fix-off-by-one passed (35 s, $0.0088), and Archon ledger passed (326 s, $0.1214).
 The remaining cells have **no verdict**, not failures or implied passes.
-Original `run.json` and `results.jsonl` are preserved; the interrupted manifest
-has no finish time. The summaries describe only completed trials.
+Original measurements in `run.json` and `results.jsonl` are preserved; home paths
+in version diagnostics are redacted as recorded in `provenance.json`. The
+interrupted manifest has no finish time. The summaries describe only completed
+trials.
 
 All-agent accounting is in `accounting.json`: earlier Opus calibration $11.1931992,
 Haiku task agents $0.16886092, accidental Opus agents $0.7771906, total
@@ -25,9 +27,10 @@ can autostart a daemon. With the trial daemon gone, it started against operator
 data and launched unrelated Opus agents on private Aether. Those agents made
 operator queue/carryover changes before shutdown. The private daemons were
 stopped and the incident was reported for recovery; no blind rollback was made.
-The benchmark process itself had all private variables. The new smoke preflight
-now requires all four private config/data directories; diagnostic commands must
-retain the entire private environment too. Prefer saved captures for inspection.
+The benchmark process itself had all private variables. The shared run/smoke
+preflight now requires all four private config/data directories to be distinct;
+diagnostic commands must retain the entire private environment too. Prefer saved
+captures for inspection.
 
 The calibration passed both ledger and retry with careful implementations; it
 did not demonstrate an accuracy difference between arms or review rescuing a
@@ -46,7 +49,7 @@ sandbox Aether daemon alive across the paired trials, then stop it explicitly.
 
 ```sh
 CARGO_PROFILE_DEV_DEBUG=0 cargo build -p archon -p archon-bench --locked
-sandbox="$HOME/.local/share/archon-bench/quality-$(date -u +%Y%m%dT%H%M%SZ)"
+sandbox="${XDG_DATA_HOME:-$HOME/.local/share}/archon-bench/q-$(date -u +%H%M%S)"
 mkdir -p "$sandbox/bin" "$sandbox/config/aether" "$sandbox/data/aether" \
   "$sandbox/run" "$sandbox/tmp" "$sandbox/archon/config" "$sandbox/archon/data"
 cp target/debug/archon "$sandbox/bin/archon"
@@ -65,9 +68,7 @@ sandbox_pid=$!
 # Wait until `aether status --socket "$AETHER_SOCKET"` reports ready.
 target/debug/archon-bench verify
 # Bootstrap the first baseline using the exact preset, then review its results.
-target/debug/archon-bench run --arms archon,aether --trials 1 --parallel 1 \
-  --only fix-off-by-one,quality-ledger-transfer,quality-retry-budget,review-seeded-bug \
-  --model claude-code/claude-haiku-5-5 --effort high --max-usd 7 --max-trials 8 \
+target/debug/archon-bench smoke --bootstrap \
   --archon-bin "$sandbox/bin/archon" --aether-socket "$AETHER_SOCKET"
 aether stop --socket "$AETHER_SOCKET"
 wait "$sandbox_pid"
@@ -88,6 +89,14 @@ check also refuses an over-budget total, unpriced trials, incomplete cells,
 timeouts and infrastructure failures. Keep a failed run for diagnosis instead
 of lowering the baseline. One trial per cell cannot prove a task always passes
 or establish how much review improves reliability.
+
+Bootstrap does not read or overwrite `baseline.json`. A complete, priced run
+within its cap and with at least one Archon pass writes `candidate-baseline.json`
+in its results directory, marked `"candidate": true`. Review the results,
+failures and provenance before copying that file to `baseline.json` with
+`candidate` changed to `false` in a reviewed commit. Keep `source_run` and
+`max_usd` from the measured run. The gate rejects candidates and any run or
+check cap above the reviewed baseline's cap.
 
 After a complete run establishes `baseline.json`, recheck its evidence without
 a daemon or model call (the incomplete evidence here cannot pass):

@@ -16,6 +16,7 @@ pub const TASKS: [&str; 4] = [
     "review-seeded-bug",
 ];
 pub const DEFAULT_MAX_USD: f64 = 7.0;
+pub const ARMS: [Arm; 2] = [Arm::Archon, Arm::Aether];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +25,9 @@ pub struct Baseline {
     pub tasks: Vec<String>,
     pub model: String,
     pub effort: String,
+    pub max_usd: f64,
+    #[serde(default)]
+    pub candidate: bool,
     pub archon_successes: u32,
     pub archon_trials: u32,
     pub source_run: String,
@@ -39,6 +43,10 @@ impl Baseline {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.candidate,
+            "candidate baseline requires review before use"
+        );
         ensure!(self.suite_version == 1, "unsupported smoke suite version");
         ensure!(
             self.tasks == TASKS,
@@ -46,7 +54,8 @@ impl Baseline {
         );
         ensure!(
             self.archon_trials == TASKS.len() as u32,
-            "baseline needs four Archon trials"
+            "baseline needs {} Archon trials",
+            TASKS.len()
         );
         ensure!(
             (1..=self.archon_trials).contains(&self.archon_successes),
@@ -57,11 +66,44 @@ impl Baseline {
             "baseline lacks model or effort"
         );
         ensure!(
+            self.max_usd.is_finite() && self.max_usd > 0.0,
+            "invalid baseline cost cap"
+        );
+        ensure!(
             !self.source_run.is_empty() && self.source_run != "pending",
             "baseline lacks a completed evidence run (template is not a baseline)"
         );
         Ok(())
     }
+}
+
+pub fn write_candidate(dir: &Path) -> anyhow::Result<()> {
+    let results = summary::read_results(&dir.join("results.jsonl"))?;
+    let manifest = summary::read_manifest(dir)?.context("bootstrap needs run.json")?;
+    let mut baseline = Baseline {
+        suite_version: 1,
+        tasks: TASKS.map(str::to_owned).to_vec(),
+        model: manifest
+            .models
+            .get("archon")
+            .context("missing Archon model")?
+            .clone(),
+        effort: manifest.effort.clone(),
+        max_usd: manifest.max_usd,
+        candidate: false,
+        archon_successes: 1,
+        archon_trials: TASKS.len() as u32,
+        source_run: manifest.stamp.clone(),
+    };
+    let gate = evaluate(&results, &manifest, &baseline, baseline.max_usd)?;
+    baseline.archon_successes = gate.archon_successes;
+    baseline.validate()?;
+    baseline.candidate = true;
+    let path = dir.join("candidate-baseline.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&baseline)?)
+        .with_context(|| format!("writing candidate baseline {}", path.display()))?;
+    println!("candidate baseline: {} (review required)", path.display());
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,10 +147,15 @@ pub fn evaluate(
         max_usd.is_finite() && max_usd > 0.0,
         "invalid smoke cost cap"
     );
+    ensure!(
+        max_usd <= baseline.max_usd,
+        "smoke cost cap exceeds baseline cap"
+    );
     validate_manifest(manifest, baseline)?;
     ensure!(
-        results.len() == TASKS.len() * 2,
-        "smoke requires all eight results"
+        results.len() == TASKS.len() * ARMS.len(),
+        "smoke requires all {} results",
+        TASKS.len() * ARMS.len()
     );
     let mut cells = BTreeSet::new();
     let mut total_cost_usd = 0.0;
@@ -127,14 +174,14 @@ pub fn evaluate(
         archon_successes += u32::from(result.arm == Arm::Archon && result.success);
     }
     ensure!(
-        total_cost_usd <= max_usd,
+        total_cost_usd <= max_usd.min(manifest.max_usd),
         "smoke exceeded ${max_usd:.2}: ${total_cost_usd:.2}"
     );
     ensure!(
         (manifest.spent_usd - total_cost_usd).abs() < 0.000001,
         "run.json spend disagrees with results.jsonl"
     );
-    assert_eq!(cells.len(), TASKS.len() * 2);
+    assert_eq!(cells.len(), TASKS.len() * ARMS.len());
     assert!(archon_successes <= baseline.archon_trials);
     Ok(Gate {
         passed: archon_successes >= baseline.archon_successes,
@@ -150,18 +197,25 @@ fn validate_manifest(manifest: &RunManifest, baseline: &Baseline) -> anyhow::Res
         manifest.tasks == baseline.tasks,
         "run used different smoke tasks"
     );
-    ensure!(
-        manifest.arms == [Arm::Archon, Arm::Aether],
-        "smoke needs both arms"
-    );
+    ensure!(manifest.arms == ARMS, "smoke needs both arms");
     ensure!(
         manifest.trials == 1 && manifest.parallel == 1,
         "smoke requires one serial trial per cell"
     );
     ensure!(manifest.timeout_factor == 1.0, "smoke time limits changed");
     ensure!(
-        manifest.planned == 8 && manifest.completed == 8 && manifest.skipped == 0,
+        manifest.planned == TASKS.len() * ARMS.len()
+            && manifest.completed == manifest.planned
+            && manifest.skipped == 0,
         "incomplete smoke run; budget stops cannot pass"
+    );
+    ensure!(
+        manifest.max_usd.is_finite() && manifest.max_usd > 0.0,
+        "invalid run cost cap"
+    );
+    ensure!(
+        manifest.max_usd <= baseline.max_usd,
+        "run cost cap exceeds baseline cap"
     );
     ensure!(
         manifest.finished_at.is_some() && manifest.stopped_reason.is_none(),
@@ -175,9 +229,9 @@ fn validate_manifest(manifest: &RunManifest, baseline: &Baseline) -> anyhow::Res
         manifest.effort == baseline.effort,
         "effort differs from baseline"
     );
-    for arm in ["archon", "aether"] {
+    for arm in ARMS {
         ensure!(
-            manifest.models.get(arm) == Some(&baseline.model),
+            manifest.models.get(arm.name()) == Some(&baseline.model),
             "{arm} model differs from baseline"
         );
     }
@@ -190,10 +244,7 @@ fn validate_result(result: &TrialResult, baseline: &Baseline) -> anyhow::Result<
         "unexpected smoke task {}",
         result.task
     );
-    ensure!(
-        matches!(result.arm, Arm::Archon | Arm::Aether),
-        "unexpected smoke arm"
-    );
+    ensure!(ARMS.contains(&result.arm), "unexpected smoke arm");
     ensure!(result.trial == 1, "smoke trial number must be 1");
     ensure!(
         result.error.is_none(),

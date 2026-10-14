@@ -40,7 +40,7 @@ enum BenchCommand {
     List,
     /// Run trials and write results.jsonl, run.json, summary.md, chart.json and report.html.
     Run(Box<RunArgs>),
-    /// Run the fixed eight-trial quality gate against the stored baseline.
+    /// Run the fixed quality gate or bootstrap a candidate baseline.
     Smoke(Box<smoke_cli::SmokeArgs>),
     /// Re-render summary.md, chart.json and report.html from a results directory.
     Report {
@@ -155,6 +155,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(tasks_root: &Path, args: RunArgs) -> anyhow::Result<Option<PathBuf>> {
+    if !args.dry_run
+        && args
+            .arms
+            .iter()
+            .any(|arm| matches!(arm, Arm::Archon | Arm::Aether))
+    {
+        smoke_cli::validate_sockets(args.aether_socket.as_deref())?;
+    }
     let tasks = BenchTask::select(BenchTask::load_all(tasks_root)?, &args.only)?;
     let protected = Protected::for_run(tasks_root, &args.results_dir)?;
     let work_dir = match &args.work_dir {

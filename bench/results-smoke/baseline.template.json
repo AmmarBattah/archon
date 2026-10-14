@@ -1,9 +1,15 @@
 {
   "suite_version": 1,
-  "tasks": ["fix-off-by-one", "quality-ledger-transfer", "quality-retry-budget", "review-seeded-bug"],
+  "tasks": [
+    "fix-off-by-one",
+    "quality-ledger-transfer",
+    "quality-retry-budget",
+    "review-seeded-bug"
+  ],
   "model": "claude-code/claude-haiku-5-5",
   "effort": "high",
   "archon_successes": 4,
   "archon_trials": 4,
-  "source_run": "pending"
+  "source_run": "pending",
+  "max_usd": 7.0
 }

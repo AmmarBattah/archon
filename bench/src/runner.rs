@@ -16,7 +16,7 @@ use crate::arms::{self, ArmOutcome, ArmSettings, TrialInput};
 use crate::grade::{self, GradeOutcome, ResultSource};
 use crate::metrics::{Arm, RunManifest, TrialResult};
 use crate::plan::{Budget, RunOptions, TrialSpec, check_plan, plan};
-use crate::process::version_of;
+use crate::process::{redact_home, version_of};
 use crate::task::BenchTask;
 use crate::workspace::{self, TrialLayout};
 
@@ -328,6 +328,11 @@ pub async fn collect_versions(settings: &ArmSettings, arms: &[Arm]) -> BTreeMap<
             Err(e) => format!("unreachable: {e}"),
         };
         versions.insert("aetherd".to_owned(), aetherd);
+    }
+    let home = std::env::var_os("HOME");
+    let home = home.as_ref().map(|value| value.to_string_lossy());
+    for version in versions.values_mut() {
+        *version = redact_home(version, home.as_deref());
     }
     versions
 }

@@ -2,6 +2,8 @@
 
 Implement `extract(entries, root) -> list[str]`. Entries are a list of
 `(name, data)` tuples for regular files; name is a string and data is bytes.
+Reject a non-list batch with ValueError, including tuples, iterators and
+generators, even when empty; do not consume them or change the filesystem.
 Root is a pathlib.Path or string naming an existing directory. Return entry
 names in input order. The caller owns a stable filesystem: concurrent changes
 and rollback after I/O errors are outside this API's scope.

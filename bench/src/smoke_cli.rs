@@ -1,7 +1,7 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
-use archon_bench::metrics::Arm;
 use archon_bench::{plan, smoke};
 use archon_core::model::{Effort, ModelRef};
 use clap::Args;
@@ -19,6 +19,9 @@ pub struct SmokeArgs {
     max_usd: f64,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/results-smoke/baseline.json"))]
     baseline: PathBuf,
+    /// Run without a baseline and write candidate-baseline.json for review.
+    #[arg(long, conflicts_with = "check_results")]
+    bootstrap: bool,
     /// Check existing results without spending money.
     #[arg(long, conflicts_with = "dry_run")]
     check_results: Option<PathBuf>,
@@ -38,6 +41,13 @@ pub async fn run(tasks_root: &Path, args: SmokeArgs) -> anyhow::Result<()> {
         super::run(tasks_root, into_run_args(args)).await?;
         return Ok(());
     }
+    if args.bootstrap {
+        let dir = super::run(tasks_root, into_run_args(args))
+            .await?
+            .context("bootstrap did not produce a results directory")?;
+        smoke::write_candidate(&dir)?;
+        return Ok(());
+    }
     let baseline = smoke::Baseline::load(&args.baseline)?;
     if let Some(dir) = &args.check_results {
         super::render(dir, false)?;
@@ -52,27 +62,30 @@ pub async fn run(tasks_root: &Path, args: SmokeArgs) -> anyhow::Result<()> {
         args.effort.to_string() == baseline.effort,
         "effort differs from stored baseline"
     );
-    if !args.dry_run {
-        validate_sockets(args.aether_socket.as_deref())?;
-    }
+    ensure!(
+        args.max_usd <= baseline.max_usd,
+        "smoke cost cap exceeds baseline cap"
+    );
     let max_usd = args.max_usd;
-    if let Some(dir) = super::run(tasks_root, into_run_args(args)).await? {
-        smoke::check_directory(&dir, &baseline, max_usd)?;
-    }
+    let dir = super::run(tasks_root, into_run_args(args))
+        .await?
+        .context("smoke did not produce a results directory")?;
+    smoke::check_directory(&dir, &baseline, max_usd)?;
     Ok(())
 }
 
-fn validate_sockets(aether: Option<&Path>) -> anyhow::Result<()> {
-    let aether = aether.context("smoke needs --aether-socket for a private sandbox")?;
+pub(super) fn validate_sockets(aether: Option<&Path>) -> anyhow::Result<()> {
+    let aether = aether.context("daemon arms need --aether-socket for a private sandbox")?;
     let archon = std::env::var_os("ARCHON_SOCKET")
         .map(PathBuf::from)
-        .context("smoke needs ARCHON_SOCKET set to a private sandbox path")?;
+        .context("daemon arms need ARCHON_SOCKET set to a private sandbox path")?;
     let sandbox = plan::default_work_dir()?
         .parent()
         .context("work directory lacks a parent")?
         .canonicalize()
         .context("create the archon-bench sandbox directory first")?;
     validate_socket_paths(aether, &archon, &sandbox)?;
+    let mut directories = BTreeSet::new();
     for name in [
         "ARCHON_CONFIG_DIR",
         "ARCHON_DATA_DIR",
@@ -80,7 +93,11 @@ fn validate_sockets(aether: Option<&Path>) -> anyhow::Result<()> {
         "AETHER_DATA_DIR",
     ] {
         let path = std::env::var_os(name).map(PathBuf::from);
-        validate_private_directory(name, path.as_deref(), &sandbox)?;
+        let resolved = validate_private_directory(name, path.as_deref(), &sandbox)?;
+        ensure!(
+            directories.insert(resolved),
+            "sandbox config/data directories must be distinct ({name})"
+        );
     }
     Ok(())
 }
@@ -89,9 +106,9 @@ fn validate_private_directory(
     name: &str,
     path: Option<&Path>,
     sandbox: &Path,
-) -> anyhow::Result<()> {
-    let path =
-        path.with_context(|| format!("smoke needs {name} set to a private sandbox directory"))?;
+) -> anyhow::Result<PathBuf> {
+    let path = path
+        .with_context(|| format!("daemon arms need {name} set to a private sandbox directory"))?;
     ensure!(path.is_absolute(), "{name} must be absolute");
     let resolved = path
         .canonicalize()
@@ -102,7 +119,7 @@ fn validate_private_directory(
         "{name} must be below {}",
         sandbox.display()
     );
-    Ok(())
+    Ok(resolved)
 }
 
 fn validate_socket_paths(aether: &Path, archon: &Path, sandbox: &Path) -> anyhow::Result<()> {
@@ -126,7 +143,7 @@ fn validate_socket_paths(aether: &Path, archon: &Path, sandbox: &Path) -> anyhow
 
 fn into_run_args(args: SmokeArgs) -> RunArgs {
     RunArgs {
-        arms: vec![Arm::Archon, Arm::Aether],
+        arms: smoke::ARMS.to_vec(),
         only: smoke::TASKS.iter().map(|s| (*s).to_owned()).collect(),
         trials: 1,
         parallel: 1,
@@ -137,7 +154,7 @@ fn into_run_args(args: SmokeArgs) -> RunArgs {
         codex_model: None,
         effort: args.effort,
         max_usd: args.max_usd,
-        max_trials: 8,
+        max_trials: smoke::TASKS.len() * smoke::ARMS.len(),
         timeout_factor: 1.0,
         price: Vec::new(),
         dry_run: args.dry_run,
@@ -155,6 +172,7 @@ fn into_run_args(args: SmokeArgs) -> RunArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archon_bench::metrics::Arm;
     use clap::Parser;
 
     #[test]
