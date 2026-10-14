@@ -297,10 +297,8 @@ pub(super) async fn announce(
     tell_orchestrator(ctx, item, finished, needs_operator).await
 }
 
-/// Hand `finished` to the orchestrator: quiet when it need not wake, and a
-/// routine success while other work runs waits up to [`MAX_SUCCESS_DEFER`]
-/// for that work, so one turn reports them together. The last item to
-/// finish skips the coalescing window, as no other outcome is coming.
+/// Hand `finished` to the orchestrator; a routine success waits up to [`MAX_SUCCESS_DEFER`]
+/// for other running work so one turn reports both, unless it is the last item.
 async fn tell_orchestrator(
     ctx: &DaemonContext,
     item: &QueueItem,
