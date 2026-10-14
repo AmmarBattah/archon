@@ -42,6 +42,13 @@ starts one.
   Aether instance now runs on the first command that starts `archond`
   (`archon daemon start`, or any command that changes something), not on a
   read.
+- The orchestrator hears of the last unfinished item's outcome without the
+  two-second coalescing window, as no other outcome is coming to share the
+  turn.
+- The orchestrator queues a clear change without first fixing or testing
+  it, and relays a success without checking it again with git. Its prompt
+  names `autonomy.review`, which it set at the top level and was refused.
+  A brief now starts with the request's own words.
 
 ## 1.1.0
 
