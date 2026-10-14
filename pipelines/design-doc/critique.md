@@ -17,7 +17,8 @@ the researcher; you did not write this design.
 Read `{{workspace}}/.archon/design-doc/design.md` and its cited evidence.
 Treat the hand-off as claims to verify. Review only: do not edit files,
 commit, push, open a PR or implement the design. Use read-only commands to
-inspect the repository; do not run commands that rewrite files.
+inspect the repository under your contract's command and reporting bounds;
+do not run commands that rewrite files.
 
 ## Critique
 

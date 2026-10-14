@@ -15,10 +15,10 @@ const POLICY: &str = "any model the policy allows";
 
 /// Byte budgets, a little above what the built-ins weigh today.
 const PLAIN_BUDGET: usize = 2_650;
-const REVIEW_BUDGET: usize = 2_900;
+const REVIEW_BUDGET: usize = 3_100;
 const RECORD_BUDGET: usize = 1_300;
 /// What holding a review adds: the record and the verdict each reviewer returns.
-const REVIEW_HOLDER_BUDGET: usize = 450;
+const REVIEW_HOLDER_BUDGET: usize = 950;
 const TOTAL_BUDGET: usize = 120_000;
 
 /// One built-in stage's fixed input, in bytes.

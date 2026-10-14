@@ -39,6 +39,9 @@ pub fn instructions(
     assert!(stage.fan_out >= 1, "validated specs have fan_out >= 1");
     let mut out = contract_header(stage, mode, workspace, team);
     out.push_str(kind_rules(stage.kind));
+    if stage.kind == StageKind::Review {
+        out.push_str(REVIEW_BOUNDS);
+    }
     if let TeamPart::RunTree { branch } = team
         && stage.kind == StageKind::Work
     {
@@ -83,7 +86,8 @@ pub fn delegation_rules(mode: WorkspaceMode, models: &str, depth: u32) -> String
          is lost. A child that finished cannot be asked again: for a second look, \
          delegate a new one.\n\
          {DELEGATE_HAND_OFF}\
-         {DELEGATE_CHILD_RULES}"
+         {DELEGATE_CHILD_RULES}\
+         {REVIEW_BOUNDS}"
     )
 }
 
@@ -402,6 +406,12 @@ commits it read; `base` is where the diff it read starts:\n\n\
 ```\n\n";
 
 const REVIEW_CHECK_RULES: &str = "\
+- Delegate with `wait: false`, then use `wait_for` with `any: true`. On a blocking \
+fail, `cancel_agent` the reviewers still reading before you edit: they share your \
+workspace, and cancelled reviews do not count. Then fix and commit. Replace each \
+cancelled reviewer with a new whole-change read at the new head. Completed reads, \
+even fails, need only delta passes from the head they read (one can cover several), \
+and the fix at least one; an amend or rebase needs whole-change re-review.\n\
 - Archon checks a pass against Aether and the branch. Each agent named must be a \
 different one you delegated to yourself that completed with that verdict, and as many \
 as the review asks must have passed the branch head, or an earlier head whose later \
@@ -487,6 +497,13 @@ const REVIEW_RULES: &str = "\n## Review stage\n\n\
 - Review only; do not edit, commit or push. Your findings go back to the implementer \
 verbatim if the gate fails, so make each one actionable: where (path and line), what \
 is wrong, why it matters, and what a fix looks like.\n";
+
+const REVIEW_BOUNDS: &str = "\
+- Reviewers: read the code and run the checks the review needs. Run each ad-hoc \
+experiment (mutant, probe, repro) under `timeout 30s` (`timeout 30s sh -c '…'` for \
+pipelines), not the project's build or tests; a hang or timeout counts as detected. \
+No long hang proofs or background waits. Report incomplete checks; never pass \
+without the evidence the review requires.\n";
 
 const TEST_RULES: &str = "\n## Test stage\n\n\
 - Verify by running things, not by reading alone. Do not edit tracked files to make a \
@@ -611,6 +628,57 @@ mod tests {
             Owed::default(),
         );
         assert!(!work.contains("VERDICT: PASS"));
+    }
+
+    #[test]
+    fn reviewers_bound_commands_and_reporting_without_skipping_checks() {
+        let review = instructions(
+            &stage(StageKind::Review, Gate::AllPass, 1),
+            WorkspaceMode::Worktree,
+            "/w",
+            TeamPart::Solo,
+            Owed::default(),
+        );
+        let delegated = delegation_rules(WorkspaceMode::Worktree, "a/one", 1);
+        for text in [&review, &delegated] {
+            for said in [
+                "read the code and run the checks the review needs",
+                "Run each ad-hoc experiment (mutant, probe, repro) under `timeout 30s`",
+                "timeout 30s sh -c",
+                "not the project's build or tests",
+                "a hang or timeout counts as detected",
+                "No long hang proofs or background waits",
+                "never pass without the evidence the review requires",
+            ] {
+                assert!(text.contains(said), "missing {said:?} in {text}");
+            }
+            assert_eq!(text.matches(REVIEW_BOUNDS).count(), 1);
+        }
+    }
+
+    #[test]
+    fn review_holders_fix_early_and_request_only_missing_delta_passes() {
+        for reviewers in [1, 3] {
+            let text = work_contract(owing(reviewers, false));
+            for said in [
+                "Delegate with `wait: false`",
+                "use `wait_for` with `any: true`",
+                "On a blocking fail, `cancel_agent` the reviewers still reading before you edit",
+                "cancelled reviews do not count. Then fix and commit",
+                "Replace each cancelled reviewer with a new whole-change read at the new head",
+                "Completed reads, even fails, need only delta passes from the head they read (one can cover several)",
+                "and the fix at least one",
+                "an amend or rebase needs whole-change re-review",
+                "a passing reviewer read with `base` at or before it",
+                "A fail stands until such a pass",
+            ] {
+                assert!(text.contains(said), "missing {said:?} in {text}");
+            }
+        }
+        let delegation = delegation_rules(WorkspaceMode::Worktree, "a/one", 1);
+        assert!(
+            delegation.contains("Wait for every child (`wait_for`) or cancel it (`cancel_agent`)")
+        );
     }
 
     #[test]
