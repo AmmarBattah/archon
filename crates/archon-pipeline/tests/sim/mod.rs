@@ -552,6 +552,7 @@ impl Sim {
             fan_index: plan.fan_index,
             model_segments: Vec::new(),
             infrastructure_failure: false,
+            host_context: Default::default(),
             choice: plan.choice.clone(),
             aether_agent: None,
             aether_task: None,

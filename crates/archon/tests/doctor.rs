@@ -81,3 +81,28 @@ fn doctor_validates_operator_edited_calm_definitions() {
     let (_, checks) = doctor(&env);
     assert_eq!(level_of(&checks, "calm mode"), "ok");
 }
+
+#[test]
+fn doctor_shows_the_configured_host_context_while_aether_is_offline() {
+    let env = set_up(DEDICATED);
+    let (_, full) = doctor(&env);
+    assert_eq!(level_of(&full, "host context"), "ok");
+    let lean = DEDICATED.replace(
+        "mode = \"dedicated\"",
+        "mode = \"dedicated\"\nhost_context = \"lean\"",
+    );
+    let env = set_up(&lean);
+    let (out, checks) = doctor(&env);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(level_of(&checks, "host context"), "warn");
+    let context = checks
+        .iter()
+        .find(|check| check["check"] == "host context")
+        .unwrap();
+    assert!(
+        context["detail"]
+            .as_str()
+            .unwrap()
+            .contains("configured lean")
+    );
+}

@@ -50,6 +50,34 @@ mode, because a client holding that daemon's `[listen]` token is the same
 `user` actor as you; see the
 [guide](guide.md#answering-in-the-orchestrators-chat).
 
+`[aether] host_context = "full"` is the default. Opt in to lean context for
+new agents with:
+
+```toml
+[aether]
+host_context = "lean"
+```
+
+On Claude Code, lean context removes the Skill tool and host MCP servers
+outside Aether. Aether's MCP server (including Archon's tools), built-in
+tools, CLAUDE.md, hooks and settings remain available. Codex ignores this
+setting. Archon applies it to the orchestrator, run nodes and stage agents;
+Aether's `delegate` tool inherits it for helpers unless explicitly overridden.
+It is fixed at agent creation: existing and resumed agents keep their context.
+Restart the orchestrator to change its context. There is no per-stage override.
+
+Archon sends lean only when Aether advertises the `host_context` feature;
+protocol 17 alone does not imply support. An older Aether gets full context,
+with a daemon log warning and a warning in `archon doctor`. Pending lean
+requests fall back to full if support disappears, with one warning per
+changed stage or node. If Aether already accepted the lean request and
+rejects its changed replay, Archon fails the stage visibly or advances the
+run node to a new generation. Existing agents keep their original context.
+Doctor shows configured and effective context for new agents. Stage records
+retain the effective policy, and `model-evidence` groups lean and full
+separately for Claude Code; Codex stages record full. Full stays the default
+pending a quality benchmark.
+
 A relative path in the config, such as `[worktrees] root`, is relative to
 the directory holding `config.toml`, and `~/` expands to your home
 directory. The daemon runs in Archon's data directory, so it never depends

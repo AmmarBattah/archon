@@ -275,6 +275,9 @@ async fn keys_of_the_retired_give_up_rule_go_and_live_supervisor_state_stays() {
         for (key, value) in [
             ("orchestrator_gave_up", "1"),
             ("orchestrator_failures", "[]"),
+            ("host_context:old-key", "\"lean\""),
+            ("agent_host_context:old-agent", "lean"),
+            ("orchestrator_host_context", "\"lean\""),
             ("orchestrator_backoff", r#"{"revivals":0,"last":null}"#),
             ("trigger_outbox", "{}"),
         ] {
@@ -283,9 +286,15 @@ async fn keys_of_the_retired_give_up_rule_go_and_live_supervisor_state_stays() {
     }
 
     let pruned = prune_at(&h, archon_core::now()).await;
-    assert_eq!(pruned.retired_keys, 2, "{pruned:?}");
+    assert_eq!(pruned.retired_keys, 4, "{pruned:?}");
     assert_eq!(h.kv("orchestrator_gave_up").await, None);
     assert_eq!(h.kv("orchestrator_failures").await, None);
+    assert!(h.kv("host_context:old-key").await.is_none());
+    assert!(h.kv("agent_host_context:old-agent").await.is_none());
+    assert_eq!(
+        h.kv("orchestrator_host_context").await.as_deref(),
+        Some("\"lean\"")
+    );
     assert!(h.kv("orchestrator_backoff").await.is_some());
     assert!(h.kv("trigger_outbox").await.is_some(), "held news is kept");
     assert_eq!(prune_at(&h, after_retention()).await.retired_keys, 0);

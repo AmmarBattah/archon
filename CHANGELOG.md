@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in `[aether] host_context = "lean"` for new agents. On supported
+  Aether versions, Claude Code skips skills and non-Aether host MCP servers;
+  Codex ignores the setting. Full remains the default. Older daemons receive
+  no new wire field, with one log warning and a doctor check explaining the
+  fallback. Stage records and model evidence retain the effective context.
+
 ## 1.2.0
 
 Released 2026-10-14.

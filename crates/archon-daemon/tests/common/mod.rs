@@ -603,6 +603,7 @@ pub struct FakeBackend {
 
 #[derive(Default)]
 struct FakeState {
+    host_context_supported: bool,
     /// Aether's `[network] default` is `denied`; `allowed`, as Aether
     /// ships, until a test says otherwise.
     network_denied: bool,
@@ -707,6 +708,10 @@ fn widens(parent: &AetherAgentId) -> ArchonError {
 }
 
 impl FakeBackend {
+    pub fn set_host_context_supported(&self, supported: bool) {
+        self.state().host_context_supported = supported;
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -947,6 +952,17 @@ impl FakeBackend {
 
 #[async_trait]
 impl AgentBackend for FakeBackend {
+    async fn host_context(
+        &self,
+        requested: archon_core::config::HostContext,
+    ) -> Result<archon_core::config::HostContext, ArchonError> {
+        Ok(if self.state().host_context_supported {
+            requested
+        } else {
+            archon_core::config::HostContext::Full
+        })
+    }
+
     async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedAgent, ArchonError> {
         let stalled = self.state().stalls.iter().find_map(|(text, gate)| {
             request

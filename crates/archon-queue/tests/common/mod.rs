@@ -163,6 +163,7 @@ pub fn stage(run: &PipelineRun, fan_index: u32) -> StageRun {
         fan_index,
         model_segments: Vec::new(),
         infrastructure_failure: false,
+        host_context: Default::default(),
         choice: choice(),
         aether_agent: None,
         aether_task: None,

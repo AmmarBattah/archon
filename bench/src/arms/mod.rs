@@ -268,6 +268,7 @@ pub fn aether_request(input: &TrialInput<'_>, deadline: Timestamp) -> CreateAgen
         }),
         parent: None,
         config: Some(AgentConfig {
+            host_context: Default::default(),
             instructions: None,
             effort: Some(input.settings.effort),
             cost_budget: None,

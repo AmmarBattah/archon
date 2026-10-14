@@ -15,8 +15,8 @@ use archon_core::aether_ids::{AetherAgentId, AetherRunId, AetherTaskId};
 use archon_core::model::Effort;
 use serde_json::{Value, json};
 
-/// Aether's protocol 17 schema (operator logins). Both vendored schemas are
-/// Aether's but for issue numbers, which are cut from their descriptions.
+/// v17 + host_context feature (operator logins and opt-in host context).
+/// Vendored schemas omit issue numbers from Aether's descriptions.
 const SCHEMA: &str = include_str!("fixtures/aether-protocol-v17.schema.json");
 const SCHEMA_V15: &str = include_str!("fixtures/aether-protocol-v15.schema.json");
 
@@ -85,6 +85,7 @@ fn full_create_agent() -> CreateAgent {
         }),
         parent: Some(agent()),
         config: Some(AgentConfig {
+            host_context: Default::default(),
             instructions: Some("contract".into()),
             effort: Some(Effort::High),
             cost_budget: Some(5.0),
@@ -530,4 +531,29 @@ fn usage_fixtures_include_cost_provenance_in_the_vendored_schemas() {
             assert!(allowed.contains(&usage["cost_basis"]), "{allowed:?}");
         }
     }
+}
+
+#[test]
+fn lean_context_matches_the_feature_schema_without_changing_protocol() {
+    use archon_core::config::HostContext;
+    let mut create = full_create_agent();
+    create.config.as_mut().unwrap().host_context = HostContext::Lean;
+    let command = Command::CreateAgent(Box::new(create));
+    let current = violations(&schema(), &command);
+    assert!(current.is_empty(), "{current:?}");
+    assert_eq!(
+        violations(&schema_v15(), &command),
+        ["create_agent.config.host_context is not in the schema"]
+    );
+    let current = schema();
+    let config = &current["$defs"]["AgentConfig"];
+    assert!(
+        config["required"]
+            .as_array()
+            .is_none_or(|keys| !keys.contains(&json!("host_context")))
+    );
+    assert_eq!(
+        current["$defs"]["HostContext"]["enum"],
+        json!(["full", "lean"])
+    );
 }

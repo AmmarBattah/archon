@@ -126,11 +126,16 @@ impl ModelEvidenceSnapshot {
         self,
         mut is_verdict_stage: impl FnMut(&QueueItem, &StageRun) -> Result<bool, ArchonError>,
     ) -> Result<ModelEvidenceReport, ArchonError> {
-        let mut groups: HashMap<(String, ModelChoice), Samples> = HashMap::new();
+        let mut groups: HashMap<(String, ModelChoice, archon_core::config::HostContext), Samples> =
+            HashMap::new();
         for attempt in self.attempts {
             let stage = attempt.stage;
             let samples = groups
-                .entry((stage.stage_id.clone(), stage.current_choice().clone()))
+                .entry((
+                    stage.stage_id.clone(),
+                    stage.current_choice().clone(),
+                    stage.host_context,
+                ))
                 .or_default();
             samples.attempts += 1;
             if stage.state != StageState::Completed {
@@ -178,18 +183,19 @@ impl ModelEvidenceSnapshot {
 }
 
 fn finish(
-    groups: HashMap<(String, ModelChoice), Samples>,
+    groups: HashMap<(String, ModelChoice, archon_core::config::HostContext), Samples>,
     range: DayRange,
     estimates: bool,
 ) -> ModelEvidenceReport {
     let mut rows: Vec<_> = groups
         .into_iter()
-        .map(|((stage, choice), mut samples)| {
+        .map(|((stage, choice, host_context), mut samples)| {
             samples.costs.sort_by(f64::total_cmp);
             samples.minutes.sort_by(f64::total_cmp);
             ModelEvidenceRow {
                 stage,
                 choice,
+                host_context,
                 attempts: samples.attempts,
                 completed: samples.costs.len(),
                 median_cost_usd: median(&samples.costs),
@@ -212,6 +218,7 @@ fn finish(
                     .unwrap_or(f64::INFINITY)
                     .total_cmp(&b.median_cost_usd.unwrap_or(f64::INFINITY))
             })
+            .then_with(|| a.host_context.cmp(&b.host_context))
             .then_with(|| a.choice.model.to_string().cmp(&b.choice.model.to_string()))
             .then_with(|| {
                 a.choice

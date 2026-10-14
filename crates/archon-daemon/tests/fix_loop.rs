@@ -728,3 +728,24 @@ async fn a_model_steered_for_the_stage_gives_the_fix_to_a_fresh_agent() {
         "the kept agent is stopped"
     );
 }
+
+#[tokio::test]
+async fn resumed_attempts_retain_the_created_agents_host_context() {
+    use archon_core::config::{Config, HostContext};
+    use archon_core::ports::AgentBackend;
+    let mut config = Config::default();
+    config.aether.host_context = HostContext::Lean;
+    let h = Harness::with_config(config).await;
+    h.add_pipeline(REVIEWED, REVIEWED_TOML);
+    h.backend.set_host_context_supported(true);
+    let (_item, first) = implemented(&h, "retain the host context").await;
+    assert_eq!(first.host_context, HostContext::Lean);
+    h.backend.set_host_context_supported(false);
+    let fix = sent_back(&h).await;
+    assert_eq!(agent(&fix), agent(&first));
+    assert_eq!(fix.host_context, HostContext::Lean);
+    assert_eq!(
+        h.backend.host_context(HostContext::Lean).await.unwrap(),
+        HostContext::Full
+    );
+}

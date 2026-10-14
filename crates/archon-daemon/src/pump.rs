@@ -123,10 +123,23 @@ pub async fn run(ctx: Arc<DaemonContext>, endpoint: Endpoint) -> Result<(), Arch
 async fn link_loop(ctx: Arc<DaemonContext>, endpoint: Endpoint) -> Result<(), ArchonError> {
     let mut backoff = BACKOFF_MIN;
     let mut outage = Outage::started();
+    let mut host_context_warned = false;
     loop {
         match AetherClient::connect(&endpoint).await {
             Ok(client) => {
                 let client = Arc::new(client);
+                if ctx.config.aether.host_context == archon_core::config::HostContext::Lean
+                    && client
+                        .welcome()
+                        .effective_host_context(ctx.config.aether.host_context)
+                        .is_full()
+                    && !host_context_warned
+                {
+                    tracing::warn!(
+                        "Aether lacks host_context; new and pending lean creations fall back to full; existing agents keep their context"
+                    );
+                    host_context_warned = true;
+                }
                 announce_connected(&ctx, &client, &outage).await?;
                 backoff = BACKOFF_MIN;
                 ctx.aether.replace(Some(client.clone()))?;

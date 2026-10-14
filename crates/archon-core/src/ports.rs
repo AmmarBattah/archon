@@ -41,6 +41,9 @@ impl NetworkPolicy {
 pub struct SpawnRequest {
     /// The stage run id: Aether dedupes a retried create under it.
     pub idempotency_key: String,
+    /// Resolved before the first create; old requests keep full context.
+    #[serde(default)]
+    pub host_context: crate::config::HostContext,
     pub role: String,
     pub name: String,
     /// Rendered stage prompt; becomes the agent's task objective.
@@ -138,6 +141,9 @@ pub struct RunNodeRequest {
     /// `<pipeline run id>:node:<generation>`; a new generation replaces a
     /// node Aether lost.
     pub idempotency_key: String,
+    /// Resolved before the first create; old requests keep full context.
+    #[serde(default)]
+    pub host_context: crate::config::HostContext,
     pub role: String,
     pub name: String,
     /// Inherited by children that state none; the first stage's model.
@@ -214,6 +220,14 @@ pub trait AgentBackend: Send + Sync {
     /// Create and start a stage agent. Safe to retry with the same
     /// `idempotency_key`; implementations re-check the model policy.
     async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedAgent, ArchonError>;
+
+    /// Resolve a new agent's context before storing its keyed request.
+    async fn host_context(
+        &self,
+        _requested: crate::config::HostContext,
+    ) -> Result<crate::config::HostContext, ArchonError> {
+        Ok(crate::config::HostContext::Full)
+    }
 
     /// Resolve budget enforcement before the request is persisted and sent.
     async fn prepare_spawn(

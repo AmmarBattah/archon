@@ -47,6 +47,7 @@ pub const STARTER_CONFIG: &str = r#"# Archon's configuration. Every key is optio
 # Archon runs its own aetherd. "shared" uses yours instead.
 # [aether]
 # mode = "dedicated"
+# host_context = "full"     # "lean": Claude Code skips skills and non-Aether MCP
 "#;
 
 /// Write [`STARTER_CONFIG`] as `dir`'s `config.toml` unless one is there,

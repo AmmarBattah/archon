@@ -19,7 +19,7 @@ use archon_aether::wire::{
 use archon_core::Timestamp;
 use archon_core::aether_ids::AetherAgentId;
 use archon_core::autonomy::{AutonomyPolicy, ToolsMode};
-use archon_core::config::Config;
+use archon_core::config::{Config, HostContext};
 use archon_core::error::ArchonError;
 use archon_core::id::{FeedItemId, StoreId};
 use archon_core::model::ModelChoice;
@@ -68,6 +68,7 @@ const STOP_POLL: Duration = Duration::from_millis(200);
 const RESTARTS_KEY: &str = "orchestrator_restarts";
 const BLOCKER_KEY: &str = "orchestrator_blocker";
 const STORE_ID_KEY: &str = "store_id";
+const HOST_CONTEXT_KEY: &str = "orchestrator_host_context";
 
 /// Orchestrator lifecycle state that must not live in `kv`: the locks for its
 /// creation and for ordering its replacement with its calls, a channel
@@ -237,6 +238,10 @@ pub fn orchestrator_create_agent(
         }),
         parent: None,
         config: Some(AgentConfig {
+            host_context: config
+                .aether
+                .host_context
+                .for_model(&config.orchestrator.model),
             instructions: Some(instructions),
             effort: Some(config.orchestrator.effort),
             cost_budget: None,
@@ -823,6 +828,7 @@ async fn replace_generation(
         let generation = parse_generation(store.kv_get(keys::ORCHESTRATOR_GENERATION)?)?;
         store.kv_set(keys::ORCHESTRATOR_GENERATION, &(generation + 1).to_string())?;
         store.kv_delete(keys::ORCHESTRATOR_AGENT)?;
+        store.kv_delete(HOST_CONTEXT_KEY)?;
     }
     create_generation(ctx, client).await
 }
@@ -870,12 +876,44 @@ async fn create_generation(
         network,
         delegation,
     );
-    let agent = client.create_agent(request).await?;
-    // An earlier try may have created it under this key with other tools.
-    callers::record_delegation(ctx, &agent).await?;
+    let agent = create_orchestrator(ctx, client, request).await?;
     tracing::info!(agent = %agent.id, generation, delegation, "orchestrator created");
     crate::triggers::collapse_for_new_orchestrator(ctx).await?;
     Ok(agent.id)
+}
+
+async fn create_orchestrator(
+    ctx: &DaemonContext,
+    client: &AetherClient,
+    mut request: CreateAgent,
+) -> Result<archon_aether::wire::Agent, ArchonError> {
+    assert_eq!(request.role, ORCHESTRATOR_ROLE);
+    assert!(request.parent.is_none() && request.start);
+    let config = request.config.as_mut().expect("orchestrator config");
+    let mut store = ctx.store.lock().await;
+    let frozen: Option<HostContext> = match store.kv_get(HOST_CONTEXT_KEY)? {
+        Some(raw) => Some(
+            serde_json::from_str(&raw)
+                .map_err(|error| ArchonError::Store(format!("kv {HOST_CONTEXT_KEY}: {error}")))?,
+        ),
+        None => None,
+    };
+    let requested = frozen.unwrap_or(config.host_context);
+    config.host_context = client.welcome().effective_host_context(requested);
+    // A full fallback is frozen too, so a retry under this key never turns lean.
+    if frozen.is_some() || !requested.is_full() {
+        store.kv_set(
+            HOST_CONTEXT_KEY,
+            &serde_json::to_string(&config.host_context)?,
+        )?;
+    }
+    if requested != config.host_context {
+        tracing::warn!("Aether lacks host_context; orchestrator creation falls back to full");
+    }
+    drop(store);
+    let agent = client.create_agent(request).await?;
+    callers::record_delegation(ctx, &agent).await?;
+    Ok(agent)
 }
 
 /// Post a supervisor `Blocker` unless the same one is already standing.
