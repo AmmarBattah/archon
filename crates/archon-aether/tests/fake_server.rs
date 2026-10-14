@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 
 fn spawn_request() -> SpawnRequest {
     SpawnRequest {
+        host_context: Default::default(),
         idempotency_key: "stg_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
         role: "archon-stage:direct/implement".into(),
         name: "implement · the thing".into(),
@@ -52,6 +53,7 @@ fn spawn_request() -> SpawnRequest {
 
 fn node_request() -> RunNodeRequest {
     RunNodeRequest {
+        host_context: Default::default(),
         idempotency_key: "prun_01ARZ3NDEKTSV4RRFFQ69G5FAV:node:1".into(),
         role: "archon-run:direct".into(),
         name: "the thing".into(),

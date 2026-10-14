@@ -18,6 +18,11 @@
 - A repository cohort with a correction reads only runs of the last 90 days,
   never pools global evidence, and explores no other model while a
   correction is active.
+- Add opt-in `[aether] host_context = "lean"` for new agents. On supported
+  Aether versions, Claude Code skips skills and non-Aether host MCP servers;
+  Codex ignores the setting. Full remains the default. Older daemons receive
+  no new wire field, with one log warning and a doctor check explaining the
+  fallback. Stage records and model evidence retain the effective context.
 
 ### Upgrading
 

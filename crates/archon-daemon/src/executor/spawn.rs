@@ -1,9 +1,5 @@
-//! Reserving and issuing stage agents. A reservation stores the exact
-//! `SpawnRequest` in `kv` and then persists a `spawning` stage run, so every
-//! `create_agent` for that stage run is byte-identical under one key. The
-//! run node it is parented under and its network are bound, and the bound
-//! request stored, the first time it is issued and before anything reaches
-//! Aether.
+//! Freeze stage requests before creation and replay them under the same key.
+//! Unsupported lean context may fall back to full before an agent is recorded.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -124,6 +120,25 @@ pub(super) fn save_spawn(
 ) -> Result<(), ArchonError> {
     assert_eq!(spawn.request.idempotency_key, id.as_str());
     store.kv_set(&request_key(id), &serde_json::to_string(spawn)?)
+}
+
+fn record_host_context(
+    store: &mut Store,
+    id: &StageRunId,
+    host_context: archon_core::config::HostContext,
+) -> Result<(), ArchonError> {
+    let mut stage = store.stage_run(id)?;
+    assert_eq!(&stage.id, id, "the stored stage matches its key");
+    if stage.host_context == host_context {
+        return Ok(());
+    }
+    if stage.aether_agent.is_some() {
+        return Err(ArchonError::Invalid(format!(
+            "stage run {id} cannot change its agent's host context"
+        )));
+    }
+    stage.host_context = host_context;
+    store.upsert_stage_run(&stage)
 }
 
 /// Delete the stored requests nothing reads any more: of settled stage runs
@@ -434,6 +449,7 @@ fn reserve_one(
         fan_index: plan.fan_index,
         model_segments: Vec::new(),
         infrastructure_failure: false,
+        host_context: Default::default(),
         choice: plan.choice.clone(),
         aether_agent: None,
         aether_task: None,
@@ -486,6 +502,7 @@ fn build_request(
         "a team run's agents work under its team directory"
     );
     SpawnRequest {
+        host_context: Default::default(),
         idempotency_key: id.as_str().to_owned(),
         role: format!("archon-stage:{}/{}", run.pipeline, plan.stage_id),
         name: naming::stage_agent_name(&item.id, plan, retry, &item.title),
@@ -735,13 +752,8 @@ async fn resume_or_spawn(
     spawn_bound(ctx, stage, spawn).await.map(Issued::Spawned)
 }
 
-/// Every new stage agent is a child of its run's node (§4.5). The node is
-/// bound the first time the spawn is issued, and the bound request is
-/// stored before it is sent, so every retry repeats the frame Aether
-/// fingerprints under the key. Its network is the narrower of the node's
-/// and Aether's default now: it may not widen its parent, nor exceed a
-/// default the operator tightened mid-run. A request bound already,
-/// including one stored before run nodes existed, is sent as stored.
+/// Bind a new stage to its run node and freeze its parent, network and context.
+/// Replays preserve these inputs except for a fallback from unsupported lean.
 async fn spawn_bound(
     ctx: &DaemonContext,
     stage: &StageRun,
@@ -765,11 +777,32 @@ async fn spawn_bound(
         let model = &spawn.request.choice.model;
         let node = run_node::ensure(ctx, &stage.run, model, default).await?;
         let network = node.network.narrower(default);
+        spawn.request.host_context = ctx
+            .backend
+            .host_context(ctx.config.aether.host_context.for_model(model))
+            .await?;
         spawn.request.parent = Some(node.agent);
         spawn.request.network = Some(network);
         spawn.parent = ParentBinding::Bound;
         save_spawn(&mut *ctx.store.lock().await, &stage.id, &spawn)?;
     }
+    let effective = ctx
+        .backend
+        .host_context(
+            spawn
+                .request
+                .host_context
+                .for_model(&spawn.request.choice.model),
+        )
+        .await?;
+    let mut store = ctx.store.lock().await;
+    record_host_context(&mut store, &stage.id, effective)?;
+    if effective != spawn.request.host_context {
+        spawn.request.host_context = effective;
+        save_spawn(&mut store, &stage.id, &spawn)?;
+        tracing::warn!(stage = %stage.id, "lean host context unavailable for this engine or Aether; frozen stage request falls back to full");
+    }
+    drop(store);
     ctx.backend.spawn(spawn.request).await
 }
 

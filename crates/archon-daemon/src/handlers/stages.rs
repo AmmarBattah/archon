@@ -296,6 +296,7 @@ mod tests {
             },
             model_segments: Vec::new(),
             infrastructure_failure: false,
+            host_context: Default::default(),
             aether_agent: Some(agent.clone()),
             aether_task: None,
             state: StageState::Running,

@@ -352,6 +352,13 @@ impl AetherClient {
 
     pub async fn create_agent(&self, request: CreateAgent) -> Result<Agent, ArchonError> {
         assert!(!request.role.is_empty(), "Aether requires a role");
+        if let Some(config) = &request.config
+            && config.host_context != self.welcome.effective_host_context(config.host_context)
+        {
+            return Err(ArchonError::Invalid(
+                "Aether lacks host_context; negotiate full before creating an agent".into(),
+            ));
+        }
         let agent: Agent = self
             .typed(Command::CreateAgent(Box::new(request)), "agent")
             .await?;

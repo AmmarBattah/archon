@@ -35,6 +35,8 @@ impl ModelEvidenceQuery {
 pub struct ModelEvidenceRow {
     pub stage: String,
     pub choice: ModelChoice,
+    #[serde(default)]
+    pub host_context: crate::config::HostContext,
     /// Each stage run (including each fan-out slot) is one attempt.
     pub attempts: usize,
     pub completed: usize,
@@ -89,10 +91,11 @@ impl ModelEvidenceReport {
             };
             let _ = writeln!(
                 text,
-                "{} {} {} n={} completed={} median={} p90={} median_min={minutes}{pass}{small}",
+                "{} {} {} host_context={} n={} completed={} median={} p90={} median_min={minutes}{pass}{small}",
                 row.stage,
                 row.choice.model,
                 row.choice.effort,
+                row.host_context.as_str(),
                 row.attempts,
                 row.completed,
                 cost(row.median_cost_usd),

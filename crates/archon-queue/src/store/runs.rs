@@ -318,6 +318,12 @@ fn check_stage_change(stored: &StageRun, next: &StageRun) -> Result<(), ArchonEr
             stored.id
         )));
     }
+    if stored.aether_agent.is_some() && stored.host_context != next.host_context {
+        return Err(ArchonError::Invalid(format!(
+            "stage run {} cannot change its agent's host context",
+            stored.id,
+        )));
+    }
     let agent_kept = stored.aether_agent.is_none() || stored.aether_agent == next.aether_agent;
     let task_kept = stored.aether_task.is_none() || stored.aether_task == next.aether_task;
     if !agent_kept || !task_kept {

@@ -34,9 +34,37 @@ struct Fleet {
     nodes_by_key: BTreeMap<String, u32>,
     node_network: BTreeMap<String, Value>,
     status: BTreeMap<String, Value>,
+    requests: BTreeMap<String, Value>,
+    lose_next_reply: bool,
 }
 
 impl Fleet {
+    fn create(&mut self, frame: &Value) -> Scripted {
+        let key = frame["idempotency_key"].as_str().expect("keyed").to_owned();
+        assert!(!key.is_empty(), "fleet creations are keyed");
+        assert!(
+            frame["start"].is_boolean(),
+            "creation states whether it starts"
+        );
+        if frame["start"] == json!(false) {
+            let next = self.nodes_by_key.len() as u32 + 1;
+            let n = *self.nodes_by_key.entry(key).or_insert(next);
+            self.node_network
+                .insert(node_id(n), frame["scope"]["network"].clone());
+            return Scripted::reply("agent", fake::agent(&node_id(n), None));
+        }
+        if self.widens_parent(frame) {
+            return Scripted::refuse(
+                "invalid_argument",
+                "child scope must narrow its parent's: network",
+            );
+        }
+        let next = self.by_key.len() as u32 + 1;
+        let n = *self.by_key.entry(key).or_insert(next);
+        let (agent, task) = ids(n);
+        Scripted::reply("agent", fake::agent(&agent, Some(&task)))
+    }
+
     /// Aether refuses a child whose scope is wider than its parent's.
     fn widens_parent(&self, frame: &Value) -> bool {
         let Some(parent) = frame["parent"].as_str() else {
@@ -75,26 +103,21 @@ fn script_fleet(aether: &FakeAether) -> Arc<Mutex<Fleet>> {
     aether.set_responder(
         "create_agent",
         Arc::new(move |frame: &Value| {
-            let key = frame["idempotency_key"].as_str().expect("keyed").to_owned();
+            let key = frame["idempotency_key"].as_str().expect("keyed");
+            let mut request = frame.clone();
+            request.as_object_mut().unwrap().remove("req");
             let mut fleet = created.lock().expect("fleet");
-            if frame["start"] == json!(false) {
-                let next = fleet.nodes_by_key.len() as u32 + 1;
-                let n = *fleet.nodes_by_key.entry(key).or_insert(next);
-                fleet
-                    .node_network
-                    .insert(node_id(n), frame["scope"]["network"].clone());
-                return Scripted::reply("agent", fake::agent(&node_id(n), None));
+            if let Some(stored) = fleet.requests.get(key)
+                && stored != &request
+            {
+                return Scripted::refuse("invalid_argument", "a different request needs a new key");
             }
-            if fleet.widens_parent(frame) {
-                return Scripted::refuse(
-                    "invalid_argument",
-                    "child scope must narrow its parent's: network",
-                );
+            fleet.requests.insert(key.into(), request);
+            let reply = fleet.create(frame);
+            if std::mem::take(&mut fleet.lose_next_reply) {
+                return Scripted::Silent;
             }
-            let next = fleet.by_key.len() as u32 + 1;
-            let n = *fleet.by_key.entry(key).or_insert(next);
-            let (agent, task) = ids(n);
-            Scripted::reply("agent", fake::agent(&agent, Some(&task)))
+            reply
         }),
     );
     let states = fleet.clone();
@@ -877,4 +900,226 @@ async fn a_budget_decision_is_persisted_before_create_and_replayed_after_capabil
     assert_eq!(replay["config"]["cost_budget"], 2.0);
     assert_eq!(aether.received_named("providers").len(), 1);
     assert_eq!(h.running().await.len(), 1);
+}
+
+#[tokio::test]
+async fn host_context_is_frozen_for_nodes_and_stage_agents() {
+    use archon_core::config::HostContext;
+    let claude = "claude-code/claude-haiku-5-5";
+    let codex = "codex/gpt-6-luna";
+    for (advertised, requested, model, effective) in [
+        (true, HostContext::Lean, claude, HostContext::Lean),
+        (false, HostContext::Lean, claude, HostContext::Full),
+        (true, HostContext::Full, claude, HostContext::Full),
+        (true, HostContext::Lean, codex, HostContext::Full),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let aether = start_aether(dir.path()).await;
+        if advertised {
+            aether.set_features(vec!["host_context".into()]);
+        }
+        script_fleet(&aether);
+        let mut config = Config::default();
+        config.aether.host_context = requested;
+        let h = harness_with_config(&aether, ClientOptions::default(), config).await;
+        let mut plan = common::plan();
+        plan.0.get_mut("implement").unwrap()[0] = common::choice(model, Effort::Low);
+        let item = h.enqueue_with("record host context", plan).await.unwrap();
+        h.dispatch().await;
+        let creates = aether.wait_for("create_agent", 2, WAIT).await;
+        assert_eq!(creates.len(), 2);
+        for create in &creates {
+            let sent = create["config"].get("host_context");
+            assert_eq!(sent, (!effective.is_full()).then_some(&json!("lean")));
+        }
+        let run = h.run(&item.id).await;
+        let stages = h.ctx.store.lock().await.stage_runs(&run.id).unwrap();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].host_context, effective);
+        let key = format!("spawn_request:{}", stages[0].id);
+        let raw = h.ctx.store.lock().await.kv_get(&key).unwrap().unwrap();
+        let frozen: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frozen["request"]["host_context"], effective.as_str());
+        assert_eq!(creates[1]["parent"], node_id(1));
+    }
+}
+
+async fn pending_lean_creation(
+    stage: bool,
+    landed: bool,
+) -> (
+    tempfile::TempDir,
+    FakeAether,
+    Harness,
+    archon_core::queue::QueueItem,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let aether = start_aether(dir.path()).await;
+    aether.set_features(vec!["host_context".into()]);
+    let fleet = script_fleet(&aether);
+    if stage {
+        aether.script(
+            "create_agent",
+            Scripted::reply("agent", fake::agent(&node_id(1), None)),
+        );
+    }
+    if landed {
+        fleet.lock().unwrap().lose_next_reply = true;
+    } else {
+        aether.script("create_agent", Scripted::Silent);
+    }
+    let mut config = Config::default();
+    config.aether.host_context = archon_core::config::HostContext::Lean;
+    let options = ClientOptions {
+        request_timeout: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let h = harness_with_config(&aether, options, config).await;
+    let mut plan = common::plan();
+    plan.0.get_mut("implement").unwrap()[0] =
+        common::choice("claude-code/claude-haiku-5-5", Effort::Low);
+    let item = h
+        .enqueue_with("downgrade a pending lean create", plan)
+        .await
+        .unwrap();
+    h.dispatch().await;
+    assert_eq!(h.stages(&item.id).await[0].state, StageState::Spawning);
+    let creates = aether.received_named("create_agent");
+    assert_eq!(creates.last().unwrap()["config"]["host_context"], "lean");
+    aether.set_features(Vec::new());
+    let client = AetherClient::connect_with(&aether.endpoint(), options)
+        .await
+        .unwrap();
+    h.ctx.aether.replace(Some(Arc::new(client))).unwrap();
+    (dir, aether, h, item)
+}
+
+#[tokio::test]
+async fn pending_lean_stage_and_node_creations_fall_back_to_full() {
+    for stage_pending in [false, true] {
+        let (_dir, aether, h, item) = pending_lean_creation(stage_pending, false).await;
+        h.dispatch().await;
+        let creates = aether.received_named("create_agent");
+        let original = usize::from(stage_pending);
+        assert_eq!(
+            creates[original]["idempotency_key"],
+            creates[original + 1]["idempotency_key"]
+        );
+        assert!(
+            creates[original + 1]["config"]
+                .get("host_context")
+                .is_none()
+        );
+        let stage = &h.stages(&item.id).await[0];
+        assert_eq!(stage.state, StageState::Running);
+        assert!(stage.host_context.is_full());
+        let raw = h.kv(&format!("spawn_request:{}", stage.id)).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap()["request"]["host_context"],
+            "full"
+        );
+        let run = h.run(&item.id).await;
+        let raw = h.kv(&format!("run_node:{}", run.id)).await.unwrap();
+        let node: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            node["request"]["host_context"],
+            if stage_pending { "lean" } else { "full" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn aether_rejecting_a_changed_lean_replay_refuses_stages_and_replaces_nodes() {
+    for stage_pending in [false, true] {
+        let (_dir, aether, h, item) = pending_lean_creation(stage_pending, true).await;
+        h.dispatch().await;
+        let creates = aether.received_named("create_agent");
+        let replay = usize::from(stage_pending) + 1;
+        assert_eq!(
+            creates[replay - 1]["idempotency_key"],
+            creates[replay]["idempotency_key"]
+        );
+        assert!(creates[replay]["config"].get("host_context").is_none());
+        let stage = &h.stages(&item.id).await[0];
+        assert!(stage.host_context.is_full());
+        if stage_pending {
+            let StageState::Failed { error } = &stage.state else {
+                panic!("stage must be refused")
+            };
+            assert!(error.contains("a different request needs a new key"));
+            assert!(matches!(h.state(&item.id).await, QueueState::Failed { .. }));
+            h.dispatch().await;
+            assert_eq!(aether.received_named("create_agent").len(), 3);
+        } else {
+            assert_eq!(stage.state, StageState::Running);
+            let run = h.run(&item.id).await;
+            assert_eq!(creates[2]["idempotency_key"], format!("{}:node:2", run.id));
+            assert_eq!(creates[3]["parent"], node_id(2));
+        }
+    }
+}
+
+#[tokio::test]
+async fn retiring_a_pending_lean_node_falls_back_instead_of_waiting_forever() {
+    let (_dir, aether, h, item) = pending_lean_creation(false, false).await;
+    executor::cancel_item(&h.ctx, &item.id, "cancel pending run")
+        .await
+        .unwrap();
+    let run = h.run(&item.id).await;
+    assert!(h.kv(&format!("run_node:{}", run.id)).await.is_none());
+    let creates = aether.received_named("create_agent");
+    assert_eq!(creates.len(), 2);
+    assert!(creates[1]["config"].get("host_context").is_none());
+    assert_eq!(creates[0]["idempotency_key"], creates[1]["idempotency_key"]);
+    assert_eq!(aether.received_named("cancel")[0]["agent"], node_id(1));
+}
+
+#[tokio::test]
+async fn a_stored_agent_context_mismatch_is_refused_without_panicking() {
+    let (_dir, _aether, h, item) = pending_lean_creation(true, false).await;
+    let mut stage = h.stages(&item.id).await.remove(0);
+    stage.aether_agent = Some(AetherAgentId::parse("agt_already_created").unwrap());
+    h.ctx.store.lock().await.upsert_stage_run(&stage).unwrap();
+    h.dispatch().await;
+    let StageState::Failed { error } = &h.stages(&item.id).await[0].state else {
+        panic!("a stored context mismatch must be refused")
+    };
+    assert!(error.contains("cannot change its agent's host context"));
+    assert_eq!(
+        h.stages(&item.id).await[0].host_context,
+        archon_core::config::HostContext::Lean
+    );
+}
+
+#[tokio::test]
+async fn downgraded_requests_stay_full_when_host_context_support_returns() {
+    for stage_pending in [false, true] {
+        let (_dir, aether, h, item) = pending_lean_creation(stage_pending, false).await;
+        aether.script("create_agent", Scripted::Silent);
+        h.dispatch().await;
+        let before = aether.received_named("create_agent");
+        let mut full = before.last().unwrap().clone();
+        assert!(full["config"].get("host_context").is_none());
+        assert_eq!(h.stages(&item.id).await[0].state, StageState::Spawning);
+        aether.set_features(vec!["host_context".into()]);
+        let options = ClientOptions {
+            request_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let client = AetherClient::connect_with(&aether.endpoint(), options)
+            .await
+            .unwrap();
+        h.ctx.aether.replace(Some(Arc::new(client))).unwrap();
+        h.dispatch().await;
+        let after = aether.received_named("create_agent");
+        let mut replay = after[before.len()].clone();
+        full.as_object_mut().unwrap().remove("req");
+        replay.as_object_mut().unwrap().remove("req");
+        assert_eq!(replay, full);
+        assert_eq!(
+            h.stages(&item.id).await[0].host_context.is_full(),
+            stage_pending
+        );
+        assert_eq!(h.stages(&item.id).await[0].state, StageState::Running);
+    }
 }

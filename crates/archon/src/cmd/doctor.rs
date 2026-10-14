@@ -77,6 +77,10 @@ pub async fn run(json: bool) -> anyhow::Result<ExitCode> {
         }
         Err(error) => check("aether", Level::Fail, error.clone()),
     });
+    checks.push(check_host_context(
+        config.aether.host_context,
+        aether.as_ref().ok().map(|client| client.welcome()),
+    ));
     let registered_in = match config.aether.mode {
         AetherMode::Dedicated => instance.config_path(),
         AetherMode::Shared => setup::aether_config_path(),
@@ -383,6 +387,49 @@ fn aether_ok(welcome: &Welcome, mode: AetherMode) -> Check {
     match gap {
         Some(gap) => check("aether", Level::Warn, format!("{detail}; {gap}")),
         None => check("aether", Level::Ok, detail),
+    }
+}
+
+fn check_host_context(
+    requested: archon_core::config::HostContext,
+    welcome: Option<&Welcome>,
+) -> Check {
+    use archon_core::config::HostContext;
+    let effective = welcome.map(|w| w.effective_host_context(requested));
+    assert!(
+        requested != HostContext::Full || effective.is_none_or(|value| value.is_full()),
+        "full is never promoted to lean"
+    );
+    assert!(
+        welcome.is_none_or(|value| value.protocol_version > 0),
+        "a connected daemon negotiated a protocol"
+    );
+    if requested == HostContext::Full {
+        return check(
+            "host context",
+            Level::Ok,
+            "configured full; effective full for new agents",
+        );
+    }
+    match welcome {
+        Some(_) if effective == Some(HostContext::Lean) => check(
+            "host context",
+            Level::Ok,
+            "configured lean; effective lean for new agents (Codex ignores it)",
+        ),
+        Some(welcome) => check(
+            "host context",
+            Level::Warn,
+            format!(
+                "configured lean; effective full: Aether version {} lacks host_context; pending lean creations fall back to full; existing agents keep their context",
+                welcome.daemon_version,
+            ),
+        ),
+        None => check(
+            "host context",
+            Level::Warn,
+            "configured lean; effective context unknown until Aether connects",
+        ),
     }
 }
 
@@ -757,6 +804,28 @@ mod tests {
             "instance_id": "i-1", "schema_version": 1, "pid": 7,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn doctor_reports_requested_and_effective_host_context() {
+        use archon_core::config::HostContext;
+        let mut welcome = welcome(17);
+        let lacking = check_host_context(HostContext::Lean, Some(&welcome));
+        assert_eq!(lacking.level, Level::Warn);
+        assert!(
+            lacking
+                .detail
+                .contains("Aether version 0.9.0 lacks host_context")
+        );
+        assert!(lacking.detail.contains("effective full"));
+        welcome.features.push("host_context".into());
+        let lean = check_host_context(HostContext::Lean, Some(&welcome));
+        assert_eq!(lean.level, Level::Ok);
+        assert!(lean.detail.contains("effective lean"));
+        assert_eq!(check_host_context(HostContext::Full, None).level, Level::Ok);
+        let offline = check_host_context(HostContext::Lean, None);
+        assert_eq!(offline.level, Level::Warn);
+        assert!(offline.detail.contains("unknown until Aether connects"));
     }
 
     #[test]

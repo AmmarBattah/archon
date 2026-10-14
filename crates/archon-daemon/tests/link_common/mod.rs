@@ -250,6 +250,7 @@ pub async fn spawning_stage(
     store.update_run(&run).unwrap();
     let stage = stage_run(&run.id, StageState::Spawning);
     let request = SpawnRequest {
+        host_context: Default::default(),
         idempotency_key: stage.id.to_string(),
         role: "archon-stage:direct/implement".into(),
         name: "implement · link test item".into(),
@@ -341,6 +342,7 @@ fn stage_run(run: &PipelineRunId, state: StageState) -> StageRun {
         fan_index: 0,
         model_segments: Vec::new(),
         infrastructure_failure: false,
+        host_context: Default::default(),
         choice: choice(),
         aether_agent: None,
         aether_task: None,

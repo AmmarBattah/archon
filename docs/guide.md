@@ -947,3 +947,21 @@ enter its queue; a fresh Aether run does not itself become an Archon item.
 See [Aether's documentation](https://github.com/mengsig/aether).
 
 For benchmark results and the crate layout, see [development and benchmarks](development.md).
+
+## Lean host context
+
+To reduce the host tools loaded into newly created Claude Code sessions, set
+`host_context = "lean"` under `[aether]` in `config.toml`. Full context remains
+the default pending quality benchmarks. Lean removes skills and non-Aether
+host MCP servers while keeping Aether's MCP (including Archon's tools),
+built-in tools, CLAUDE.md, hooks and settings. Codex ignores the setting.
+
+Restart `archond` to reload the config, then use `archon orchestrator restart`
+for a new orchestrator; already created agents and resumed fix attempts keep
+their original context. Run `archon doctor` to see the requested and effective
+policy. If Aether does not advertise support, Archon creates agents with full
+context and logs a warning. Pending lean requests also fall back to full
+if support disappears, with one warning per changed stage or node. Stage
+records and `archon model-evidence` retain the effective policy for comparing
+cost and outcomes; Codex stages always record full. See the
+[configuration reference](configuration.md) for the full contract.

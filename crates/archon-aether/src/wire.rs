@@ -25,6 +25,7 @@ pub const ALLOWLIST_PROTOCOL_VERSION: u32 = 15;
 pub const OPERATOR_LOGINS_PROTOCOL_VERSION: u32 = 17;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const CLIENT_NAME: &str = "archon";
+pub const HOST_CONTEXT_FEATURE: &str = "host_context";
 
 /// One client frame: `{"req": id, "cmd": ..., ...fields}`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -178,6 +179,23 @@ pub struct Welcome {
     pub idle_timeout_secs: Option<u64>,
 }
 
+impl Welcome {
+    pub fn effective_host_context(
+        &self,
+        requested: archon_core::config::HostContext,
+    ) -> archon_core::config::HostContext {
+        if self
+            .features
+            .iter()
+            .any(|feature| feature == HOST_CONTEXT_FEATURE)
+        {
+            requested
+        } else {
+            archon_core::config::HostContext::Full
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CreateAgent {
     pub role: String,
@@ -269,6 +287,8 @@ pub struct Scope {
 /// `tools`, which Archon always states.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct AgentConfig {
+    #[serde(skip_serializing_if = "archon_core::config::HostContext::is_full")]
+    pub host_context: archon_core::config::HostContext,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -408,6 +428,8 @@ pub struct AgentScope {
 /// The fields of an agent's `config` Archon reads.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct AgentSettings {
+    #[serde(default)]
+    pub host_context: Option<String>,
     #[serde(default)]
     pub instructions: Option<String>,
     #[serde(default)]

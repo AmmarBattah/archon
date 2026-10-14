@@ -87,6 +87,7 @@ async fn recorded_sample(
             choice: (*choice).clone(),
             model_segments: Vec::new(),
             infrastructure_failure: false,
+            host_context: Default::default(),
             aether_agent: None,
             aether_task: None,
             state: StageState::Completed,

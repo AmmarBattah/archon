@@ -83,6 +83,7 @@ struct State {
     instance_id: String,
     serves: (u32, u32),
     idle_timeout_secs: Option<u64>,
+    features: Vec<String>,
     scripts: HashMap<String, VecDeque<Scripted>>,
     responders: HashMap<String, Responder>,
     received: Vec<Value>,
@@ -117,6 +118,7 @@ impl FakeAether {
             instance_id: "fake-instance-1".to_owned(),
             serves: (PROTOCOL_VERSION - 1, PROTOCOL_VERSION),
             idle_timeout_secs: None,
+            features: Vec::new(),
             scripts: HashMap::new(),
             responders: HashMap::new(),
             received: Vec::new(),
@@ -177,6 +179,10 @@ impl FakeAether {
     pub fn set_protocol_window(&self, min: u32, max: u32) {
         assert!(min <= max, "empty protocol window {min}..{max}");
         self.state().serves = (min, max);
+    }
+
+    pub fn set_features(&self, features: Vec<String>) {
+        self.state().features = features;
     }
 
     /// Advertised in the welcome, as Aether's TCP listener does.
@@ -419,7 +425,7 @@ impl Session {
                 json!({
                     "protocol_version": v, "daemon_version": "0.0.0-fake",
                     "instance_id": state.instance_id, "schema_version": 1,
-                    "pid": std::process::id(), "features": [],
+                    "pid": std::process::id(), "features": state.features,
                     "daemon_protocol_version": max, "min_protocol_version": min,
                     "idle_timeout_secs": state.idle_timeout_secs,
                 }),
