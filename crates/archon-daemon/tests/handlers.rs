@@ -8,7 +8,7 @@ use archon_core::config::Config;
 use archon_core::cost::{CostGroup, CostQuery, CostReport, DayBound};
 use archon_core::error::ArchonError;
 use archon_core::github::{GithubThread, OperatorUsers, WatcherChange};
-use archon_core::model::{Effort, ModelPlan};
+use archon_core::model::{Effort, ModelChoice, ModelPlan};
 use archon_core::protocol::{
     ClientKind, EnqueueRequest, ErrorCode, ErrorReply, ItemPatch, ItemQuery, PauseTarget, Reply,
     RepoAdd, RepoPatch, RepoRef, Request,
@@ -132,8 +132,6 @@ async fn enqueue_refuses_models_outside_the_global_allowlist() {
 #[tokio::test]
 async fn enqueue_validates_the_plan_against_the_pipeline() {
     let h = Harness::new().await;
-    let mut missing = plan();
-    missing.0.remove("ship");
     let mut too_many = plan();
     too_many
         .0
@@ -142,11 +140,7 @@ async fn enqueue_validates_the_plan_against_the_pipeline() {
     unknown
         .0
         .insert("deploy".into(), vec![choice(MODEL, Effort::Low)]);
-    for (why, bad) in [
-        ("missing", missing),
-        ("too many", too_many),
-        ("unknown", unknown),
-    ] {
+    for (why, bad) in [("too many", too_many), ("unknown", unknown)] {
         let refused = h.enqueue_with(why, bad).await.expect_err(why);
         assert!(
             matches!(refused, ArchonError::Invalid(_)),
@@ -158,53 +152,115 @@ async fn enqueue_validates_the_plan_against_the_pipeline() {
         .await
         .expect_err("empty title");
     assert!(matches!(refused, ArchonError::Invalid(_)));
-    let refused = h
-        .enqueue_with("no plan", ModelPlan::default())
-        .await
-        .expect_err("empty plan");
-    assert!(matches!(refused, ArchonError::Invalid(_)));
     assert_eq!(item_count(&h).await, 0);
 }
 
+/// A plan names the stages whose model the caller chooses: the others get
+/// the orchestrator's model at the effort the pipeline's tier suggests.
 #[tokio::test]
-async fn model_plan_changes_wait_for_a_retry_which_keeps_the_worktree() {
+async fn enqueue_fills_the_stages_a_plan_leaves_out() {
+    let h = Harness::new().await;
+    let default = vec![ModelChoice {
+        model: h.ctx.config.orchestrator.model.clone(),
+        effort: Effort::Medium,
+    }];
+    let mut partial = plan();
+    partial.0.remove("ship");
+    let item = h.enqueue_with("a partial plan", partial).await.unwrap();
+    assert_eq!(item.model_plan.0["implement"], plan().0["implement"]);
+    assert_eq!(item.model_plan.0["review"], plan().0["review"]);
+    assert_eq!(item.model_plan.0["ship"], default);
+
+    let unplanned = h
+        .enqueue_with("no plan at all", ModelPlan::default())
+        .await
+        .unwrap();
+    let stages: Vec<&str> = unplanned.model_plan.0.keys().map(String::as_str).collect();
+    assert_eq!(stages, ["implement", "review", "ship"]);
+    assert!(unplanned.model_plan.0.values().all(|c| *c == default));
+    // `performance` asks for the strongest model: its stages run at high effort.
+    let performance = h
+        .enqueue_in("performance", "a faster path", ModelPlan::default())
+        .await
+        .unwrap();
+    assert_eq!(performance.model_plan.0["measure"][0].effort, Effort::High);
+}
+
+/// A default is a choice like any other: the model policy still decides.
+#[tokio::test]
+async fn a_filled_plan_stays_within_the_model_policy() {
+    let mut config = Config::default();
+    config.models.allow = vec![REVIEW_MODEL.parse().unwrap()];
+    config.models.max_effort = Some(Effort::Low);
+    let h = Harness::with_config(config).await;
+    let item = h
+        .enqueue_with("no plan at all", ModelPlan::default())
+        .await
+        .expect("the one allowed model fills the plan");
+    for choices in item.model_plan.0.values() {
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].model.to_string(), REVIEW_MODEL);
+        assert_eq!(choices[0].effort, Effort::Low, "capped by the policy");
+    }
+    let mut over = ModelPlan::default();
+    over.0
+        .insert("implement".into(), vec![choice(MODEL, Effort::Low)]);
+    let refused = h.enqueue_with("a denied model", over).await.unwrap_err();
+    assert!(matches!(refused, ArchonError::Policy(_)), "{refused:?}");
+}
+
+/// `plan()` with the implementer at low effort.
+fn cheaper_plan() -> ModelPlan {
+    let mut cheaper = plan();
+    let low = vec![choice(MODEL, Effort::Low)];
+    cheaper.0.insert("implement".into(), low);
+    cheaper
+}
+
+#[tokio::test]
+async fn a_running_item_is_steered_onto_a_new_model_plan() {
     let h = Harness::new().await;
     let item = h.enqueue("change of plan").await;
-    let mut cheaper = plan();
-    cheaper
-        .0
-        .insert("implement".into(), vec![choice(MODEL, Effort::Low)]);
-    let patch = |plan: &ModelPlan| ItemPatch {
-        model_plan: Some(plan.clone()),
-        model_reasons: None,
-        ..ItemPatch::default()
-    };
-    let update = |p| Request::UpdateItem {
+    let update = |plan: ModelPlan| Request::UpdateItem {
         item: item.id.clone(),
-        patch: p,
+        patch: ItemPatch {
+            model_plan: Some(plan),
+            ..ItemPatch::default()
+        },
     };
-    h.cli(update(patch(&cheaper)))
+    h.cli(update(cheaper_plan()))
         .await
         .expect("queued items take a new plan");
     h.dispatch().await;
-    let refused = h.cli(update(patch(&plan()))).await.expect_err("running");
-    assert!(
-        matches!(refused, ArchonError::InvalidTransition(_)),
-        "{refused:?}"
-    );
+    h.cli(update(plan()))
+        .await
+        .expect("a running item is steered onto its new plan");
     assert_eq!(h.backend.requests()[0].choice, choice(MODEL, Effort::Low));
+    let implementer = h.running().await[0].aether_agent.clone().expect("agent");
+    let retuned: Vec<_> = h
+        .backend
+        .updates()
+        .into_iter()
+        .filter_map(|(agent, update)| update.choice.map(|choice| (agent, choice)))
+        .collect();
+    assert_eq!(retuned, vec![(implementer, choice(MODEL, Effort::High))]);
+    assert_eq!(h.item(&item.id).await.model_plan, plan());
+    assert!(h.backend.cancelled().is_empty(), "nothing was cancelled");
+}
 
-    let retry = Request::RetryItem {
+#[tokio::test]
+async fn a_retry_takes_a_new_plan_and_keeps_the_worktree() {
+    let h = Harness::new().await;
+    let item = h.enqueue("second try").await;
+    h.dispatch().await;
+    let retry = |plan: Option<ModelPlan>| Request::RetryItem {
         item: item.id.clone(),
-        model_plan: None,
+        model_plan: plan,
         model_reasons: None,
         fresh: false,
         brief_append: None,
     };
-    let refused = h
-        .cli(retry.clone())
-        .await
-        .expect_err("only failed or cancelled");
+    let refused = h.cli(retry(None)).await.expect_err("only a finished item");
     assert!(matches!(refused, ArchonError::InvalidTransition(_)));
     let cancel = Request::CancelItem {
         item: item.id.clone(),
@@ -214,22 +270,12 @@ async fn model_plan_changes_wait_for_a_retry_which_keeps_the_worktree() {
     let workspace = h.backend.requests()[0].workspace.clone();
     std::fs::write(workspace.join("draft.txt"), "prior work\n").expect("draft");
     h.cli(cancel).await.expect("cancel");
-    let retry = Request::RetryItem {
-        item: item.id.clone(),
-        model_plan: Some(plan()),
-        model_reasons: None,
-        fresh: false,
-        brief_append: None,
-    };
-    h.cli(retry).await.expect("retry");
+    h.cli(retry(Some(cheaper_plan()))).await.expect("retry");
     assert_eq!(h.state(&item.id).await, QueueState::Queued);
     h.dispatch().await;
     let last = h.backend.requests().pop().expect("a new implementer");
-    assert_eq!(
-        last.choice,
-        choice(MODEL, Effort::High),
-        "the retry uses the new plan"
-    );
+    let low = choice(MODEL, Effort::Low);
+    assert_eq!(last.choice, low, "the retry uses the new plan");
     assert_eq!(
         last.workspace, workspace,
         "a retried item keeps its worktree"
@@ -347,7 +393,7 @@ async fn pausing_an_unknown_pipeline_is_refused_with_the_known_ones() {
     assert!(matches!(error, ArchonError::Invalid(_)), "{error:?}");
     assert!(
         text.contains("\"no-such-pipeline\"")
-            && text.contains("quick-pr")
+            && text.contains("direct")
             && text.contains(common::PIPELINE),
         "{text}"
     );
@@ -373,23 +419,25 @@ async fn mcp_clients_cannot_lift_the_operators_hard_pause() {
         .await
         .expect("no running agent to pause in Aether");
     let resume = Request::Resume(PauseTarget::Global { hard: false });
-    let refused = handlers::handle(&h.ctx, ClientKind::ArchonMcp, resume.clone())
+    let refused = h
+        .orchestrator(resume.clone())
         .await
-        .expect_err("MCP cannot lift a hard pause");
-    assert!(matches!(refused, ArchonError::Forbidden(_)), "{refused:?}");
+        .expect_err("the orchestrator cannot lift a hard pause");
+    assert!(
+        matches!(&refused, ArchonError::Forbidden(why) if why.contains("hard")),
+        "{refused:?}"
+    );
     let Ok(Reply::Status(status)) = h.cli(Request::Status).await else {
         panic!("status");
     };
     assert!(status.pause.global, "the hard pause holds");
     h.cli(resume).await.expect("the operator lifts it");
     let soft = Request::Pause(PauseTarget::Global { hard: false });
-    handlers::handle(&h.ctx, ClientKind::ArchonMcp, soft)
-        .await
-        .expect("soft pause");
+    h.orchestrator(soft).await.expect("soft pause");
     let resume = Request::Resume(PauseTarget::Global { hard: false });
-    handlers::handle(&h.ctx, ClientKind::ArchonMcp, resume)
+    h.orchestrator(resume)
         .await
-        .expect("MCP lifts a soft pause");
+        .expect("the orchestrator lifts a soft pause");
 }
 
 #[tokio::test]
@@ -408,6 +456,7 @@ async fn item_detail_reports_each_stage_agents_ledger_cost() {
         item: Some(item.id.clone()),
         cost_usd: 0.25,
         cost_basis: archon_core::cost::CostBasis::ProviderReported,
+        cost_complete: None,
         estimated_cost_usd: 0.5,
         input_tokens: 10,
         output_tokens: 5,
@@ -447,6 +496,7 @@ async fn cost_reports_count_the_ledger_as_the_budgets_do() {
             item: Some(item.id.clone()),
             cost_usd: 0.25,
             cost_basis: archon_core::cost::CostBasis::ProviderReported,
+            cost_complete: None,
             estimated_cost_usd: 0.5,
             input_tokens: 10,
             output_tokens: 5,
@@ -506,7 +556,7 @@ async fn an_item_asked_for_on_github_reports_back_to_its_thread() {
         autonomy: Default::default(),
         origin: Some(origin.clone()),
     };
-    let reply = handlers::handle(&h.ctx, ClientKind::ArchonMcp, Request::Enqueue(request)).await;
+    let reply = h.orchestrator(Request::Enqueue(request)).await;
     let Ok(Reply::Item(item)) = reply else {
         panic!("enqueue replied {reply:?}");
     };
@@ -698,9 +748,7 @@ async fn mcp_enqueue_and_updates_refuse_invalid_queue_inputs() {
         });
     }
     for request in invalid {
-        let error = handlers::handle(&h.ctx, ClientKind::ArchonMcp, Request::Enqueue(request))
-            .await
-            .unwrap_err();
+        let error = h.orchestrator(Request::Enqueue(request)).await.unwrap_err();
         assert!(matches!(error, ArchonError::Invalid(_)), "{error}");
     }
     assert_eq!(item_count(&h).await, 0);

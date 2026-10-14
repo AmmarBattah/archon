@@ -10,6 +10,7 @@ pub mod feed;
 pub mod gc;
 pub mod github;
 pub mod handlers;
+pub mod mirror;
 pub mod prune;
 pub mod pump;
 pub mod reports;
@@ -20,6 +21,7 @@ pub mod triggers;
 pub mod worktree;
 
 mod knobs;
+pub mod learned;
 mod resolve;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +32,7 @@ use archon_aether::backend::AetherBackend;
 use archon_aether::client::Endpoint;
 use archon_core::config::Config;
 use archon_core::error::ArchonError;
+use archon_core::notify::NotificationKind;
 use archon_lavish::Lavish;
 use archon_queue::Store;
 use tokio::signal::unix::{SignalKind, signal};
@@ -52,10 +55,8 @@ pub struct DaemonOptions {
     pub archon_bin: PathBuf,
 }
 
-/// Run until `Shutdown` or SIGTERM/SIGINT: open the store, recover runs,
-/// bind the socket, then run the server, event pump, dispatcher, trigger
-/// delivery, store pruning and worktree gc concurrently. The socket serves even while
-/// Aether is down, and in standby after the store hit a full disk.
+/// Run until `Shutdown` or SIGTERM/SIGINT: recover, bind the socket and run
+/// the server and every worker; it serves while Aether is down and in standby.
 pub async fn run(options: DaemonOptions) -> Result<(), ArchonError> {
     let endpoint = Endpoint::from_config(&options.config.aether)?;
     let ctx = build_context(options)?;
@@ -85,7 +86,33 @@ pub async fn run(options: DaemonOptions) -> Result<(), ArchonError> {
 /// spawns recovery would issue.
 async fn recover(ctx: &DaemonContext) -> Result<(), ArchonError> {
     dispatcher::check_disk(ctx).await?;
+    note_legacy_config(ctx, &archon_core::paths::config_dir()).await?;
     executor::recover(ctx).await
+}
+
+/// `kv`: set while the operator has been told of an ignored `archon.toml`.
+const LEGACY_CONFIG_TOLD_KEY: &str = "legacy_config_told";
+
+/// Tell the operator, once, that the `archon.toml` in `config_dir` is not
+/// read: they may believe it sets the limits Archon runs with.
+pub async fn note_legacy_config(ctx: &DaemonContext, config_dir: &Path) -> Result<(), ArchonError> {
+    let notice = archon_core::config_files::legacy_config_notice(config_dir);
+    let told = {
+        let mut store = ctx.store.lock().await;
+        let told = store.kv_get(LEGACY_CONFIG_TOLD_KEY)?.is_some();
+        match (notice.is_some(), told) {
+            // The file is gone: one that appears later is news again.
+            (false, true) => store.kv_delete(LEGACY_CONFIG_TOLD_KEY)?,
+            (true, false) => store.kv_set(LEGACY_CONFIG_TOLD_KEY, "1")?,
+            _ => {}
+        }
+        told
+    };
+    let Some(text) = notice.filter(|_| !told) else {
+        return Ok(());
+    };
+    feed::notify(ctx, NotificationKind::Blocker, text, None, None).await?;
+    Ok(())
 }
 
 /// SIGTERM and SIGINT, which stop the daemon cleanly.
@@ -132,9 +159,15 @@ async fn supervise(
     let c = ctx.clone();
     workers.spawn(async move { ("dispatcher", dispatcher::run(c).await) });
     let c = ctx.clone();
+    workers.spawn(async move { ("coordination", executor::coordination::run(c).await) });
+    let c = ctx.clone();
     workers.spawn(async move { ("trigger delivery", triggers::deliver_loop(c).await) });
     let c = ctx.clone();
     workers.spawn(async move { ("store pruning", prune::run(c).await) });
+    let c = ctx.clone();
+    workers.spawn(async move { ("repository mirrors", mirror::run(c).await) });
+    let c = ctx.clone();
+    workers.spawn(async move { ("learning", learned::run(c).await) });
     let auto_gc = ctx.config.worktrees.auto_gc;
     if auto_gc {
         let c = ctx.clone();
@@ -142,7 +175,7 @@ async fn supervise(
     }
     assert_eq!(
         workers.len(),
-        4 + usize::from(auto_gc),
+        7 + usize::from(auto_gc),
         "every daemon worker is supervised"
     );
     let result = tokio::select! {
@@ -204,7 +237,11 @@ fn build_context(options: DaemonOptions) -> Result<DaemonContext, ArchonError> {
         std::fs::create_dir_all(dir)
             .map_err(|e| ArchonError::io(format!("creating {}", dir.display()), e))?;
     }
-    let store = Store::open(&paths.store)?;
+    let mut store = Store::open(&paths.store)?;
+    store.configure_learning(&config.learning)?;
+    if !config.learning.enabled {
+        store.cancel_queued_distillations()?;
+    }
     let lavish = Lavish::detect(&config.lavish)?;
     let aether = Arc::new(AetherLink::new());
     let backend = Arc::new(AetherBackend::new(aether.clone(), config.models.policy()));
@@ -218,11 +255,14 @@ fn build_context(options: DaemonOptions) -> Result<DaemonContext, ArchonError> {
         backend,
         feed,
         dispatch: dispatch.clone(),
+        coordination: Default::default(),
         runs: Mutex::new(executor::RunTable::default()),
         replies: Mutex::new(feed::ReplyTracker::default()),
         answering: Mutex::new(()),
         report_files: Arc::new(Mutex::new(())),
         triggers: TriggerQueue::default(),
+        mirrors: mirror::MirrorQueue::default(),
+        spawn_recorded: Notify::new(),
         caps_override: Mutex::new(None),
         lavish,
         supervisor: Supervisor::default(),

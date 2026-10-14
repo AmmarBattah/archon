@@ -575,6 +575,7 @@ fn spend_row(
         item: item.map(|i| i.id.clone()),
         cost_usd: cost,
         cost_basis: archon_core::cost::CostBasis::ProviderReported,
+        cost_complete: None,
         estimated_cost_usd: est,
         input_tokens: 1000,
         output_tokens: 200,
@@ -634,7 +635,7 @@ fn pause_state_and_kv_round_trip() {
     let pause = PauseState {
         global: true,
         repos: vec![repo.id.clone()],
-        pipelines: vec!["quick-pr".into()],
+        pipelines: vec!["direct".into()],
     };
     store.set_pause_state(&pause).unwrap();
     assert_eq!(store.pause_state().unwrap(), pause);

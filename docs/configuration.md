@@ -3,20 +3,29 @@
 `~/.config/archon/config.toml` on Linux (or `$XDG_CONFIG_HOME/archon/config.toml`),
 `~/Library/Application Support/archon/config.toml` on macOS.
 `ARCHON_CONFIG_DIR` overrides the directory on either platform. Every field
-is optional. Unknown keys are an error, so a typo cannot silently disable a limit.
+is optional, and so is the file: `archon setup` writes one with every key
+commented out when there is none. Unknown keys are an error, so a typo
+cannot silently disable a limit. Only `config.toml` is read. An
+`archon.toml` from before 1.0 lying beside it is ignored: `archon doctor`
+warns about it, and `archond` says so once in the feed when it starts.
+
+You do not list models or model tiers anywhere. With no `[models]` section
+Archon may use every model Aether reports ready (`archon aether models`),
+and the orchestrator picks a model and effort for each stage of each item.
+`[models]` only narrows that choice.
 
 ```toml
-[models]
-allow = ["claude-code/claude-opus-5-5", "codex/your-available-model"]
+[models]                       # optional: leave it out to allow every ready model
+allow = ["claude-code/claude-opus-5-5", "codex/gpt-6.1-sol"]
 max_effort = "high"
 
 [limits]
-max_parallel_agents = 3        # the hard cap on running stage agents
+max_parallel_agents = 8        # the hard cap on running stage agents (the default)
 max_per_repo = 2
 budget_usd_daily = 50.0
 min_free_gb = 10               # nothing new starts below this much free disk; 0 = off
 [limits.per_pipeline]
-strict-pr-review = 3
+adaptive = 3
 
 [worktrees]
 auto_gc = true                 # archond collects finished runs' worktrees itself
@@ -28,9 +37,15 @@ cache_dirs = ["target"]        # only these caches; unset = everything git ignor
 To run Archon on your own `aetherd` instead, set `[aether] mode = "shared"`.
 In shared mode, `archon setup` adds the `archon` MCP server to your
 `~/.config/aether/config.toml`, and every agent of that daemon then sees
-Archon's tools. Answering a gate or question with `/answer <n> …` in the
-orchestrator's chat is off in shared mode, because a client holding that
-daemon's `[listen]` token is the same `user` actor as you; see the
+Archon's tools. The ones that change Archon answer only the current
+orchestrator, which needs `send_caller_meta = true` on that registration
+so that Aether names the calling agent. `archon setup` writes the line,
+and never edits a registration that is already there: if yours lacks it,
+`archon doctor` fails and says so, and the
+[guide](guide.md#after-upgrading) has the fix. Answering a gate or
+question with `/answer <n> …` in the orchestrator's chat is off in shared
+mode, because a client holding that daemon's `[listen]` token is the same
+`user` actor as you; see the
 [guide](guide.md#answering-in-the-orchestrators-chat).
 
 A relative path in the config, such as `[worktrees] root`, is relative to
@@ -40,6 +55,113 @@ on where you started it.
 
 Each repository can lower these limits in `<repo>/.archon/config.toml`. The
 full reference is in [`docs/ARCHITECTURE.md` §9](ARCHITECTURE.md#9-configuration).
+
+The orchestrator reads your code in mirrors: for every registered
+repository, `archond` keeps a clone at `<data>/orchestrator/repos/<name>`,
+checked out at the base branch, with no remote, and refreshes it when an
+item finishes and when you write. A mirror shares the repository's objects
+through hard links when both are on one filesystem, so it costs about one
+more checkout; on another filesystem it is a full copy. A repository whose
+own `[models]` refuses the orchestrator's model gets no mirror.
+
+`archond` posts every finished item to your feed itself and wakes the
+orchestrator for a success, a failure, a blocker, an item tagged `notify`
+or one a GitHub thread asked for; every wake is a whole orchestrator turn
+that you pay for. A routine success waits, up to five minutes, while other
+items are queued or running, so one wake reports them together. The success
+wake is what shows a finished item in the terminal UI. If you follow Archon
+in `archon chat` instead, set
+`wake_on_success = false` under `[orchestrator]`: a routine success then
+reaches the orchestrator with its next turn
+([guide](guide.md#when-the-orchestrator-is-woken)).
+
+The helper agents the orchestrator delegates to
+([guide](guide.md#what-the-orchestrator-does-without-queueing)) work in a
+mirror or in a scratch directory, never in your checkout. A helper is held
+to `[models]` narrowed by the `[models]` of the repository whose mirror it
+reads, and to `[models]` alone when it reads none. It may delegate once
+more, and no deeper ([`max_delegation_depth`](#structural-limits)).
+Helpers' spend counts toward the daily and total
+budgets. `max_parallel_agents` and the other caps count stage agents
+only, so the orchestrator is told to keep its helpers within them. If your
+Aether config sets `[scheduler] run_budget_usd`, Archon's instance inherits
+it, and it is cumulative: once the orchestrator's run has spent it, Aether
+refuses every delegation until `archon orchestrator restart`.
+
+## Structural limits
+
+These `[limits]` keys bound shapes rather than spend. Each default is the
+value earlier releases fixed, and each has a ceiling the daemon will not
+go past:
+
+```toml
+[limits]
+max_delegation_depth = 2         # 1..=4
+max_agent_messages = 20          # 1..=200
+initiative_members = 16          # 1..=64
+initiative_contract_bytes = 2048 # 1..=16384
+```
+
+- `max_delegation_depth`: how many delegations below a stage agent or the
+  orchestrator an agent may be. 2 lets a child delegate once more; 1 makes
+  every child a leaf. Every level adds agents that run outside
+  `max_parallel_agents`. The orchestrator's prompt and each delegating
+  stage's contract state the configured depth.
+- `max_agent_messages`: the `message_orchestrator` calls one stage agent
+  may make in its lifetime, and the messages one run node's inbox may
+  relay. Each message is an orchestrator turn.
+- `initiative_members` and `initiative_contract_bytes`: an initiative's
+  size. The contract is in every member's stage contract, and is sent
+  whole to running members whenever it changes.
+
+Others stay fixed. The pipeline format's own bounds (32 stages, `fan_out`
+16, `max_loops` 10) are the same everywhere, so a pipeline that loads on
+one installation loads on all ([pipelines](PIPELINES.md)). The git-identity
+rules, workspace placement, model policy, budgets, review evidence and
+gates are protections, not sizes, and no configuration turns them off.
+
+## Learning
+
+```toml
+[learning]
+enabled = true
+distill_every = 20
+distill_daily_budget_usd = 3.0
+explore_rate = 0.1
+```
+
+Learning keeps an outcome for every finished run: its result, its stage
+attempts with what their delegated agents cost, and the corrections it drew
+later, among them what GitHub says of the pull request `archond` delivered
+(merged, closed, or sent back by a reviewer; read every 10 minutes for 14
+days). Runs that finished before you updated are imported in small batches
+in the background; their diff sizes stay unknown.
+
+Omitted stages use conservative Wilson quality bounds, with a small cost penalty,
+within the model policy. Evidence is grouped by repository, pipeline content revision,
+review level, stage, task class (`task:<class>`, otherwise `general`) and known diff
+size (`diff:small`, `diff:medium`, `diff:large`). Explicit choices stay explicit.
+`explore_rate`, from 0 to 0.1, bounds experiments with ready, allowed models from
+Aether's catalog, including models with no history. The item ID makes the choice
+replayable. Choices with at least five samples whose upper quality bound falls below
+the incumbent's lower bound are excluded from exploration. `lessons why` explains
+the bounds, sample size and context; five wins are not proof of equivalence.
+
+`distill_every` (1..100) counts new outcomes per repository before a $1 errand.
+At most one distillation is queued or running per repository. Across repositories,
+`distill_daily_budget_usd` reserves the full errand budgets per UTC creation day;
+the default is $3, and 0 disables new distillations. Imported history informs routing
+and statistics but is never distilled, avoiding upgrade spending bursts.
+Proposed lessons and pipelines wait for operator acceptance; inspect pipelines with
+`archon pipelines proposals [name]` before `archon pipelines accept <name>`.
+
+`enabled = false` stops new learning and cancels queued distillation errands on the
+next maintenance pass. Recorded evidence stays readable, including offline lessons
+commands. Config is loaded into daemon memory; restart after editing it.
+Outcome costs are provisional at finish and read from the current spend ledger,
+including later provider settlement. Missing outcomes are reconciled in recurring
+bounded scans; malformed history gets a diagnostic skip marker instead of blocking
+later runs.
 
 ## Disk use
 
@@ -108,7 +230,7 @@ keep from a directory that was set aside. The rules in full are in
 
 If the disk still fills:
 
-- Run fewer agents at once: lower `[limits] max_parallel_agents` (3 by
+- Run fewer agents at once: lower `[limits] max_parallel_agents` (8 by
   default) or `max_per_repo`, or until the next restart
   `archon queue caps --max-parallel-agents 2`.
 - Shorten `cache_after`, for example to `"15m"`, so finished items give
@@ -122,13 +244,18 @@ If the disk still fills:
 The default orchestrator uses `claude-code/claude-opus-5-5` at `high` effort.
 If you are already signed in to Claude Code or Codex, neither Archon nor Aether needs a separate login for that engine.
 After setup, `archon aether models` lists the models your Aether installation
-actually exposes. To use Codex alone, set `[orchestrator] model` to an
-available `codex/…` entry before starting Archon. If you set `[models] allow`,
-include the orchestrator as well as every model the stages may use.
+actually exposes: for example `claude-code/claude-opus-5-5`,
+`claude-code/claude-sonnet-5-5`, `claude-code/claude-haiku-5-5`,
+`claude-code/claude-fable-5-1`, `codex/gpt-6-astra`, `codex/gpt-6.1-sol`
+and `codex/gpt-6-luna`. The orchestrator's own model is the one model you
+set, because it must be known before any agent runs. To use Codex alone,
+set `[orchestrator] model` to an available `codex/…` entry before starting
+Archon. If you do set `[models] allow`, include the orchestrator's model as
+well as every model the stages may use.
 
 ```toml
 [orchestrator]
-model = "codex/your-available-model" # replace with an entry from the model list
+model = "codex/gpt-6.1-sol"    # any entry from `archon aether models`
 effort = "high"
 ```
 

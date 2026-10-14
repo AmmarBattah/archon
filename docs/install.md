@@ -40,12 +40,12 @@ profile, and it never touches Archon's configuration or data.
 Set these in the environment of `sh`, after the pipe:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mengsig/archon/main/install.sh | ARCHON_VERSION=v1.0.1 sh
+curl -fsSL https://raw.githubusercontent.com/mengsig/archon/main/install.sh | ARCHON_VERSION=v1.1.0 sh
 ```
 
 | Variable | Effect |
 | --- | --- |
-| `ARCHON_VERSION` | Install this release, such as `v1.0.1`, instead of the latest. |
+| `ARCHON_VERSION` | Install this release, such as `v1.1.0`, instead of the latest. |
 | `ARCHON_INSTALL_DIR` | Install here instead of `~/.local/bin`. The directory must be yours to write. |
 | `ARCHON_SKIP_AETHER=1` | Do not install Aether; print the command that does. |
 | `ARCHON_NONINTERACTIVE=1` | Ask nothing: a missing Aether is installed without a question. |
@@ -89,7 +89,7 @@ If you are already signed in to Claude Code or Codex, neither Archon nor Aether 
 | Program | Used for | Required? | Install |
 | --- | --- | --- | --- |
 | [Aether](https://github.com/mengsig/aether) (`aether`) | Runs the orchestrator and stage agents | Yes | The Archon installer offers it; see [Aether](#aether). |
-| [git](https://git-scm.com/install/) | A worktree and a branch for every item | Yes | `brew install git`, or your distribution's package |
+| [git](https://git-scm.com/install/) 2.38 or later | A worktree and a branch for every item | Yes | `brew install git`, or your distribution's package |
 | [Claude Code](https://code.claude.com/docs/en/quickstart) (`claude`) | Claude engine and its login | One engine required | `curl -fsSL https://claude.ai/install.sh \| bash`, then run `claude` once to log in |
 | [Codex](https://github.com/openai/codex) (`codex`) | Codex engine and its login | Alternative engine | `npm install -g @openai/codex`, then `codex login` |
 | [GitHub CLI](https://cli.github.com/) (`gh`) | The `pr` ship mode and the GitHub watcher | Optional; local work works without it | `brew install gh`, then `gh auth login` |
@@ -97,8 +97,6 @@ If you are already signed in to Claude Code or Codex, neither Archon nor Aether 
 | [lavish-axi](https://github.com/kunchenguid/lavish-axi) | Annotated HTML review pages | Optional | `npm install -g lavish-axi` |
 | [Rust / Cargo](https://rustup.rs/) | Builds Archon from source | Only for source builds | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | [Playwright](https://playwright.dev/docs/intro) | Browser journeys in the web testing pipelines | Optional | `npm init playwright@latest` in the tested project |
-| [cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit) | Rust audit in the `dependency-upgrade` pipeline | Optional | `cargo install cargo-audit --locked` |
-| [pip-audit](https://pypi.org/project/pip-audit/) | Python audit in the `dependency-upgrade` pipeline | Optional | `python -m pip install pip-audit` in a virtual environment |
 
 ## Verifying a download by hand
 
@@ -106,7 +104,7 @@ Every release carries, for each archive, a `.sha256` file, and one
 `SHA256SUMS` file that lists all of them.
 
 ```sh
-tag=v1.0.1
+tag=v1.1.0
 target=x86_64-unknown-linux-musl
 base=https://github.com/mengsig/archon/releases/download/$tag
 curl -fsSLO "$base/archon-$target.tar.gz"
@@ -127,7 +125,7 @@ archive holds `LICENSE` and `THIRD-PARTY-NOTICES`; the installer and
 ```sh
 archon update            # install the latest release when it is newer
 archon update --check    # only report: exit 0 when up to date, 10 when a newer release exists
-archon update --version v1.2.3    # install exactly this release; an older one is a downgrade
+archon update --version v1.2.3    # install exactly this release
 ```
 
 `archon update` downloads the same archive as the installer, makes the same
@@ -148,13 +146,47 @@ update itself interrupts no running item. To move the daemon to the new
 version:
 
 ```sh
-archon daemon stop
+archon daemon stop --keep-aether
 archon aether mcp refresh archon
 archon orchestrator restart
 ```
 
 It also reports whether your Aether serves what the new version needs, and
 prints `aether update` when it does not.
+
+### Back up before a release that migrates the store
+
+A release may migrate the queue database (`archon.db` in the data
+directory) when its `archond` first starts, and an older `archond` refuses
+a migrated store: "store schema version 10 is newer than this archon
+supports (7)". The migration is one-way. 1.1.0 migrates a 1.0 store, so
+back it up first:
+
+```sh
+archon daemon stop
+cd ~/.local/share/archon      # or $ARCHON_DATA_DIR; ~/Library/Application Support/archon on macOS
+cp archon.db archon-1.0.db
+archon update
+```
+
+An `archond` that stopped cleanly leaves no `archon.db-wal` beside the
+store. If there is one, copy it too, as `archon-1.0.db-wal`.
+
+To go back, stop the new `archond`, install the old release and put the
+copy back. Everything the newer release recorded since the copy is lost.
+
+```sh
+archon daemon stop
+archon update --version v1.0.1
+cd ~/.local/share/archon
+rm -f archon.db-wal archon.db-shm
+cp archon-1.0.db archon.db    # and archon-1.0.db-wal as archon.db-wal, if you copied one
+archon daemon start
+```
+
+`archon update --version` with an older release installs it even when
+the store was migrated; the old `archond` then refuses to start until the
+copy is back.
 
 `archon update` only replaces an `archon` that the installer put in a
 directory you can write. For a `cargo install` or a build directory it
@@ -164,7 +196,7 @@ also updates.
 ## Uninstalling
 
 ```sh
-archon daemon stop --aether    # stop archond and Archon's own aetherd
+archon daemon stop             # stop archond and Archon's own aetherd
 rm ~/.local/bin/archon         # or the directory you chose with ARCHON_INSTALL_DIR
 ```
 

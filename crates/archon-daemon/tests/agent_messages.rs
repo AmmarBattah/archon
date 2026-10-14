@@ -2,7 +2,9 @@ mod common;
 
 use archon_aether::events::parse_event;
 use archon_core::aether_ids::AetherAgentId;
-use archon_core::agent_message::{AgentMessage, MAX_AGENT_MESSAGES, MessageKind, MessageSender};
+use archon_core::agent_message::{
+    AgentMessage, DEFAULT_AGENT_MESSAGES, MessageKind, MessageSender,
+};
 use archon_core::error::ArchonError;
 use archon_core::notify::{FeedEntry, NotificationKind};
 use archon_core::protocol::{ClientKind, Reply, Request};
@@ -126,12 +128,18 @@ async fn records_attribution_and_receipt_without_settling_or_calling_aether() {
     let FeedEntry::Notification(note) = recorded.entry else {
         panic!("expected item log");
     };
-    assert_eq!(note.kind, NotificationKind::Progress);
+    assert_eq!(
+        note.kind,
+        NotificationKind::Blocker,
+        "an escalation shows in the quiet chat"
+    );
     assert_eq!(note.item, Some(message.item.clone()));
     assert_eq!(note.run, Some(message.run.clone()));
+    let agent = message.agent.as_ref().unwrap();
     assert_eq!(
-        serde_json::from_str::<AgentMessage>(&note.text).unwrap(),
-        message
+        note.text,
+        format!("From implement ({agent}; escalation): cross-item blocker"),
+        "the operator reads it as it is; the orchestrator does not repeat it"
     );
 }
 
@@ -155,7 +163,7 @@ async fn refuses_invalid_unattributed_and_over_limit_calls_without_recording_the
         send(&h, &unknown, MessageKind::Info, "hi").await,
         Err(ArchonError::Forbidden(_))
     ));
-    for _ in 0..MAX_AGENT_MESSAGES {
+    for _ in 0..DEFAULT_AGENT_MESSAGES {
         send(&h, &stage, MessageKind::Info, "progress")
             .await
             .unwrap();
@@ -166,8 +174,32 @@ async fn refuses_invalid_unattributed_and_over_limit_calls_without_recording_the
         .await
         .unwrap_err();
     assert!(error.to_string().contains("limit reached"));
-    assert_eq!(messages(&h).await.len(), MAX_AGENT_MESSAGES as usize);
+    assert_eq!(messages(&h).await.len(), DEFAULT_AGENT_MESSAGES as usize);
     assert_eq!(h.running().await, vec![stage]);
+}
+
+/// `[limits] max_agent_messages` replaces the default of 20, and the
+/// refusal names the key.
+#[tokio::test]
+async fn the_configured_message_limit_is_the_one_enforced() {
+    let mut config = archon_core::config::Config::default();
+    config.limits.max_agent_messages = 2;
+    let h = Harness::with_config(config).await;
+    h.enqueue("stage messaging").await;
+    h.dispatch().await;
+    let stage = h.running().await.remove(0);
+    for _ in 0..2 {
+        send(&h, &stage, MessageKind::Info, "progress")
+            .await
+            .unwrap();
+    }
+    let error = send(&h, &stage, MessageKind::Info, "third")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("limit reached (2 messages"), "{error}");
+    assert!(error.contains("`[limits] max_agent_messages`"), "{error}");
+    assert_eq!(messages(&h).await.len(), 2);
 }
 
 #[tokio::test]
@@ -298,10 +330,10 @@ async fn forwards_after_retirement_and_after_the_node_index_is_pruned() {
 async fn run_node_external_rate_limit_is_visible_and_replay_safe() {
     let (h, stage) = running().await;
     let node = h.backend.node_ids().remove(0);
-    for seq in 1..=MAX_AGENT_MESSAGES {
+    for seq in 1..=DEFAULT_AGENT_MESSAGES {
         inbox(&h, &node, u64::from(seq), json!({"actor": "user"}), "relay").await;
     }
-    let seq = u64::from(MAX_AGENT_MESSAGES + 1);
+    let seq = u64::from(DEFAULT_AGENT_MESSAGES + 1);
     inbox(&h, &node, seq, json!({"actor": "user"}), "too many").await;
     let count = system_notes(&h).await.len();
     assert!(
@@ -312,7 +344,7 @@ async fn run_node_external_rate_limit_is_visible_and_replay_safe() {
     );
     inbox(&h, &node, seq, json!({"actor": "user"}), "too many").await;
     assert_eq!(system_notes(&h).await.len(), count);
-    assert_eq!(messages(&h).await.len(), MAX_AGENT_MESSAGES as usize);
+    assert_eq!(messages(&h).await.len(), DEFAULT_AGENT_MESSAGES as usize);
     assert_eq!(h.running().await, vec![stage]);
 }
 
@@ -326,7 +358,7 @@ async fn run_node_agent_refusals_are_delivered_and_retried_when_unavailable() {
     assert!(h.backend.messages()[0].1.contains("at most 4096"));
     assert_eq!(h.backend.messages()[0].0, *agent);
     assert!(messages(&h).await.is_empty());
-    for _ in 0..MAX_AGENT_MESSAGES {
+    for _ in 0..DEFAULT_AGENT_MESSAGES {
         send(&h, &stage, MessageKind::Info, "tool message")
             .await
             .unwrap();
@@ -348,7 +380,7 @@ async fn run_node_agent_refusals_are_delivered_and_retried_when_unavailable() {
     pump::handle_fleet_event(&h.ctx, &event).await.unwrap();
     assert_eq!(h.backend.messages().len(), 2);
     assert!(h.backend.messages()[1].1.contains("limit reached"));
-    assert_eq!(messages(&h).await.len(), MAX_AGENT_MESSAGES as usize);
+    assert_eq!(messages(&h).await.len(), DEFAULT_AGENT_MESSAGES as usize);
 }
 
 #[tokio::test]

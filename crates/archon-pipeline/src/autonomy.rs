@@ -2,7 +2,7 @@
 //! `proposal` and `report` insert when the pipeline declares none, and the
 //! stages whose output waits for the operator.
 
-use archon_core::autonomy::{Autonomy, ProposalMode, ReportMode, ReviewLevel};
+use archon_core::autonomy::{Autonomy, Knob, ProposalMode, ReportMode, ReviewLevel};
 use archon_core::catalog::{Gate, StageKind};
 use archon_core::error::ArchonError;
 use archon_core::run::GateSubject;
@@ -18,21 +18,34 @@ const PROPOSE_TEMPLATE: &str = include_str!("../../../pipelines/_shared/propose.
 const REPORT_TEMPLATE: &str = include_str!("../../../pipelines/_shared/report.md");
 const INSERTED_TIMEOUT_MINUTES: u32 = 45;
 
-/// Whether the pipeline delivers a change: it has a ship stage.
+/// Whether the pipeline delivers a change: archond ships it, or it has a
+/// ship stage.
 pub fn ships(spec: &PipelineSpec) -> bool {
     ship_index(spec).is_some()
 }
 
+/// Where shipping happens among the stages: at the ship stage, or after the
+/// last stage when archond ships.
 fn ship_index(spec: &PipelineSpec) -> Option<usize> {
-    spec.file
-        .stages
-        .iter()
-        .position(|s| s.kind == StageKind::Ship)
+    let stages = &spec.file.stages;
+    if spec.file.pipeline.ship.is_some() {
+        return Some(stages.len());
+    }
+    stages.iter().position(|s| s.kind == StageKind::Ship)
 }
 
-/// The review level a pipeline's gates amount to: gated tests and gated
-/// reviews are strict, either one alone standard, neither none.
+/// A pipeline's review level: the stricter of what it declares and its gates'
+/// (gated tests and gated reviews: strict; either alone: standard; else none).
 pub fn review_level(spec: &PipelineSpec) -> ReviewLevel {
+    let by_gates = gated_review_level(spec);
+    match &spec.file.pipeline.review {
+        Some(declared) => declared.level.lower(by_gates),
+        None => by_gates,
+    }
+}
+
+/// The review a pipeline's gated stages run whatever an item asks for.
+fn gated_review_level(spec: &PipelineSpec) -> ReviewLevel {
     let gated = |kind: StageKind| {
         spec.file
             .stages
@@ -44,6 +57,25 @@ pub fn review_level(spec: &PipelineSpec) -> ReviewLevel {
         (true, false) | (false, true) => ReviewLevel::Standard,
         (false, false) => ReviewLevel::None,
     }
+}
+
+/// Whether an item chooses the pipeline's review level: one of its stages
+/// holds the review and delegates as many reviewers as the level needs.
+pub fn review_is_chosen(spec: &PipelineSpec) -> bool {
+    spec.file.pipeline.review.is_some()
+}
+
+/// The review level an item gets on `spec`: what it `asked` for, else the
+/// pipeline's own raised to `floor`; never below what its gated stages run.
+pub fn chosen_review(
+    spec: &PipelineSpec,
+    asked: Option<ReviewLevel>,
+    floor: ReviewLevel,
+) -> ReviewLevel {
+    let declared = spec.file.pipeline.review.as_ref();
+    let declared = declared.expect("only a pipeline that declares its review lets an item choose");
+    let level = asked.unwrap_or_else(|| declared.level.lower(floor));
+    level.lower(gated_review_level(spec))
 }
 
 /// The pipeline's propose stage, which is always first when present.
@@ -61,10 +93,13 @@ pub fn change_report_stage(spec: &PipelineSpec) -> Option<&StageSpec> {
         .find(|s| s.kind == StageKind::Report)
 }
 
-/// `spec` with the stages `autonomy` needs and the pipeline does not
-/// declare: `propose` first, and `report` right before ship.
+/// `spec` as run with `autonomy`: the stages its knobs add (`propose` first,
+/// `report` before ship), and its review level where a stage holds the review.
 pub fn augment(spec: &PipelineSpec, autonomy: &Autonomy) -> Result<PipelineSpec, ArchonError> {
     let mut out = spec.clone();
+    if let Some(review) = &mut out.file.pipeline.review {
+        review.level = autonomy.review;
+    }
     let wants_proposal = autonomy.proposal == ProposalMode::Lavish;
     if wants_proposal && propose_stage(spec).is_none() {
         require_ship(spec, "proposal")?;
@@ -87,7 +122,7 @@ fn require_ship(spec: &PipelineSpec, knob: &str) -> Result<(), ArchonError> {
         return Ok(());
     }
     Err(ArchonError::Invalid(format!(
-        "{knob} applies only to pipelines that ship; {:?} has no ship stage",
+        "{knob} applies only to pipelines that ship; {:?} ships nothing",
         spec.name()
     )))
 }
@@ -190,26 +225,34 @@ mod tests {
         }
     }
 
+    /// An enqueue that names no pipeline may ask for any review level.
     #[test]
-    fn builtin_review_levels_match_their_family() {
+    fn the_default_pipeline_ships_at_every_review_level() {
+        let spec = builtin_spec(crate::builtin::DEFAULT_PIPELINE);
+        assert!(ships(&spec) && review_is_chosen(&spec));
         for level in [
             ReviewLevel::None,
             ReviewLevel::Standard,
             ReviewLevel::Strict,
         ] {
-            let spec = builtin_spec(level.pipeline());
-            assert_eq!(review_level(&spec), level, "{}", level.pipeline());
-            assert!(ships(&spec));
+            assert_eq!(chosen_review(&spec, Some(level), ReviewLevel::None), level);
         }
+        let refactor = builtin_spec("refactor");
+        assert!(!review_is_chosen(&refactor), "its gates fix its review");
+        assert_eq!(review_level(&refactor), ReviewLevel::Strict);
         assert!(!ships(&builtin_spec("ask")));
     }
 
     #[test]
     fn knobs_insert_propose_first_and_report_before_ship() {
-        let spec = builtin_spec("default-pr-review");
+        let spec = builtin_spec("refactor");
         let both = augment(&spec, &knobs(ProposalMode::Lavish, ReportMode::BeforePr)).unwrap();
         let ids: Vec<&str> = both.file.stages.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["propose", "implement", "review", "report", "ship"]);
+        let stages = [
+            "propose", "baseline", "refactor", "verify", "review", "report",
+        ];
+        assert_eq!(ids, stages);
+        assert_eq!(ship_index(&both), Some(6), "archond ships after the report");
         assert!(both.prompts.contains_key(PROPOSE_PROMPT));
         let gates =
             OperatorGates::for_run(&both, &knobs(ProposalMode::Lavish, ReportMode::BeforePr));
@@ -217,7 +260,7 @@ mod tests {
         assert_eq!(gates.subject("report"), Some(GateSubject::Report));
         let with_pr = knobs(ProposalMode::Off, ReportMode::WithPr);
         let plain = augment(&spec, &with_pr).unwrap();
-        assert_eq!(plain.file.stages.len(), 4);
+        assert_eq!(plain.file.stages.len(), 5);
         assert!(
             OperatorGates::for_run(&plain, &with_pr).is_empty(),
             "with-pr never waits"
@@ -243,7 +286,7 @@ mod tests {
 
     #[test]
     fn an_augmented_manifest_round_trips_through_toml() {
-        let spec = builtin_spec("strict-pr-review");
+        let spec = builtin_spec("refactor");
         let both = augment(&spec, &knobs(ProposalMode::Lavish, ReportMode::BeforePr)).unwrap();
         let text = toml::to_string(&both.file).unwrap();
         let back: crate::spec::PipelineFile = toml::from_str(&text).unwrap();
@@ -253,7 +296,7 @@ mod tests {
 
     #[test]
     fn declared_stages_are_not_duplicated_and_non_shipping_pipelines_refuse() {
-        let spec = builtin_spec("default-pr-review");
+        let spec = builtin_spec("direct");
         let wanted = knobs(ProposalMode::Lavish, ReportMode::WithPr);
         let once = augment(&spec, &wanted).unwrap();
         let twice = augment(&once, &wanted).unwrap();

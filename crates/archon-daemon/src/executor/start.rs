@@ -71,9 +71,11 @@ async fn claim_item(
     let _table = ctx.runs.lock().await;
     let mut store = ctx.store.lock().await;
     let item = store.item(id)?;
-    let collecting = ctx.collecting.contains(id);
+    let owner = store.stack_fix(id)?.map(|t| t.owner);
+    let collecting =
+        ctx.collecting.contains(id) || owner.as_ref().is_some_and(|id| ctx.collecting.contains(id));
     match item.state {
-        QueueState::Queued if collecting => Ok(None),
+        QueueState::Queued if collecting || held_by_stack(&store, id)?.is_some() => Ok(None),
         QueueState::Queued => {
             let item = store.transition_item(id, QueueState::Dispatching, archon_core::now())?;
             Ok(Some(item))
@@ -89,6 +91,34 @@ async fn claim_item(
     }
 }
 
+/// Why `id` may not start now: its restack fix is still to finish, or it is
+/// the fix of an item that is running, which would share its branch.
+pub(crate) fn held_by_stack(
+    store: &archon_queue::Store,
+    id: &QueueItemId,
+) -> Result<Option<String>, ArchonError> {
+    if store.has_pending_stack_fix(id)? {
+        return Ok(Some(format!(
+            "item {id} waits for its restack fix to finish"
+        )));
+    }
+    let Some(fix) = store.stack_fix(id)? else {
+        return Ok(None);
+    };
+    assert_ne!(&fix.owner, id, "a fix repairs another item");
+    let live = store.item(&fix.owner)?.state.is_active()
+        || store
+            .runs_for_item(&fix.owner)?
+            .iter()
+            .any(|r| !r.state.is_terminal());
+    Ok(live.then(|| {
+        format!(
+            "restack fix {id} waits for item {} to stop running",
+            fix.owner
+        )
+    }))
+}
+
 /// Everything that can fail before the run exists. Slow parts (git) run
 /// without any lock. The run uses a snapshot of its pipeline.
 async fn prepare(
@@ -99,9 +129,13 @@ async fn prepare(
     assert_eq!(item.state, QueueState::Dispatching, "prepare follows claim");
     let env = RepoEnv::load(ctx, item.repo.as_ref()).await?;
     let (base, current) = knobs::item_specs(&env, item)?;
+    // A steer may have given the item a stage list of its own (§6.6).
+    let current = super::steer::shaped(ctx, item, current).await?;
     // The ceiling may have been lowered since the item was enqueued.
     knobs::check_ceiling(&env.autonomy(&ctx.config), &env, &base, item.autonomy)?;
+    let item = &without_retired_ship(item, &current);
     let spec = Arc::new(frozen::freeze(&ctx.paths.data_dir, &run_id, &current).await?);
+    crate::learned::freeze_context(ctx, &run_id, item, &spec).await?;
     let header = &spec.file.pipeline;
     if header.requires_repo && env.repo.is_none() {
         return Err(ArchonError::Invalid(format!(
@@ -120,6 +154,16 @@ async fn prepare(
             Err(error)
         }
     }
+}
+
+/// `item` as its run reads it: a 1.0 item queued for a built-in keeps no
+/// choice for the ship agent archond replaced. The stored item is unchanged.
+fn without_retired_ship(item: &QueueItem, spec: &PipelineSpec) -> QueueItem {
+    let mut read = item.clone();
+    if spec.drop_retired_ship(&mut read.model_plan, read.model_reasons.as_mut()) {
+        tracing::info!(item = %item.id, pipeline = %item.pipeline, "dropped the retired ship stage from a 1.0 model plan");
+    }
+    read
 }
 
 /// The run in `workspace` and its driver, which may still refuse the
@@ -228,8 +272,28 @@ async fn add_worktree(
         ctx.paths.worktrees.clone(),
         ctx.config.worktrees.branch_prefix.clone(),
     );
-    let branch = manager.branch_name(&item.id, &item.title, item.fresh_retries);
-    let (repo, item_id) = (repo.clone(), item.id.clone());
+    let target = ctx.store.lock().await.stack_fix(&item.id)?;
+    let parents = match &target {
+        Some(target) => ctx.store.lock().await.stack_parents(&target.owner)?,
+        None => super::restack::parents(ctx, item, repo, base.as_deref()).await?,
+    };
+    let base = parents
+        .iter()
+        .find(|p| !p.merged)
+        .map(|p| p.parent_branch.clone())
+        .or(base);
+    let branch = target
+        .as_ref()
+        .map(|t| t.branch.clone())
+        .unwrap_or_else(|| manager.branch_name(&item.id, &item.title, item.fresh_retries));
+    let item_id = target
+        .as_ref()
+        .map(|t| t.owner.clone())
+        .unwrap_or_else(|| item.id.clone());
+    let team = target.as_ref().map_or(team, |t| t.team);
+    let cleanup_owner = item_id.clone();
+    let source_repo = repo.clone();
+    let repo = repo.clone();
     let repo_path = repo.path.clone();
     let tree = tokio::task::spawn_blocking(move || match team {
         true => manager.create_team_run(&repo.path, &repo.name, &item_id, &branch, base.as_deref()),
@@ -241,7 +305,43 @@ async fn add_worktree(
         tree.path.starts_with(&ctx.paths.worktrees),
         "worktrees are added under the worktree root"
     );
+    let workspace = worktree_workspace(tree, repo_path, cleanup_owner, team);
+    if target.is_none() {
+        merge_stack(ctx, &source_repo, &workspace, &parents).await?;
+    }
+    Ok(workspace)
+}
+
+async fn merge_stack(
+    ctx: &DaemonContext,
+    repo: &Repo,
+    workspace: &Workspace,
+    parents: &[archon_queue::store::stacks::StackParent],
+) -> Result<(), ArchonError> {
+    assert!(workspace.path.starts_with(&ctx.paths.worktrees));
+    assert!(!workspace.branch.is_empty());
+    let result =
+        super::restack::merge_others(ctx, repo, &workspace.path, &workspace.branch, parents).await;
+    if let Err(error) = result {
+        let error = match abandon_worktree(ctx, workspace.added.clone()).await {
+            Ok(()) => error,
+            Err(cleanup) => error.with_detail(&format!("worktree cleanup also failed: {cleanup}")),
+        };
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn worktree_workspace(
+    tree: crate::worktree::Worktree,
+    repo_path: PathBuf,
+    item: QueueItemId,
+    team: bool,
+) -> Workspace {
+    assert!(tree.path.is_absolute());
+    assert!(!tree.branch.is_empty());
     let added = tree.added.then(|| Cleanup {
+        item,
         repo_path,
         worktree: tree.path.clone(),
         snapshot: false,
@@ -250,13 +350,13 @@ async fn add_worktree(
         let root = archon_pipeline::team::team_root(&tree.path);
         root.expect("create_team_run adds <item>/main").to_owned()
     });
-    Ok(Workspace {
+    Workspace {
         path: tree.path,
         team_root,
         branch: tree.branch,
         base: tree.base,
         added,
-    })
+    }
 }
 
 /// A detached snapshot of the repository's `HEAD` commit for a
@@ -295,6 +395,7 @@ async fn add_snapshot(
     );
     tracing::info!(item = %item.id, snapshot = %snapshot.path.display(), commit = %snapshot.commit, "added a snapshot");
     let added = Cleanup {
+        item: item.id.clone(),
         repo_path: repo.path.clone(),
         worktree: snapshot.path.clone(),
         snapshot: true,
@@ -349,7 +450,8 @@ async fn launch(
         let running = QueueState::Running {
             run: run.id.clone(),
         };
-        store.transition_item(&run.item, running, archon_core::now())
+        let started = store.transition_item(&run.item, running, archon_core::now());
+        started.and_then(|item| super::steer::correct_shaped(&store, &run).map(|()| item))
     };
     // The run exists now, so only finish_run can settle the item.
     if let Err(error) = inserted {
@@ -374,7 +476,7 @@ async fn abandon_worktree(ctx: &DaemonContext, added: Option<Cleanup>) -> Result
         "only Archon's own worktrees are abandoned"
     );
     tracing::info!(worktree = %tree.worktree.display(), "removing the worktree of an abandoned start");
-    finish::remove_worktree(ctx, tree, ABANDONED).await
+    finish::remove_worktree(ctx, tree, ABANDONED, None).await
 }
 
 fn first_stage(run: &PipelineRun) -> String {

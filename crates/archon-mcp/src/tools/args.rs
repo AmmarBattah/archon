@@ -21,23 +21,20 @@ use serde_json::{Map, Value};
 
 use super::{ToolDefinition, ToolError, definition};
 
+mod initiatives;
+mod lessons;
+mod steer;
+
 pub(super) fn to_request(tool: &str, arguments: Value) -> Result<Request, ToolError> {
     let Some(definition) = definition(tool) else {
         return Err(ToolError(format!("unknown tool `{tool}`")));
     };
     let mut args = Args::new(definition, arguments)?;
     let request = match tool {
-        "message_orchestrator" => {
-            let text = args.required_text("text")?;
-            archon_core::agent_message::check_text(&text).map_err(|e| args.error("text", e))?;
-            Request::MessageOrchestrator {
-                text,
-                kind: args.optional("kind")?.unwrap_or_default(),
-                caller: None,
-            }
-        }
+        "message_orchestrator" => message_orchestrator(&mut args)?,
         "list_pipelines" => Request::ListPipelines {
             repo: args.optional("repo")?,
+            pipeline: args.optional_text("pipeline")?,
         },
         "list_repos" => Request::RepoList,
         "model_policy" => Request::ModelPolicy {
@@ -50,12 +47,7 @@ pub(super) fn to_request(tool: &str, arguments: Value) -> Result<Request, ToolEr
         "get_stage" => get_stage(&mut args)?,
         "queue_status" => Request::Status,
         "cost_report" => cost_report(&mut args)?,
-        "model_evidence" => Request::ModelEvidence(ModelEvidenceQuery {
-            repo: args.optional("repo")?,
-            pipeline: args.optional_text("pipeline")?,
-            stage: args.optional_text("stage")?,
-            since: day_bound(&mut args, "since")?,
-        }),
+        "model_evidence" => model_evidence(&mut args)?,
         "register_repo" => register_repo(&mut args)?,
         "enqueue" => Request::Enqueue(enqueue(&mut args)?),
         "update_item" => update_item(&mut args)?,
@@ -63,13 +55,7 @@ pub(super) fn to_request(tool: &str, arguments: Value) -> Result<Request, ToolEr
             item: args.required("item")?,
             reason: args.optional_text("reason")?,
         },
-        "retry_item" => Request::RetryItem {
-            item: args.required("item")?,
-            model_plan: args.optional_plan("model_plan")?,
-            model_reasons: args.optional_reasons()?,
-            fresh: args.optional("fresh")?.unwrap_or(false),
-            brief_append: args.optional_text("brief_append")?,
-        },
+        "retry_item" => retry_item(&mut args)?,
         "pause" => Request::Pause(pause_target(&mut args)?),
         "resume" => Request::Resume(pause_target(&mut args)?),
         "notify" => Request::Notify {
@@ -90,6 +76,10 @@ pub(super) fn to_request(tool: &str, arguments: Value) -> Result<Request, ToolEr
         "set_directive" => set_directive(&mut args)?,
         "clear_directive" => clear_directive(&mut args)?,
         "github_reply" => github_reply(&mut args)?,
+        "enqueue_initiative" => initiatives::enqueue_initiative(&mut args)?,
+        "update_initiative" => initiatives::update_initiative(&mut args)?,
+        "steer_item" => steer::steer_item(&mut args)?,
+        "record_lesson" => lessons::record_lesson(&mut args)?,
         other => unreachable!("`{other}` has a definition but no mapping"),
     };
     args.finish()?;
@@ -148,6 +138,11 @@ impl Args {
 
     fn error(&self, key: &str, why: impl std::fmt::Display) -> ToolError {
         ToolError(format!("{}: `{key}` {why}", self.tool))
+    }
+
+    /// A refusal of the arguments together, not of one of them.
+    fn refusal(&self, why: impl std::fmt::Display) -> ToolError {
+        ToolError(format!("{}: {why}", self.tool))
     }
 
     /// Absent and `null` are both "not given".
@@ -301,8 +296,7 @@ fn enqueue(args: &mut Args) -> Result<EnqueueRequest, ToolError> {
     if title.contains('\n') {
         return Err(args.error("title", "must be a single line; put the details in `brief`"));
     }
-    let model_plan = args.optional_plan("model_plan")?;
-    let model_plan = model_plan.ok_or_else(|| args.error("model_plan", "is required"))?;
+    let model_plan = args.optional_plan("model_plan")?.unwrap_or_default();
     let request = EnqueueRequest {
         repo: args.optional("repo")?,
         pipeline: args.optional_text("pipeline")?,
@@ -377,6 +371,35 @@ fn day_bound(args: &mut Args, key: &str) -> Result<Option<DayBound>, ToolError> 
         Err(ArchonError::Invalid(why)) => Err(args.error(key, format_args!("is invalid: {why}"))),
         Err(other) => Err(args.error(key, other)),
     }
+}
+
+fn message_orchestrator(args: &mut Args) -> Result<Request, ToolError> {
+    let text = args.required_text("text")?;
+    archon_core::agent_message::check_text(&text).map_err(|e| args.error("text", e))?;
+    Ok(Request::MessageOrchestrator {
+        text,
+        kind: args.optional("kind")?.unwrap_or_default(),
+        caller: None,
+    })
+}
+
+fn model_evidence(args: &mut Args) -> Result<Request, ToolError> {
+    Ok(Request::ModelEvidence(ModelEvidenceQuery {
+        repo: args.optional("repo")?,
+        pipeline: args.optional_text("pipeline")?,
+        stage: args.optional_text("stage")?,
+        since: day_bound(args, "since")?,
+    }))
+}
+
+fn retry_item(args: &mut Args) -> Result<Request, ToolError> {
+    Ok(Request::RetryItem {
+        item: args.required("item")?,
+        model_plan: args.optional_plan("model_plan")?,
+        model_reasons: args.optional_reasons()?,
+        fresh: args.optional("fresh")?.unwrap_or(false),
+        brief_append: args.optional_text("brief_append")?,
+    })
 }
 
 fn list_queue(args: &mut Args) -> Result<Request, ToolError> {

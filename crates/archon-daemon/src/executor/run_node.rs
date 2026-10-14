@@ -24,7 +24,7 @@ use archon_core::run::StageRun;
 use archon_queue::Store;
 use serde::{Deserialize, Serialize};
 
-use super::naming;
+use super::{naming, resume};
 use crate::context::DaemonContext;
 use crate::resolve;
 
@@ -37,7 +37,7 @@ const MESSAGE_NODE_KEY_PREFIX: &str = "message_run_node:";
 /// How long after its stage settled an agent may still be ending its turn
 /// before the node is retired regardless. Aether settles a task mid-turn
 /// and the agent completes when the turn ends.
-const TURN_END_GRACE_SECS: i64 = 60;
+pub(super) const TURN_END_GRACE_SECS: i64 = 60;
 
 /// The live node a stage agent is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +106,12 @@ fn node_key(run: &PipelineRunId) -> String {
 
 fn node_agent_key(agent: &AetherAgentId) -> String {
     format!("{NODE_AGENT_KEY_PREFIX}{agent}")
+}
+
+/// Whether `run` still has its node entry: live, or finished and not yet
+/// retired.
+pub(super) fn has_node(store: &Store, run: &PipelineRunId) -> Result<bool, ArchonError> {
+    Ok(store.kv_get(&node_key(run))?.is_some())
 }
 
 /// Whether `agent` is, or was, the node of a pipeline run.
@@ -567,12 +573,21 @@ async fn turn_still_ending(
     run: &PipelineRunId,
     now: Timestamp,
 ) -> Result<bool, ArchonError> {
-    let stages = ctx.store.lock().await.stage_runs(run)?;
+    let (stages, parked) = {
+        let store = ctx.store.lock().await;
+        let stages = store.stage_runs(run)?;
+        let parked = resume::parked(&store, &stages)?;
+        (stages, parked)
+    };
     assert!(
         stages.iter().all(|s| s.state.is_terminal()),
         "only a run with no live stage retires its node"
     );
-    for (stage, agent) in agents_within_grace(&stages, now) {
+    // A kept agent waits on its inbox until the node's cancel ends it (§6.7).
+    let ending = agents_within_grace(&stages, now)
+        .into_iter()
+        .filter(|(_, agent)| !parked.contains(*agent));
+    for (stage, agent) in ending {
         match ctx.backend.is_live(agent).await {
             Ok(false) => continue,
             Ok(true) => {
@@ -736,6 +751,8 @@ mod tests {
             stage_id: stage.to_owned(),
             attempt: 1,
             fan_index: 0,
+            model_segments: Vec::new(),
+            infrastructure_failure: false,
             choice: archon_core::model::ModelChoice {
                 model: "claude-code/claude-sonnet-5".parse().unwrap(),
                 effort: archon_core::model::Effort::Medium,

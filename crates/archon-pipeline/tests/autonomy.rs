@@ -1,6 +1,6 @@
 //! The autonomy knobs in the RunDriver (ARCHITECTURE §18): proposal and
 //! change-report gates, their approve, revise and reject paths, a with-pr
-//! report that never waits, and `merge = auto` reaching the ship prompt.
+//! report that never waits, and `merge = auto` reaching a ship agent's prompt.
 //! Every step runs through `sim::Sim`, which checks the resume property.
 
 mod sim;
@@ -8,20 +8,33 @@ mod support;
 
 use std::sync::Arc;
 
-use archon_core::autonomy::{Autonomy, ProposalMode, ReportMode};
+use archon_core::autonomy::{Autonomy, ProposalMode, ReportMode, ReviewLevel};
 use archon_core::run::{GateDecision, GateSubject, RunState};
 use archon_pipeline::autonomy::{OperatorGates, augment};
 use archon_pipeline::engine::MAX_REVISIONS;
 use archon_pipeline::spec::PipelineSpec;
 use archon_pipeline::{EngineAction, RunDriver};
-use sim::{Agent, Sim, awaited, finish_state, slots, spawn_plans, spawned};
+use sim::{Agent, Sim, awaited, finish_state, ship_plans, slots, spawn_plans, spawned};
 
 fn gated_sim(name: &str, proposal: ProposalMode, report: ReportMode) -> Sim {
-    gated_spec_sim(&support::builtin(name), proposal, report)
+    let spec = support::builtin(name);
+    gated_spec_sim(&spec, ReviewLevel::Standard, proposal, report)
 }
 
-fn gated_spec_sim(spec: &PipelineSpec, proposal: ProposalMode, report: ReportMode) -> Sim {
+/// `direct` at review level none: its one agent, then archond ships.
+fn direct_sim(proposal: ProposalMode, report: ReportMode) -> Sim {
+    let spec = support::builtin("direct");
+    gated_spec_sim(&spec, ReviewLevel::None, proposal, report)
+}
+
+fn gated_spec_sim(
+    spec: &PipelineSpec,
+    review: ReviewLevel,
+    proposal: ProposalMode,
+    report: ReportMode,
+) -> Sim {
     let knobs = Autonomy {
+        review,
         proposal,
         report,
         ..Autonomy::default()
@@ -65,7 +78,7 @@ fn propose(sim: &mut Sim, attempt: u32) -> Vec<EngineAction> {
 
 #[test]
 fn an_approved_proposal_reaches_the_implementer_with_the_note() {
-    let mut sim = gated_sim("quick-pr", ProposalMode::Lavish, ReportMode::Off);
+    let mut sim = direct_sim(ProposalMode::Lavish, ReportMode::Off);
     let first = sim.start();
     assert_eq!(spawned(&first), slots(&[("propose", 1, 0)]));
     assert!(
@@ -82,16 +95,14 @@ fn an_approved_proposal_reaches_the_implementer_with_the_note() {
     assert!(prompt.contains("Add a parse flag; touch src/parse.rs."));
     assert!(prompt.contains("note on approving: keep the old flag working"));
     let ship = sim.settle("implement", 0, Agent::Done("Added the flag."));
-    assert!(
-        spawn_plans(&ship)[0]
-            .prompt
-            .contains("Direction from the propose stage")
-    );
+    assert!(spawned(&ship).is_empty(), "no agent ships");
+    assert_eq!(ship_plans(&ship).len(), 1, "{ship:#?}");
+    assert_eq!(ship_plans(&ship)[0].record_stage, "implement");
 }
 
 #[test]
 fn a_revised_proposal_is_rewritten_with_the_feedback() {
-    let mut sim = gated_sim("quick-pr", ProposalMode::Lavish, ReportMode::Off);
+    let mut sim = direct_sim(ProposalMode::Lavish, ReportMode::Off);
     sim.start();
     propose(&mut sim, 1);
     let again = sim.decide(revise("Use a trait instead of a flag."));
@@ -107,7 +118,7 @@ fn a_revised_proposal_is_rewritten_with_the_feedback() {
 
 #[test]
 fn a_rejected_proposal_cancels_the_run() {
-    let mut sim = gated_sim("default-pr-review", ProposalMode::Lavish, ReportMode::Off);
+    let mut sim = gated_sim("reviewed", ProposalMode::Lavish, ReportMode::Off);
     sim.start();
     propose(&mut sim, 1);
     let done = sim.decide(GateDecision::Reject {
@@ -126,7 +137,7 @@ fn a_rejected_proposal_cancels_the_run() {
 
 #[test]
 fn revisions_past_the_limit_fail_the_run() {
-    let mut sim = gated_sim("quick-pr", ProposalMode::Lavish, ReportMode::Off);
+    let mut sim = direct_sim(ProposalMode::Lavish, ReportMode::Off);
     sim.start();
     for attempt in 1..=MAX_REVISIONS {
         propose(&mut sim, attempt);
@@ -143,7 +154,7 @@ fn revisions_past_the_limit_fail_the_run() {
     }
 }
 
-/// Run `default-pr-review` with a before-pr report up to its gate.
+/// Run `reviewed` with a before-pr report up to its gate.
 fn to_report_gate(sim: &mut Sim, attempt: u32) {
     sim.settle("implement", 0, Agent::Done("Fixed parse()."));
     let report = sim.settle("review", 0, Agent::Pass);
@@ -164,19 +175,23 @@ fn to_report_gate(sim: &mut Sim, attempt: u32) {
 
 #[test]
 fn an_approved_before_pr_report_ships_with_the_report() {
-    let mut sim = gated_sim("default-pr-review", ProposalMode::Off, ReportMode::BeforePr);
+    let mut sim = gated_sim("reviewed", ProposalMode::Off, ReportMode::BeforePr);
     sim.start();
     to_report_gate(&mut sim, 1);
     let ship = sim.decide(approve(None));
-    assert_eq!(spawned(&ship), slots(&[("ship", 1, 0)]));
-    let prompt = &spawn_plans(&ship)[0].prompt;
-    assert!(prompt.contains("## Change report"));
-    assert!(prompt.contains("Report at .archon/reports/change."));
+    assert!(spawned(&ship).is_empty(), "no agent ships");
+    let body = &ship_plans(&ship)[0].body;
+    assert!(body.contains("## Change report"), "{body}");
+    assert!(body.contains("Report at .archon/reports/change."));
+    assert!(
+        body.contains("### `review`"),
+        "the review that passed is in the body"
+    );
 }
 
 #[test]
 fn a_revised_before_pr_report_sends_the_work_back_to_implement() {
-    let mut sim = gated_sim("default-pr-review", ProposalMode::Off, ReportMode::BeforePr);
+    let mut sim = gated_sim("reviewed", ProposalMode::Off, ReportMode::BeforePr);
     sim.start();
     to_report_gate(&mut sim, 1);
     let back = sim.decide(revise("Also handle whitespace-only input."));
@@ -194,12 +209,13 @@ fn a_revised_before_pr_report_sends_the_work_back_to_implement() {
     let gate = sim.settle("report", 0, Agent::Done("Report v2."));
     assert_eq!(awaited(&gate)[0].attempt, 2);
     let ship = sim.decide(approve(None));
-    assert_eq!(spawned(&ship), slots(&[("ship", 1, 0)]));
+    assert_eq!(ship_plans(&ship).len(), 1, "{ship:#?}");
+    assert!(ship_plans(&ship)[0].body.contains("Report v2."));
 }
 
 #[test]
-fn a_revised_quick_pr_report_reaches_the_implementer() {
-    let mut sim = gated_sim("quick-pr", ProposalMode::Off, ReportMode::BeforePr);
+fn a_revised_direct_report_reaches_the_implementer() {
+    let mut sim = direct_sim(ProposalMode::Off, ReportMode::BeforePr);
     sim.start();
     sim.settle("implement", 0, Agent::Done("Fixed parse()."));
     let gate = sim.settle("report", 0, Agent::Done("Report v1."));
@@ -231,7 +247,12 @@ fn a_revision_reaches_a_prompt_without_a_feedback_placeholder() {
         prompt = "ship.md"
     "#;
     let spec = support::spec_from(toml, &[("build.md", "Build {{task.title}}.")]);
-    let mut sim = gated_spec_sim(&spec, ProposalMode::Off, ReportMode::BeforePr);
+    let mut sim = gated_spec_sim(
+        &spec,
+        ReviewLevel::Standard,
+        ProposalMode::Off,
+        ReportMode::BeforePr,
+    );
     sim.start();
     sim.settle("build", 0, Agent::Done("Built it."));
     sim.settle("report", 0, Agent::Done("Report v1."));
@@ -244,7 +265,7 @@ fn a_revision_reaches_a_prompt_without_a_feedback_placeholder() {
     assert!(prompt.contains("Also handle whitespace-only input."));
 }
 
-/// Fail `default-pr-review`'s review `fails` times, then pass it.
+/// Fail `reviewed`'s review `fails` times, then pass it.
 fn review_after_failures(sim: &mut Sim, fails: u32) {
     for _ in 0..fails {
         sim.settle("implement", 0, Agent::Done("Fixed parse()."));
@@ -258,7 +279,7 @@ fn review_after_failures(sim: &mut Sim, fails: u32) {
 
 #[test]
 fn a_revised_report_starts_fresh_fix_loops() {
-    let mut sim = gated_sim("default-pr-review", ProposalMode::Off, ReportMode::BeforePr);
+    let mut sim = gated_sim("reviewed", ProposalMode::Off, ReportMode::BeforePr);
     sim.start();
     review_after_failures(&mut sim, 2);
     let gate = sim.settle("report", 0, Agent::Done("Report v1."));
@@ -287,7 +308,7 @@ fn a_revised_report_starts_fresh_fix_loops() {
 
 #[test]
 fn a_with_pr_report_never_waits() {
-    let mut sim = gated_sim("quick-pr", ProposalMode::Off, ReportMode::WithPr);
+    let mut sim = direct_sim(ProposalMode::Off, ReportMode::WithPr);
     assert!(sim.gates.is_empty());
     sim.start();
     let report = sim.settle("implement", 0, Agent::Done("Fixed parse()."));
@@ -298,25 +319,43 @@ fn a_with_pr_report_never_waits() {
         Agent::Done("Report at .archon/reports/change."),
     );
     assert!(awaited(&ship).is_empty());
-    assert_eq!(spawned(&ship), slots(&[("ship", 1, 0)]));
-    assert!(
-        spawn_plans(&ship)[0]
-            .prompt
-            .contains("do not wait for anyone to read it")
-    );
+    assert!(spawned(&ship).is_empty(), "no agent ships");
+    let body = &ship_plans(&ship)[0].body;
+    assert!(body.contains("Report at .archon/reports/change."), "{body}");
 }
 
+/// A pipeline that still ships with an agent reads the run's merge knob
+/// from its template, as before archond shipped the built-ins.
 #[test]
-fn merge_auto_reaches_the_ship_template() {
-    let spec = support::builtin("quick-pr");
+fn merge_auto_reaches_a_ship_agent_s_template() {
+    let toml = r#"
+        [pipeline]
+        name = "own-ship"
+        description = "d"
+        version = 1
+        [[stage]]
+        id = "build"
+        kind = "work"
+        prompt = "build.md"
+        [[stage]]
+        id = "ship"
+        kind = "ship"
+        prompt = "ship.md"
+    "#;
+    let prompts = [
+        ("build.md", "Build {{task.title}}."),
+        ("ship.md", "Auto-merge allowed: **`{{ship.auto_merge}}`**"),
+    ];
+    let spec = Arc::new(support::spec_from(toml, &prompts));
     let plan = support::plan_for(&spec, &[]);
     for (auto_merge, word) in [(true, "**`true`**"), (false, "**`false`**")] {
         let mut sim = Sim::new(spec.clone(), plan.clone());
         sim.base = support::base_vars_merging(&sim.run.id, &sim.run.item, auto_merge);
         sim.driver = RunDriver::new(spec.clone(), plan.clone(), sim.base.clone()).unwrap();
         sim.start();
-        let ship = sim.settle("implement", 0, Agent::Done("done"));
+        let ship = sim.settle("build", 0, Agent::Done("done"));
         assert_eq!(spawned(&ship), slots(&[("ship", 1, 0)]));
+        assert!(ship_plans(&ship).is_empty(), "its own agent ships");
         let prompt = &spawn_plans(&ship)[0].prompt;
         assert!(
             prompt.contains(&format!("Auto-merge allowed: {word}")),
@@ -327,7 +366,7 @@ fn merge_auto_reaches_the_ship_template() {
 
 #[test]
 fn decisions_are_refused_for_stages_that_are_not_gates_or_already_decided() {
-    let mut sim = gated_sim("quick-pr", ProposalMode::Lavish, ReportMode::Off);
+    let mut sim = direct_sim(ProposalMode::Lavish, ReportMode::Off);
     sim.start();
     propose(&mut sim, 1);
     let mut driver = sim.resumed_driver();
@@ -341,4 +380,83 @@ fn decisions_are_refused_for_stages_that_are_not_gates_or_already_decided() {
         .record_decision("propose", 1, revise("x"))
         .unwrap_err();
     assert!(err.to_string().contains("already approved"), "{err}");
+}
+
+/// A lead of `adaptive` finishing with its review on record.
+fn reviewed(summary: &'static str) -> Agent {
+    let review = serde_json::json!({"verdict": "pass", "reviewers": ["agt_reviewer"]});
+    let mut result = serde_json::json!({ "review": review });
+    let reviewer = archon_pipeline::review::Reviewer {
+        model: "codex/astra".into(),
+        agent: "agt_reviewer".into(),
+    };
+    archon_pipeline::review::record_check(&mut result, Some(Ok(vec![reviewer])));
+    Agent::DoneStructured(summary, result)
+}
+
+#[test]
+fn adaptive_proposal_and_report_gates_preserve_delegation_and_context() {
+    let mut sim = gated_sim("adaptive", ProposalMode::Lavish, ReportMode::BeforePr);
+    let first = sim.start();
+    assert_eq!(spawned(&first), slots(&[("propose", 1, 0)]));
+    assert!(!spawn_plans(&first)[0].allow_delegation);
+    propose(&mut sim, 1);
+    let build = sim.decide(approve(Some("Preserve the old API")));
+    assert_eq!(spawned(&build), slots(&[("build", 1, 0)]));
+    assert!(spawn_plans(&build)[0].allow_delegation);
+    assert!(
+        spawn_plans(&build)[0]
+            .prompt
+            .contains("Preserve the old API")
+    );
+    let report = sim.settle("build", 0, reviewed("Built and reviewed"));
+    assert_eq!(spawned(&report), slots(&[("report", 1, 0)]));
+    assert!(!spawn_plans(&report)[0].allow_delegation);
+    let gate = sim.settle("report", 0, Agent::Done("Report v1"));
+    assert_eq!(awaited(&gate)[0].subject, GateSubject::Report);
+    let revised = sim.decide(revise("Handle empty input"));
+    assert_eq!(spawned(&revised), slots(&[("build", 2, 0)]));
+    assert!(spawn_plans(&revised)[0].allow_delegation);
+    assert!(
+        spawn_plans(&revised)[0]
+            .prompt
+            .contains("Handle empty input")
+    );
+    sim.settle("build", 0, reviewed("Fixed, verified and re-reviewed"));
+    sim.settle("report", 0, Agent::Done("Report v2"));
+    let ship = sim.decide(approve(None));
+    assert!(spawned(&ship).is_empty(), "no agent ships");
+    let plan = ship_plans(&ship)[0];
+    assert_eq!(plan.record_stage, "build");
+    assert!(
+        plan.body.contains("REVIEW: pass, by codex/astra"),
+        "{}",
+        plan.body
+    );
+    assert!(plan.body.contains("## Change report\n\nReport v2"));
+    let done = sim.ship_pr("https://github.com/o/r/pull/7");
+    match finish_state(&done) {
+        Some(RunState::Succeeded { summary }) => {
+            assert!(summary.ends_with(&format!(
+                "SHIPPED: https://github.com/o/r/pull/7 (commit {})",
+                sim::COMMIT
+            )));
+        }
+        other => panic!("expected a shipped run, got {other:?}"),
+    }
+}
+
+#[test]
+fn adaptive_with_pr_report_does_not_wait_for_approval() {
+    let mut sim = gated_sim("adaptive", ProposalMode::Off, ReportMode::WithPr);
+    let first = sim.start();
+    assert_eq!(spawned(&first), slots(&[("build", 1, 0)]));
+    sim.settle("build", 0, reviewed("Verified and reviewed"));
+    let ship = sim.settle("report", 0, Agent::Done("Change report"));
+    assert!(spawned(&ship).is_empty() && awaited(&ship).is_empty());
+    assert!(
+        ship_plans(&ship)[0]
+            .body
+            .contains("## Change report\n\nChange report")
+    );
 }

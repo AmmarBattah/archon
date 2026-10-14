@@ -10,21 +10,30 @@ use std::time::Instant;
 
 use archon_aether::wire;
 use archon_core::Timestamp;
-use archon_core::aether_ids::AetherRunId;
+use archon_core::aether_ids::{AetherAgentId, AetherRunId};
 use archon_core::autonomy::ToolsMode;
+use archon_core::catalog::WorkspaceMode;
+use archon_core::config::Config;
 use archon_core::error::ArchonError;
 use archon_core::id::{PipelineRunId, StageRunId};
+use archon_core::lesson::CONTRACT_LESSONS;
 use archon_core::ports::{SpawnRequest, SpawnedAgent};
 use archon_core::queue::QueueItem;
+use archon_core::repo::Repo;
 use archon_core::run::{PipelineRun, StageOutcome, StageRun, StageState};
 use archon_pipeline::SpawnPlan;
+use archon_pipeline::contract;
 use archon_pipeline::spec::MAX_TIMEOUT_MINUTES;
 use archon_queue::Store;
 use serde::{Deserialize, Serialize};
 
-use super::{FollowUp, RunTable, finish, naming, run_node, settle, team};
+use super::resume::Takeover;
+use super::{
+    FollowUp, RunTable, dependencies, descendants, finish, naming, resume, run_node, settle, team,
+};
 use crate::context::DaemonContext;
 use crate::disk::{self, FullDisk};
+use crate::learned;
 use crate::resolve::{self, RepoEnv};
 
 const REQUEST_KEY_PREFIX: &str = "spawn_request:";
@@ -46,6 +55,26 @@ pub(crate) struct StoredSpawn {
     /// A team slot's worker; its worktree is `request.workspace`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<StoredWorker>,
+    /// The agent to resume instead of sending `request`; cleared once only
+    /// a fresh agent will do (§6.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<KeptAgent>,
+    /// The slot's kept agent that cannot take this stage run: stopped before
+    /// `request` is sent, then cleared (§6.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<AetherAgentId>,
+}
+
+/// The agent kept from the slot's previous attempt, and what it is told to
+/// make it fix its own work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct KeptAgent {
+    pub agent: AetherAgentId,
+    pub message: String,
+    /// The summary of a final message that left out the ship record, kept
+    /// once the agent was asked for the record (§6.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_record: Option<String>,
 }
 
 /// The branch a team slot's worker worktree must have checked out.
@@ -88,14 +117,17 @@ pub(crate) fn load_spawn(store: &Store, id: &StageRunId) -> Result<StoredSpawn, 
     Ok(stored)
 }
 
-fn save_spawn(store: &mut Store, id: &StageRunId, spawn: &StoredSpawn) -> Result<(), ArchonError> {
+pub(super) fn save_spawn(
+    store: &mut Store,
+    id: &StageRunId,
+    spawn: &StoredSpawn,
+) -> Result<(), ArchonError> {
     assert_eq!(spawn.request.idempotency_key, id.as_str());
     store.kv_set(&request_key(id), &serde_json::to_string(spawn)?)
 }
 
-/// Delete the stored requests of stage runs that settled, since nothing
-/// reads a request once its stage is terminal, and of stage runs never
-/// recorded (a crash inside `reserve_one`). Returns how many went.
+/// Delete the stored requests nothing reads any more: of settled stage runs
+/// (a kept agent's once its run's node retired) and of ones never recorded.
 pub(crate) fn prune_settled_requests(store: &mut Store) -> Result<usize, ArchonError> {
     let mut pruned = 0;
     for (key, _) in store.kv_prefix(REQUEST_KEY_PREFIX)? {
@@ -105,7 +137,7 @@ pub(crate) fn prune_settled_requests(store: &mut Store) -> Result<usize, ArchonE
         let id = StageRunId::parse(raw)
             .map_err(|e| ArchonError::Store(format!("spawn request key {key}: {e}")))?;
         let settled = match store.stage_run(&id) {
-            Ok(stage) => stage.state.is_terminal(),
+            Ok(stage) => stage.state.is_terminal() && !resume::request_in_use(store, &stage)?,
             Err(ArchonError::NotFound(_)) => true,
             Err(error) => return Err(error),
         };
@@ -262,6 +294,7 @@ fn reserve_plans(
         let stage = plans[0].stage_id.clone();
         return Ok(Err(Exhausted { stage, error }));
     }
+    let sections = run_sections(store, &run, &item, plans[0].workspace)?;
     let existing = store.stage_runs(run_id)?;
     let mut ids = Vec::new();
     for plan in plans {
@@ -273,7 +306,9 @@ fn reserve_plans(
         let target = Target {
             run: &run,
             item: &item,
-            repo_name: repo.as_ref().map(|r| r.name.as_str()),
+            repo: repo.as_ref(),
+            config: &ctx.config,
+            sections: &sections,
         };
         let share = slot_budget(budget, &plan);
         ids.push(reserve_one(
@@ -286,6 +321,27 @@ fn reserve_plans(
         )?);
     }
     Ok(Ok(ids))
+}
+
+/// What the store adds to the contract of every agent of `run`: where the
+/// item's dependencies left their work, its initiative, and the run's lessons.
+fn run_sections(
+    store: &Store,
+    run: &PipelineRun,
+    item: &QueueItem,
+    mode: WorkspaceMode,
+) -> Result<String, ArchonError> {
+    assert_eq!(run.item, item.id, "the run is the item's");
+    let dependencies = dependencies::section(store, run, item, mode)?;
+    let initiative = dependencies::initiative_brief(store, item)?;
+    let lessons = learned::lessons_for_run(store, run, item)?;
+    assert!(
+        lessons.len() <= CONTRACT_LESSONS,
+        "a contract carries at most {CONTRACT_LESSONS} lessons"
+    );
+    let initiative = contract::initiative_rules(initiative.as_ref());
+    let lessons = contract::lesson_rules(&lessons)?;
+    Ok([dependencies, initiative, lessons].concat())
 }
 
 fn same_slot(stage: &StageRun, plan: &SpawnPlan) -> bool {
@@ -305,7 +361,37 @@ pub(super) fn same_slot_as(a: &StageRun, b: &StageRun) -> bool {
 struct Target<'a> {
     run: &'a PipelineRun,
     item: &'a QueueItem,
-    repo_name: Option<&'a str>,
+    repo: Option<&'a Repo>,
+    /// The global `[models]` policy, which the repository's narrows.
+    config: &'a Config,
+    /// The contract's sections on the run itself ([`run_sections`]).
+    sections: &'a str,
+}
+
+impl Target<'_> {
+    /// Whether the agent of `plan` gets Aether's `delegate`: its stage
+    /// allows it, or the item's `tools = yolo` withholds nothing.
+    fn delegates(&self, plan: &SpawnPlan) -> bool {
+        plan.allow_delegation || self.item.autonomy.tools == ToolsMode::Yolo
+    }
+
+    /// The stage contract, with the run's own sections and, when the agent
+    /// can delegate, the rules and model policy for that.
+    fn instructions(&self, plan: &SpawnPlan) -> String {
+        assert!(!plan.instructions.is_empty(), "every stage has a contract");
+        let contract = format!("{}{}", plan.instructions, self.sections);
+        if !self.delegates(plan) {
+            return contract;
+        }
+        // An unreadable policy refuses this spawn when it is issued (`claim`).
+        let models = match RepoEnv::new(self.repo.cloned()) {
+            Ok(env) => env.policy(self.config).describe(),
+            Err(error) => format!("none: the repository's model policy cannot be read ({error})"),
+        };
+        let depth = self.config.limits.max_delegation_depth;
+        let rules = contract::delegation_rules(plan.workspace, &models, depth);
+        format!("{contract}{rules}")
+    }
 }
 
 /// Persist the exact request, then the `spawning` stage run that owns it,
@@ -321,6 +407,12 @@ fn reserve_one(
 ) -> Result<StageRunId, ArchonError> {
     let id = StageRunId::new();
     let request = build_request(target, plan, &id, budget, now, retry);
+    // An infrastructure replacement is a fresh agent: the kept one was lost.
+    let (resume, replaces) = match resume::takeover(store, &target.run.id, plan, retry.is_some())? {
+        Takeover::Fresh => (None, None),
+        Takeover::Resume(kept) => (Some(kept), None),
+        Takeover::Replace(agent) => (None, Some(agent)),
+    };
     let spawn = StoredSpawn {
         request,
         timeout_minutes: plan.timeout_minutes,
@@ -329,6 +421,8 @@ fn reserve_one(
             role: slot.role.clone(),
             branch: slot.branch.clone(),
         }),
+        resume,
+        replaces,
     };
     save_spawn(store, &id, &spawn)?;
     let stage = StageRun {
@@ -337,6 +431,8 @@ fn reserve_one(
         stage_id: plan.stage_id.clone(),
         attempt: plan.attempt,
         fan_index: plan.fan_index,
+        model_segments: Vec::new(),
+        infrastructure_failure: false,
         choice: plan.choice.clone(),
         aether_agent: None,
         aether_task: None,
@@ -366,9 +462,8 @@ fn slot_budget(budget: Option<f64>, plan: &SpawnPlan) -> Option<f64> {
     }
 }
 
-/// Stage agents are headless, so the backend creates them with an approval
-/// policy that gates nothing (`stage_create_agent`); `yolo` also lets them
-/// delegate. The name is for people; the labels carry the exact identity.
+/// Headless stage agents use ungated approvals; delegation follows the stage
+/// flag or yolo tools. Labels carry identity independently of the display name.
 fn build_request(
     target: &Target<'_>,
     plan: &SpawnPlan,
@@ -389,9 +484,33 @@ fn build_request(
             .is_none_or(|root| workspace.starts_with(root)),
         "a team run's agents work under its team directory"
     );
-    let labels: BTreeMap<String, String> = [
-        ("archon.item", item.id.to_string()),
-        ("archon.run", run.id.to_string()),
+    SpawnRequest {
+        idempotency_key: id.as_str().to_owned(),
+        role: format!("archon-stage:{}/{}", run.pipeline, plan.stage_id),
+        name: naming::stage_agent_name(&item.id, plan, retry, &item.title),
+        objective: plan.prompt.clone(),
+        instructions: target.instructions(plan),
+        choice: plan.choice.clone(),
+        workspace,
+        repository: target.repo.map(|repo| repo.name.clone()),
+        labels: labels(target, plan, id),
+        hidden_tools: hidden_tools(item.autonomy.tools, plan.workspace),
+        leaf: !target.delegates(plan),
+        cost_budget_usd: budget,
+        aether_cost_budget: None,
+        deadline: Some(deadline(now, plan.timeout_minutes)),
+        attach_run: run.aether_run.clone(),
+        parent: None,
+        network: None,
+        keep: plan.keep,
+    }
+}
+
+/// What ties the agent, and through Aether its children, to this stage run.
+fn labels(target: &Target<'_>, plan: &SpawnPlan, id: &StageRunId) -> BTreeMap<String, String> {
+    [
+        ("archon.item", target.item.id.to_string()),
+        ("archon.run", target.run.id.to_string()),
         ("archon.stage", plan.stage_id.clone()),
         ("archon.stage_run", id.to_string()),
         ("archon.attempt", plan.attempt.to_string()),
@@ -399,32 +518,18 @@ fn build_request(
     ]
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v))
-    .collect();
-    SpawnRequest {
-        idempotency_key: id.as_str().to_owned(),
-        role: format!("archon-stage:{}/{}", run.pipeline, plan.stage_id),
-        name: naming::stage_agent_name(&item.id, plan, retry, &item.title),
-        objective: plan.prompt.clone(),
-        instructions: plan.instructions.clone(),
-        choice: plan.choice.clone(),
-        workspace,
-        repository: target.repo_name.map(str::to_owned),
-        labels,
-        hidden_tools: hidden_tools(item.autonomy.tools),
-        // Delegated workspaces are full copies (77 GB seen once), so the
-        // item's `tools`, not the pipeline, decides; see `StageSpec::allow_delegation`.
-        leaf: item.autonomy.tools != ToolsMode::Yolo,
-        cost_budget_usd: budget,
-        aether_cost_budget: None,
-        deadline: Some(deadline(now, plan.timeout_minutes)),
-        attach_run: run.aether_run.clone(),
-        parent: None,
-        network: None,
-    }
+    .collect()
 }
 
-/// Messaging stays available in every mode; other mutations are hidden.
-fn hidden_tools(tools: ToolsMode) -> Vec<String> {
+/// Aether tools no stage agent gets: a stage is bounded work, and a
+/// schedule would outlive it (ARCHITECTURE §18.4).
+const HIDDEN_NATIVE_TOOLS: [&str; 3] = ["create_schedule", "update_schedule", "list_schedules"];
+/// Hidden too where the workspace is read-only: nothing is integrated into it.
+const INTEGRATE_TOOL: &str = "integrate_workspace";
+
+/// What a stage agent does not see: Archon's tools that act for the
+/// orchestrator, and the Aether tools above. A child inherits the list.
+fn hidden_tools(tools: ToolsMode, workspace: WorkspaceMode) -> Vec<String> {
     let hidden = match tools {
         ToolsMode::Guarded => archon_core::mcp_tools::qualified_names(),
         ToolsMode::Yolo => archon_core::mcp_tools::mutating_names(),
@@ -433,16 +538,17 @@ fn hidden_tools(tools: ToolsMode) -> Vec<String> {
         !hidden.is_empty(),
         "stage agents never act for the orchestrator"
     );
+    let read_only = workspace == WorkspaceMode::RepoReadonly;
+    let native = HIDDEN_NATIVE_TOOLS
+        .into_iter()
+        .chain(read_only.then_some(INTEGRATE_TOOL));
     hidden
         .into_iter()
         .filter(|name| name != &archon_core::mcp_tools::qualified("message_orchestrator"))
+        .chain(native.map(str::to_owned))
         .collect()
 }
 
-/// A replacement for a stage run lost to an infrastructure failure: the
-/// slot's plan under a fresh key, deadline and budget, started strictly
-/// after `failed` so it supersedes it. `None` when the budget, or a team
-/// slot's share of it, is used up.
 pub(super) fn reserve_replacement(
     ctx: &DaemonContext,
     store: &mut Store,
@@ -469,10 +575,13 @@ pub(super) fn reserve_replacement(
         .as_ref()
         .map(|id| store.repo(&resolve::repo_ref(id)))
         .transpose()?;
+    let sections = run_sections(store, &run, &item, plan.workspace)?;
     let target = Target {
         run: &run,
         item: &item,
-        repo_name: repo.as_ref().map(|r| r.name.as_str()),
+        repo: repo.as_ref(),
+        config: &ctx.config,
+        sections: &sections,
     };
     let Some(budget) = replacement_budget(store, failed, plan, budget, estimates)? else {
         return Ok(None);
@@ -547,6 +656,13 @@ enum Claimed {
 /// Issue `create_agent` for one `spawning` stage run unless another task
 /// already is. Safe to repeat: the stage run id is the idempotency key.
 pub(super) async fn issue(ctx: &DaemonContext, id: &StageRunId) -> Result<FollowUp, ArchonError> {
+    let issued = issue_claimed(ctx, id).await;
+    // The new agent's first events can arrive before its record does.
+    ctx.spawn_recorded.notify_waiters();
+    issued
+}
+
+async fn issue_claimed(ctx: &DaemonContext, id: &StageRunId) -> Result<FollowUp, ArchonError> {
     let claim = match claim(ctx, id).await? {
         Claimed::Skip => return Ok(FollowUp::default()),
         Claimed::Settled(follow) => return Ok(*follow),
@@ -574,7 +690,7 @@ pub(super) async fn issue(ctx: &DaemonContext, id: &StageRunId) -> Result<Follow
     }
     let result = match allowed {
         Ok(()) if unsent => None,
-        Ok(()) => Some(spawn_bound(ctx, &stage, spawn).await),
+        Ok(()) => Some(resume_or_spawn(ctx, &stage, spawn).await),
         Err(refusal) => Some(Err(refusal)),
     };
     let mut table = ctx.runs.lock().await;
@@ -584,6 +700,38 @@ pub(super) async fn issue(ctx: &DaemonContext, id: &StageRunId) -> Result<Follow
         Some(result) => record(ctx, &mut table, &stage, result).await,
         None => cancel_unsent(ctx, &mut table, &stage).await,
     }
+}
+
+/// What issuing a stage run gave it: a new agent with its task, or the
+/// agent kept from the slot's previous attempt, which has no new task.
+pub(super) enum Issued {
+    Spawned(SpawnedAgent),
+    Resumed(AetherAgentId),
+}
+
+/// Resume the slot's kept agent when there is one and it takes the message;
+/// otherwise the stored request creates a fresh agent, and stays that way.
+async fn resume_or_spawn(
+    ctx: &DaemonContext,
+    stage: &StageRun,
+    mut spawn: StoredSpawn,
+) -> Result<Issued, ArchonError> {
+    if let Some(kept) = spawn.resume.take() {
+        assert_eq!(
+            spawn.parent,
+            ParentBinding::Pending,
+            "a resume sends no create"
+        );
+        if resume::hand_over(ctx, stage, &kept, &spawn.request).await? {
+            return Ok(Issued::Resumed(kept.agent));
+        }
+        save_spawn(&mut *ctx.store.lock().await, &stage.id, &spawn)?;
+    }
+    if let Some(agent) = spawn.replaces.take() {
+        resume::replace(ctx, &agent).await?;
+        save_spawn(&mut *ctx.store.lock().await, &stage.id, &spawn)?;
+    }
+    spawn_bound(ctx, stage, spawn).await.map(Issued::Spawned)
 }
 
 /// Every new stage agent is a child of its run's node (§4.5). The node is
@@ -658,6 +806,10 @@ async fn claim(ctx: &DaemonContext, id: &StageRunId) -> Result<Claimed, ArchonEr
             return Ok(Claimed::Skip);
         }
         let run = store.run(&stage.run)?;
+        // What an earlier stage agent of the run delegated is stopped first.
+        if !run.state.is_terminal() && descendants::holds(&store, &run.id)? {
+            return Ok(Claimed::Skip);
+        }
         let item = store.item(&run.item)?;
         let repo = item
             .repo
@@ -705,13 +857,17 @@ async fn record(
     ctx: &DaemonContext,
     table: &mut RunTable,
     stage: &StageRun,
-    result: Result<SpawnedAgent, ArchonError>,
+    result: Result<Issued, ArchonError>,
 ) -> Result<FollowUp, ArchonError> {
     let error = match result {
-        Ok(spawned) => {
+        Ok(Issued::Spawned(spawned)) => {
             table.spawn_errors.remove(&stage.id);
             ctx.disk.agent_created();
             return spawned_ok(ctx, stage, spawned).await;
+        }
+        Ok(Issued::Resumed(agent)) => {
+            table.spawn_errors.remove(&stage.id);
+            return resume::resumed_ok(ctx, stage, agent).await;
         }
         Err(error) => error,
     };

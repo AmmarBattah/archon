@@ -26,12 +26,14 @@ pub struct Pruned {
     pub spawn_requests: usize,
     pub run_vars: usize,
     pub team_merges: usize,
+    pub ships: usize,
     pub team_rosters: usize,
     pub node_agents: usize,
     pub children: usize,
     pub stage_agents: usize,
     pub reports: usize,
     pub retired_keys: usize,
+    pub retired_orchestrators: usize,
 }
 
 impl Pruned {
@@ -39,12 +41,14 @@ impl Pruned {
         self.spawn_requests
             + self.run_vars
             + self.team_merges
+            + self.ships
             + self.team_rosters
             + self.node_agents
             + self.children
             + self.stage_agents
             + self.reports
             + self.retired_keys
+            + self.retired_orchestrators
     }
 }
 
@@ -64,8 +68,8 @@ pub async fn run(ctx: Arc<DaemonContext>) -> Result<(), ArchonError> {
 
 /// One pass as of `now`. Entries of settled stages and finished runs, and
 /// keys no version reads any more, go at once; node agents, watched
-/// children, stage agents and settled reports go once they are older than
-/// [`retention`]. The store is locked per kind, not for the
+/// children, stage agents, replaced orchestrators and settled reports go
+/// once older than [`retention`]. The store is locked per kind, not for the
 /// whole pass.
 pub async fn prune_once(ctx: &DaemonContext, now: Timestamp) -> Result<Pruned, ArchonError> {
     let cutoff = now - retention();
@@ -74,6 +78,7 @@ pub async fn prune_once(ctx: &DaemonContext, now: Timestamp) -> Result<Pruned, A
     let spawn_requests = executor::prune_settled_requests(&mut *ctx.store.lock().await)?;
     let run_vars = executor::prune_finished_run_vars(&mut *ctx.store.lock().await)?;
     let team_merges = executor::prune_finished_merges(&mut *ctx.store.lock().await)?;
+    let ships = executor::prune_finished_ships(&mut *ctx.store.lock().await)?;
     let team_rosters = executor::prune_settled_rosters(&mut *ctx.store.lock().await)?;
     let node_agents = executor::prune_retired_node_agents(&mut *ctx.store.lock().await, cutoff)?;
     let reports = {
@@ -83,15 +88,18 @@ pub async fn prune_once(ctx: &DaemonContext, now: Timestamp) -> Result<Pruned, A
     let retired_keys = supervisor::prune_retired_keys(&mut *ctx.store.lock().await)?;
     let children = pump::prune_children(ctx, now, cutoff).await?;
     let stage_agents = pump::prune_stage_agents(ctx, cutoff).await?;
+    let retired_orchestrators = supervisor::prune_retired_orchestrators(ctx, cutoff).await?;
     Ok(Pruned {
         spawn_requests,
         run_vars,
         team_merges,
+        ships,
         team_rosters,
         node_agents,
         children,
         stage_agents,
         reports,
         retired_keys,
+        retired_orchestrators,
     })
 }

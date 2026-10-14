@@ -3,6 +3,8 @@
 //! client `{"req":N,"cmd":"...",...}`, daemon `{"frame":"reply","id":N,
 //! "result":{"Ok":{"reply":"...","data":...}}}` or `{"frame":"feed",...}`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::Timestamp;
@@ -12,7 +14,12 @@ use crate::catalog::CatalogListing;
 use crate::cost::{CostQuery, CostReport};
 use crate::error::ArchonError;
 use crate::github::{GithubThread, GithubWatch, GithubWatcherView, WatcherChange};
-use crate::id::{DirectiveId, PipelineRunId, QuestionId, QueueItemId, ReportId};
+use crate::id::{
+    DirectiveId, InitiativeId, LessonId, PipelineRunId, QuestionId, QueueItemId, ReportId,
+    StageRunId,
+};
+use crate::initiative::{ContractChange, EnqueueInitiative, Initiative, InitiativeDetail};
+use crate::lesson::{Lesson, LessonDraft, LessonPatch, LessonQuery, LessonStats, LessonWhy};
 use crate::model::{Effort, ModelChoice, ModelPlan, ModelReasons, ModelRef};
 use crate::model_evidence::{ModelEvidenceQuery, ModelEvidenceReport};
 use crate::notify::{FeedItem, NotificationKind, Question};
@@ -20,13 +27,18 @@ use crate::policy::ModelPolicy;
 use crate::queue::{Caps, PauseState, Priority, QueueItem};
 use crate::repo::{Repo, ShipMode};
 use crate::run::{OperatorGate, PipelineRun, StageRun, StageState, Verdict};
+use crate::steer::Steer;
 
 /// 3: a GitHub watcher `add` may carry an allowlist; an older archond
 /// would drop it and widen who may dispatch, so it is refused at hello.
 /// 4: `retry_item` may ask for a fresh retry and both it and `update_item`
 /// may carry `brief_append`; an older archond would silently drop them.
 /// 5: operator-only orchestrator attachment for the native TUI.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6: `archon mcp` names the calling agent on every call that changes Archon
+/// (`for_agent`), and archond refuses such a call that names none.
+/// 7: initiatives, `steer_item` and lessons; an older archond knows none of
+/// their requests.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Longest accepted frame in either direction.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -73,6 +85,13 @@ pub enum ServerFrame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
+    /// A tool call `archon mcp` forwards for the Aether agent that made it:
+    /// only the orchestrator of now may change Archon (ARCHITECTURE §11).
+    ForAgent {
+        /// Aether's out-of-band MCP caller identity, never a tool argument.
+        caller: AetherAgentId,
+        request: Box<Request>,
+    },
     MessageOrchestrator {
         text: String,
         #[serde(default)]
@@ -146,6 +165,9 @@ pub enum Request {
 
     ListPipelines {
         repo: Option<RepoRef>,
+        /// Only this pipeline, listed in full.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pipeline: Option<String>,
     },
     ModelPolicy {
         repo: Option<RepoRef>,
@@ -259,6 +281,47 @@ pub enum Request {
         thread: GithubThread,
         body: String,
     },
+
+    /// Several items, usually in several repositories, built against one
+    /// shared contract.
+    EnqueueInitiative(EnqueueInitiative),
+    ListInitiatives,
+    CancelInitiative {
+        initiative: InitiativeId,
+    },
+    RetryInitiative {
+        initiative: InitiativeId,
+    },
+    GetInitiative {
+        initiative: InitiativeId,
+    },
+    /// Append to the shared contract or replace it; live members are told.
+    UpdateInitiative {
+        initiative: InitiativeId,
+        #[serde(flatten)]
+        change: ContractChange,
+    },
+    /// Change a queued or running item without cancelling it.
+    SteerItem {
+        item: QueueItemId,
+        steer: Steer,
+    },
+
+    RecordLesson(LessonDraft),
+    Lessons(LessonQuery),
+    /// CLI only: the operator edits, pins, accepts or retracts a lesson,
+    /// and that always wins over what was learned.
+    UpdateLesson {
+        lesson: LessonId,
+        patch: LessonPatch,
+    },
+    /// The lessons and learned defaults that shaped an item.
+    LessonsWhy {
+        item: QueueItemId,
+    },
+    LessonStats {
+        repo: Option<RepoRef>,
+    },
 }
 
 impl Request {
@@ -274,11 +337,46 @@ impl Request {
             | Self::OrchestratorAttach
             | Self::Gc { .. }
             | Self::ConfigureGithubWatcher { .. }
+            | Self::UpdateLesson { .. }
             | Self::Answer { .. } => true,
             Self::RepoAdd(add) => add.auto_merge,
             Self::Pause(target) | Self::Resume(target) => {
                 matches!(target, PauseTarget::Global { hard: true })
             }
+            Self::ForAgent { request, .. } => request.is_operator_only(),
+            _ => false,
+        }
+    }
+
+    /// Whether the request only reads Archon. Anything not listed here
+    /// counts as a change, so a new request is guarded until it is listed.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Self::Hello { .. }
+            | Self::Status
+            | Self::RepoList
+            | Self::ListItems(_)
+            | Self::ListItemSummaries(_)
+            | Self::GetItem { .. }
+            | Self::GetStage(_)
+            | Self::ResolveItem { .. }
+            | Self::ListPipelines { .. }
+            | Self::ModelPolicy { .. }
+            | Self::ListQuestions { .. }
+            | Self::SubscribeFeed { .. }
+            | Self::FeedHistory { .. }
+            | Self::ListReports
+            | Self::OrchestratorStatus
+            | Self::CostReport(_)
+            | Self::ModelEvidence(_)
+            | Self::Autonomy { .. }
+            | Self::GithubWatcher
+            | Self::ListInitiatives
+            | Self::GetInitiative { .. }
+            | Self::Lessons(_)
+            | Self::LessonsWhy { .. }
+            | Self::LessonStats { .. } => true,
+            Self::ForAgent { request, .. } => request.is_read_only(),
             _ => false,
         }
     }
@@ -344,7 +442,9 @@ pub struct EnqueueRequest {
     pub depends_on: Vec<QueueItemId>,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Must name every stage of the pipeline, within the model policy.
+    /// Choices per stage, within the model policy. Optional: a stage left
+    /// out gets what was learned for the repository, else a default.
+    #[serde(default)]
     pub model_plan: ModelPlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_reasons: Option<ModelReasons>,
@@ -381,8 +481,8 @@ pub struct ItemPatch {
     #[serde(default)]
     pub add_depends_on: Vec<QueueItemId>,
     pub budget_usd: Option<f64>,
-    /// Appended to the brief under a dated "Amendment" heading; refused
-    /// while the item is dispatching or running.
+    /// Appended to the brief under a dated "Amendment" heading; a running
+    /// item's live agents are sent it (ARCHITECTURE §6.6).
     #[serde(default)]
     pub brief_append: Option<String>,
 }
@@ -445,6 +545,12 @@ pub enum Reply {
     Gc(Box<GcReport>),
     CostReport(Box<CostReport>),
     ModelEvidence(Box<ModelEvidenceReport>),
+    Initiative(Box<InitiativeDetail>),
+    Initiatives(Vec<Initiative>),
+    Lesson(Lesson),
+    Lessons(Vec<Lesson>),
+    LessonsWhy(Box<LessonWhy>),
+    LessonStats(Box<LessonStats>),
 }
 
 /// What one gc pass did (ARCHITECTURE §13.2). Paths are real paths.
@@ -635,6 +741,10 @@ pub struct ItemSummary {
     pub waiting_on: Option<WaitingOn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<WaitingReason>,
+    /// The catalog pipeline a steer switched the item to; `item.pipeline`
+    /// stays the one it was queued with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switched_to: Option<String>,
 }
 
 /// Stable read-time reason codes; these are never stored on a queue item.
@@ -685,10 +795,91 @@ pub struct ItemDetail {
     /// Operator gates of every run, oldest first.
     #[serde(default)]
     pub gates: Vec<OperatorGate>,
+    /// How the cost of each stage run that delegated splits.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delegations: BTreeMap<StageRunId, StageDelegation>,
+    /// Every steer of the item, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steers: Vec<crate::steer::SteerRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_on: Option<WaitingOn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<WaitingReason>,
+    /// As in [`ItemSummary`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switched_to: Option<String>,
+}
+
+/// An agent a stage agent delegated to, itself or through another.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DelegatedAgent {
+    pub agent: AetherAgentId,
+    /// The stage agent, or the delegated agent that delegated further.
+    pub parent: AetherAgentId,
+    pub model: ModelRef,
+    /// `None` until Archon reads it from Aether, which it does when the
+    /// stage has ended.
+    pub effort: Option<Effort>,
+    pub cost_usd: f64,
+}
+
+impl DelegatedAgent {
+    /// `agt_… codex/astra (medium) $0.40`.
+    pub fn line(&self) -> String {
+        let effort = self
+            .effort
+            .map_or("effort unknown".to_owned(), |e| e.to_string());
+        let cost = crate::cost::format_usd(self.cost_usd);
+        format!("{} {} ({effort}) {cost}", self.agent, self.model)
+    }
+}
+
+/// How the cost of a stage run that delegated splits; the two amounts add up
+/// to the stage run's `cost_usd`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageDelegation {
+    /// What the stage agent itself was charged.
+    pub direct_usd: f64,
+    /// What the agents beneath it were charged, at any depth.
+    pub delegated_usd: f64,
+    pub agents: Vec<DelegatedAgent>,
+}
+
+impl StageDelegation {
+    /// The split of `direct_usd` and what `agents` were charged.
+    pub fn of(direct_usd: f64, agents: Vec<DelegatedAgent>) -> Self {
+        assert!(!agents.is_empty(), "a split is of a stage that delegated");
+        let delegated_usd: f64 = agents.iter().map(|agent| agent.cost_usd).sum();
+        assert!(
+            direct_usd >= 0.0 && delegated_usd >= 0.0,
+            "the ledger holds no negative charge"
+        );
+        Self {
+            direct_usd,
+            delegated_usd,
+            agents,
+        }
+    }
+
+    pub fn total_usd(&self) -> f64 {
+        self.direct_usd + self.delegated_usd
+    }
+
+    /// `$1.20 own + $0.80 for 2 delegated agent(s)`.
+    pub fn split(&self) -> String {
+        format!(
+            "{} own + {} for {} delegated agent(s)",
+            crate::cost::format_usd(self.direct_usd),
+            crate::cost::format_usd(self.delegated_usd),
+            self.agents.len()
+        )
+    }
+
+    /// The split and every delegated agent on one line.
+    pub fn line(&self) -> String {
+        let agents: Vec<String> = self.agents.iter().map(DelegatedAgent::line).collect();
+        format!("{}: {}", self.split(), agents.join("; "))
+    }
 }
 
 /// Characters of a stage's output one `GetStage` page holds by default.
@@ -765,10 +956,15 @@ pub struct StageRunView {
     pub stage_id: String,
     pub attempt: u32,
     pub slot: u32,
+    /// What its agent runs on now, a steer's live retune included.
     pub choice: ModelChoice,
     pub state: StageState,
     pub verdict: Option<Verdict>,
+    /// What its agent and every agent that one delegated to were charged.
     pub cost_usd: f64,
+    /// How `cost_usd` splits, when the stage run delegated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<StageDelegation>,
     pub aether_agent: Option<AetherAgentId>,
     /// The stage's output, only when a stage was asked for.
     pub output: Option<TextPage>,
@@ -973,7 +1169,7 @@ mod tests {
             },
             RepoPatch {
                 base_branch: Clearable::Set("main".into()),
-                default_pipeline: Clearable::Set("quick-pr".into()),
+                default_pipeline: Clearable::Set("direct".into()),
                 autonomy_max: Some(ceiling),
                 ..RepoPatch::default()
             },
@@ -1041,6 +1237,7 @@ mod tests {
             autonomy: Default::default(),
             origin: None,
             fresh_retries: 0,
+            initiative: None,
             state: crate::queue::QueueState::Queued,
             created_at: crate::now(),
             updated_at: crate::now(),
@@ -1052,6 +1249,7 @@ mod tests {
             stage: Some("review".into()),
             spent_usd: 1.5,
             pr_url: None,
+            switched_to: None,
         };
         let reply = Reply::ItemSummaries(vec![summary.clone()]);
         let value = serde_json::to_value(&reply).unwrap();
@@ -1079,9 +1277,39 @@ mod tests {
     }
 
     #[test]
+    fn a_call_forwarded_for_an_agent_keeps_its_requests_class_and_shape() {
+        let caller = AetherAgentId::parse("agt_0001").unwrap();
+        let wrap = |request: Request| Request::ForAgent {
+            caller: caller.clone(),
+            request: Box::new(request),
+        };
+        assert!(wrap(Request::Status).is_read_only());
+        assert!(!wrap(Request::Say { text: "hi".into() }).is_read_only());
+        assert!(wrap(Request::Say { text: "hi".into() }).is_operator_only());
+        let pause = wrap(Request::Pause(PauseTarget::Global { hard: false }));
+        assert!(!pause.is_read_only() && !pause.is_operator_only());
+
+        let frame = ClientFrame {
+            id: 3,
+            request: pause.clone(),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["cmd"], "for_agent");
+        assert_eq!(value["caller"], "agt_0001");
+        assert_eq!(value["request"]["cmd"], "pause");
+        let back: ClientFrame = serde_json::from_value(value).unwrap();
+        assert_eq!(back.request, pause);
+    }
+
+    #[test]
     fn operator_only_requests_are_flagged() {
         assert!(Request::Say { text: "hi".into() }.is_operator_only());
         assert!(!Request::Status.is_operator_only());
+        let edit = Request::UpdateLesson {
+            lesson: LessonId::new(),
+            patch: LessonPatch::default(),
+        };
+        assert!(edit.is_operator_only() && !edit.is_read_only());
         let merge = RepoAdd {
             path: "/r".into(),
             name: None,
@@ -1095,6 +1323,62 @@ mod tests {
             let change = WatcherChange::Operators { operator_users };
             let request = Request::ConfigureGithubWatcher { change };
             assert!(request.is_operator_only(), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn adaptive_requests_keep_their_names_and_only_the_lookups_read() {
+        let item = QueueItemId::new();
+        let steer = Request::SteerItem {
+            item: item.clone(),
+            steer: Steer {
+                note: Some("Use the v2 client.".into()),
+                ..Steer::default()
+            },
+        };
+        let wire = serde_json::to_value(&steer).unwrap();
+        assert_eq!(wire["cmd"], "steer_item");
+        assert_eq!(wire["steer"]["note"], "Use the v2 client.");
+        assert_eq!(serde_json::from_value::<Request>(wire).unwrap(), steer);
+        let lookups = [
+            Request::Lessons(LessonQuery::default()),
+            Request::LessonsWhy { item },
+            Request::LessonStats { repo: None },
+            Request::GetInitiative {
+                initiative: InitiativeId::new(),
+            },
+        ];
+        for request in lookups {
+            assert!(request.is_read_only() && !request.is_operator_only());
+        }
+        let append = Request::UpdateInitiative {
+            initiative: InitiativeId::new(),
+            change: ContractChange::Append("Also rename the column.".into()),
+        };
+        let wire = serde_json::to_value(&append).unwrap();
+        assert_eq!(wire["contract_append"], "Also rename the column.");
+        assert_eq!(serde_json::from_value::<Request>(wire).unwrap(), append);
+        let replace = serde_json::json!({
+            "cmd": "update_initiative", "initiative": InitiativeId::new(), "contract": "New."
+        });
+        let Request::UpdateInitiative { change, .. } = serde_json::from_value(replace).unwrap()
+        else {
+            panic!("an update");
+        };
+        assert_eq!(change, ContractChange::Replace("New.".into()));
+        let draft = Request::RecordLesson(LessonDraft {
+            kind: crate::lesson::LessonKind::Pitfall,
+            text: "CI needs `make lint`.".into(),
+            repo: None,
+            pipeline: None,
+            item: None,
+        });
+        assert_eq!(
+            serde_json::to_value(&draft).unwrap()["cmd"],
+            "record_lesson"
+        );
+        for request in [steer, append, draft] {
+            assert!(!request.is_read_only() && !request.is_operator_only());
         }
     }
 
@@ -1149,6 +1433,7 @@ mod tests {
             state: StageState::Completed,
             verdict: Some(Verdict::Fail),
             cost_usd: 0.5,
+            delegation: None,
             aether_agent: None,
             output: Some(TextPage::of("summary: findings", 9, 500)),
         };

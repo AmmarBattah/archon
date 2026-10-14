@@ -5,22 +5,25 @@
 mod link_common;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use archon_aether::fake::{self, Scripted};
 use archon_core::aether_ids::AetherTaskId;
+use archon_core::autonomy::{Directive, DirectiveSource};
 use archon_core::config::Config;
 use archon_core::error::ArchonError;
-use archon_core::id::{FeedItemId, QueueItemId};
+use archon_core::id::{FeedItemId, QueueItemId, RepoId};
 use archon_core::model::{Effort, ModelRef};
 use archon_core::notify::{FeedEntry, NotificationKind};
 use archon_core::protocol::{ClientKind, Reply, Request};
+use archon_core::queue::{Caps, NOTIFY_TAG};
+use archon_core::repo::{Repo, ShipMode};
 use archon_core::run::{StageRun, StageState};
 use archon_daemon::triggers::{self, TriggerEvent};
-use archon_daemon::{handlers, pump, supervisor};
+use archon_daemon::{handlers, mirror, pump, supervisor};
 use archon_queue::store::keys;
 use link_common::{Harness, WAIT, running_stage, spawning_stage};
 use serde_json::{Value, json};
@@ -74,6 +77,12 @@ impl Agents {
         table.get_mut(from).expect("a known agent")["restarted_as"] = json!(to);
     }
 
+    fn set_scope(&self, id: &str, scope: Value) {
+        let mut agent = self.set(id, "running");
+        agent["scope"] = scope;
+        self.0.lock().unwrap().insert(id.to_owned(), agent);
+    }
+
     fn set_effort(&self, id: &str, effort: &str) {
         let mut agent = self.set(id, "running");
         agent["config"] = json!({ "effort": effort });
@@ -83,9 +92,21 @@ impl Agents {
 
 /// A pump following a live orchestrator, with both streams subscribed.
 async fn running_pump(harness: &Harness) -> (Agents, JoinHandle<Result<(), ArchonError>>) {
+    running_pump_beside(harness, &[]).await
+}
+
+/// `running_pump` with `live` agents Aether already knows: a stage whose
+/// agent it has forgotten is failed, and stopped, as the pump reconciles.
+async fn running_pump_beside(
+    harness: &Harness,
+    live: &[&str],
+) -> (Agents, JoinHandle<Result<(), ArchonError>>) {
     harness.set_kv(keys::ORCHESTRATOR_AGENT, ORCH).await;
     let agents = Agents::install(harness);
     agents.set(ORCH, "running");
+    for agent in live {
+        agents.set(agent, "running");
+    }
     let pump = tokio::spawn(pump::run(harness.ctx.clone(), harness.fake.endpoint()));
     wait_for_streams(harness, 1).await;
     (agents, pump)
@@ -240,6 +261,54 @@ async fn only_the_answer_to_an_operator_message_reaches_the_chat() {
         vec!["Two items are running: A and B."]
     );
     assert!(!awaiting_reply(&harness).await);
+}
+
+/// A turn ends waiting; `condition` is what Aether resumes it on.
+async fn waits_for(harness: &Harness, condition: Value) {
+    let waiting = json!({"type": "agent.waiting", "condition": condition});
+    orch(harness, waiting).await;
+    let done = json!({"type": "agent.turn_completed", "turn": 1, "invocation": "inv_1",
+                      "next": "waiting"});
+    orch(harness, done).await;
+}
+
+/// `delegate` with `wait` ends the answering turn; the answer is written by
+/// the turn the helper's result wakes, and it reaches the chat.
+#[tokio::test]
+async fn an_answer_that_waits_for_a_delegated_helper_reaches_the_chat() {
+    let harness = Harness::new().await;
+    let (_agents, pump) = running_pump(&harness).await;
+    say(&harness, 1, "Which tests are flaky?").await;
+    orch(&harness, consumed(1)).await;
+    orch(&harness, said("A helper is reading the CI history.")).await;
+    orch(&harness, tool_call()).await;
+    let helper_task = json!({"on": "any", "of": [
+        {"on": "task", "id": "tsk_0101"}, {"on": "deadline", "at": "2026-09-26T10:30:00Z"}]});
+    waits_for(&harness, helper_task).await;
+    assert!(awaiting_reply(&harness).await, "the answer is still owed");
+
+    let result = json!({"kind": "task_completed", "task": "tsk_0101",
+                        "result": {"summary": "three tests"}});
+    orch(&harness, delivered(2, result)).await;
+    orch(&harness, consumed(2)).await;
+    orch(&harness, said("Three tests are flaky: a, b and c.")).await;
+    waits_for(&harness, json!({"on": "inbox"})).await;
+    assert!(!awaiting_reply(&harness).await);
+
+    orch(&harness, trigger_delivered(3)).await;
+    orch(&harness, consumed(3)).await;
+    orch(&harness, said("Later trigger work.")).await;
+    waits_for(&harness, json!({"on": "inbox"})).await;
+    hangup_and_replay(&harness, keys::CURSOR_ORCHESTRATOR).await;
+    orch(&harness, trigger_delivered(4)).await;
+    pump.abort();
+    assert_eq!(
+        harness.orchestrator_replies().await,
+        vec![
+            "A helper is reading the CI history.",
+            "Three tests are flaky: a, b and c."
+        ]
+    );
 }
 
 #[tokio::test]
@@ -455,6 +524,7 @@ fn item_finished(title: &str) -> TriggerEvent {
         summary: format!("Failed: {title}."),
         pr_url: None,
         cost_usd: 0.0,
+        lesson_hint: None,
         origin: None,
     }
 }
@@ -498,6 +568,7 @@ async fn an_aether_restart_of_the_orchestrator_is_adopted_and_gets_the_held_news
         .await;
 
     agents.restart(ORCH, ORCH_2);
+    harness.fake.set_default("cancel", Scripted::ok());
     let restarted = json!({"type": "agent.restarted", "from": ORCH, "to": ORCH_2,
                            "transcript_tail": 3});
     orch(&harness, restarted).await;
@@ -553,6 +624,15 @@ async fn cancel_item_of(harness: &Harness, stage: &StageRun) {
         .expect("cancel");
 }
 
+/// Tag the item of `stage` `notify`, so its outcome wakes the orchestrator.
+async fn tag_notify(harness: &Harness, stage: &StageRun) {
+    let mut store = harness.ctx.store.lock().await;
+    let mut item = store.item(&store.run(&stage.run).unwrap().item).unwrap();
+    item.tags.push(NOTIFY_TAG.into());
+    store.update_item(&item).unwrap();
+    assert!(store.item(&item.id).unwrap().wants_notice());
+}
+
 /// `trigger` refused while `ORCH` is failed, as Aether does, and counted
 /// once it takes one.
 fn triggers_reach_orch_when_live(agents: &Agents, harness: &Harness) -> Arc<AtomicUsize> {
@@ -575,6 +655,7 @@ fn triggers_reach_orch_when_live(agents: &Agents, harness: &Harness) -> Arc<Atom
 /// its news waits and reaches the orchestrator once revival recovers it.
 #[tokio::test]
 async fn outcomes_show_while_the_orchestrator_is_down_and_backoff_delivers_its_news() {
+    // A cancellation is quiet news unless its item is tagged `notify`.
     let harness = Harness::new().await;
     let (agents, pump) = running_pump(&harness).await;
     harness.fake.set_default("cancel", Scripted::ok());
@@ -593,6 +674,7 @@ async fn outcomes_show_while_the_orchestrator_is_down_and_backoff_delivers_its_n
     .await;
     let repo = tempfile::tempdir().unwrap();
     let stage = running_stage(&harness.ctx, repo.path(), STAGE, STAGE_TASK).await;
+    tag_notify(&harness, &stage).await;
     cancel_item_of(&harness, &stage).await;
     harness
         .eventually("the outcome shows and its news is held", || async {
@@ -632,6 +714,7 @@ async fn the_restart_event_alone_moves_the_pump_to_the_new_orchestrator() {
     let (agents, pump) = running_pump(&harness).await;
     agents.set(ORCH, "cancelled");
     agents.restart(ORCH, ORCH_2);
+    harness.fake.set_default("cancel", Scripted::ok());
     let asked = harness.fake.received_named("get_agent").len();
     let restarted = json!({"type": "agent.restarted", "from": ORCH, "to": ORCH_2,
                            "transcript_tail": 0});
@@ -649,7 +732,125 @@ async fn the_restart_event_alone_moves_the_pump_to_the_new_orchestrator() {
             subscribes.iter().any(|s| s["query"]["agent"] == ORCH_2)
         })
         .await;
+    // Owed by the adoption and made by itself, with nothing waiting for it.
+    harness
+        .eventually("the replaced agent's children are swept", || async {
+            !harness.fake.received_named("cancel").is_empty()
+        })
+        .await;
+    let swept = harness.fake.received_named("cancel");
+    assert_eq!(swept.len(), 1, "{swept:?}");
+    assert_eq!(swept[0]["agent"], ORCH);
     pump.abort();
+}
+
+/// archond starts with a live orchestrator and a sweep Aether refuses: the pump
+/// attaches all the same, says once that it is owed, and makes it when asked.
+#[tokio::test]
+async fn a_sweep_aether_refuses_keeps_nothing_from_the_live_orchestrator() {
+    let harness = Harness::new().await;
+    harness.set_kv(keys::ORCHESTRATOR_AGENT, ORCH_2).await;
+    let owed = json!([{"agent": ORCH, "at": archon_core::now(), "owed": true}]);
+    harness
+        .set_kv("orchestrator_retired", &owed.to_string())
+        .await;
+    let agents = Agents::install(&harness);
+    agents.set(ORCH, "cancelled");
+    agents.restart(ORCH, ORCH_2);
+    harness
+        .fake
+        .set_default("cancel", Scripted::refuse("internal", "store busy"));
+    let pump = tokio::spawn(pump::run(harness.ctx.clone(), harness.fake.endpoint()));
+    wait_for_streams(&harness, 1).await;
+    harness
+        .eventually("the orchestrator's stream is attached", || async {
+            let subscribes = harness.fake.received_named("subscribe");
+            subscribes.iter().any(|s| s["query"]["agent"] == ORCH_2)
+        })
+        .await;
+    harness
+        .eventually("the refused sweep is said", || async {
+            let notes = harness.system_notes().await;
+            notes.iter().any(|n| n.contains("store busy"))
+        })
+        .await;
+    let serving = harness.ctx.supervisor.watch().borrow().clone();
+    assert_eq!(serving, Some(link_common::agent_id(ORCH_2)));
+
+    // The restart that owed the sweep is seen again: nothing to adopt, and
+    // the sweep is tried at once instead of at its next pause.
+    harness.fake.set_default("cancel", Scripted::ok());
+    let (from, to) = (link_common::agent_id(ORCH), link_common::agent_id(ORCH_2));
+    supervisor::adopt_restart(&harness.ctx, &from, &to)
+        .await
+        .unwrap();
+    harness
+        .eventually("the sweep is made", || async {
+            let notes = harness.system_notes().await;
+            notes.iter().any(|n| n.contains("Cancelled what"))
+        })
+        .await;
+    pump.abort();
+    let notes = harness.system_notes().await;
+    let refused = notes.iter().filter(|n| n.contains("store busy")).count();
+    assert_eq!(refused, 1, "said once, not at every try: {notes:?}");
+    let record = harness.kv("orchestrator_retired").await.expect("kept");
+    let record: Value = serde_json::from_str(&record).unwrap();
+    assert_eq!(record[0]["agent"], ORCH);
+    assert_eq!(record[0]["owed"], false, "{record}");
+}
+
+/// Aether's events outlive the generation they describe: what a replaced
+/// orchestrator delegated to and spent is still Archon's when they arrive.
+#[tokio::test]
+async fn a_replaced_orchestrators_late_children_and_spend_are_still_archons() {
+    let mut config = Config::default();
+    deny_model(&mut config);
+    let mut harness = Harness::with(config, None).await;
+    let (agents, pump) = running_pump(&harness).await;
+    agents.set(ORCH, "cancelled");
+    agents.restart(ORCH, ORCH_2);
+    harness.fake.set_default("cancel", Scripted::ok());
+    let restarted = json!({"type": "agent.restarted", "from": ORCH, "to": ORCH_2,
+                           "transcript_tail": 0});
+    orch(&harness, restarted).await;
+    harness
+        .eventually(
+            "the successor is adopted and the old agent swept",
+            || async {
+                let adopted = harness.kv(keys::ORCHESTRATOR_AGENT).await;
+                adopted.as_deref() == Some(ORCH_2)
+                    && !harness.fake.received_named("cancel").is_empty()
+            },
+        )
+        .await;
+
+    // Delegated by the generation since replaced, and only now reported.
+    let fleet = keys::CURSOR_FLEET;
+    push(&harness, created(CHILD, ORCH, DENIED), fleet).await;
+    let allowed = ("claude-code", "claude-opus-5-5");
+    push(&harness, created(CHILD_2, ORCH, allowed), fleet).await;
+    push(&harness, usage_of(CHILD_2, 0.5), fleet).await;
+    push(&harness, usage_of(ORCH, 0.25), fleet).await;
+    push(&harness, stranger_usage(), fleet).await;
+    pump.abort();
+
+    let cancelled: Vec<Value> = harness.fake.received_named("cancel");
+    let cancelled: Vec<&Value> = cancelled.iter().map(|c| &c["agent"]).collect();
+    assert_eq!(cancelled, [ORCH, CHILD], "the sweep, then the policy");
+    let violation = TriggerEvent::PolicyViolation {
+        agent: CHILD.into(),
+        model: format!("{}/{}", DENIED.0, DENIED.1),
+        action: "cancelled".into(),
+    };
+    assert_eq!(harness.drain_triggers().await, vec![violation]);
+    let owned = harness.kv(&format!("link_child_{CHILD_2}")).await;
+    assert_eq!(owned.as_deref(), Some("null"), "an orchestrator's child");
+    assert_eq!(
+        spent_in_total(&harness).await,
+        0.75,
+        "the child's and its own"
+    );
 }
 
 fn deny_model(config: &mut Config) {
@@ -683,10 +884,10 @@ async fn the_watchdog_cancels_an_off_policy_child_once_and_tracks_allowed_ones()
     assert_eq!(cancels.len(), 1, "{cancels:?}");
     assert_eq!(cancels[0]["agent"], CHILD);
     let blockers = harness.notifications(NotificationKind::Blocker).await;
-    assert!(
-        blockers.len() == 1 && blockers[0].contains(CHILD),
-        "{blockers:?}"
-    );
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    let refused = format!("Cancelled agent {CHILD}: model policy: model ");
+    assert!(blockers[0].starts_with(&refused), "{blockers:?}");
+    assert!(blockers[0].contains("not allowed"), "{blockers:?}");
     let violation = TriggerEvent::PolicyViolation {
         agent: CHILD.into(),
         model: format!("{}/{}", DENIED.0, DENIED.1),
@@ -748,8 +949,7 @@ async fn a_stage_agents_children_follow_its_repositorys_narrower_policy() {
     let denied = format!("[models]\ndeny = [\"{}/{}\"]\n", DENIED.0, DENIED.1);
     std::fs::write(archon_dir.join("config.toml"), denied).unwrap();
     let stage = stage_with_task(&harness, repo.path()).await;
-    let (agents, pump) = running_pump(&harness).await;
-    agents.set(STAGE, "running");
+    let (_agents, pump) = running_pump_beside(&harness, &[STAGE]).await;
     harness.fake.set_default("cancel", Scripted::ok());
     push(&harness, created(CHILD, STAGE, DENIED), keys::CURSOR_FLEET).await;
     pump.abort();
@@ -761,6 +961,114 @@ async fn a_stage_agents_children_follow_its_repositorys_narrower_policy() {
     });
     let item = harness.ctx.store.lock().await.run(&stage.run).unwrap().item;
     assert_eq!(blocker.unwrap().item.as_ref(), Some(&item));
+}
+
+/// A helper whose scope names no directory may read every mirror, so a
+/// model any registered repository refuses is refused to it.
+#[tokio::test]
+async fn the_orchestrators_helpers_follow_every_registered_repositorys_policy() {
+    let mut harness = Harness::new().await;
+    let repo = tempfile::tempdir().unwrap();
+    let archon_dir = repo.path().join(".archon");
+    std::fs::create_dir_all(&archon_dir).unwrap();
+    let denied = format!("[models]\ndeny = [\"{}/{}\"]\n", DENIED.0, DENIED.1);
+    std::fs::write(archon_dir.join("config.toml"), denied).unwrap();
+    let global = harness.ctx.config.models.policy();
+    assert!(global.permits_model(&ModelRef::new(DENIED.0, DENIED.1)));
+    link_common::queued_item(&harness.ctx, repo.path()).await;
+    let (_agents, pump) = running_pump(&harness).await;
+    harness.fake.set_default("cancel", Scripted::ok());
+    push(&harness, created(CHILD, ORCH, DENIED), keys::CURSOR_FLEET).await;
+    push(
+        &harness,
+        created(CHILD_2, ORCH, ALLOWED),
+        keys::CURSOR_FLEET,
+    )
+    .await;
+    pump.abort();
+
+    let cancels = harness.fake.received_named("cancel");
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert_eq!(cancels[0]["agent"], CHILD);
+    let violation = TriggerEvent::PolicyViolation {
+        agent: CHILD.into(),
+        model: format!("{}/{}", DENIED.0, DENIED.1),
+        action: "cancelled".into(),
+    };
+    assert_eq!(harness.drain_triggers().await, vec![violation]);
+    let kept = harness.kv(&format!("link_child_{CHILD_2}")).await;
+    assert_eq!(
+        kept.as_deref(),
+        Some("null"),
+        "an allowed helper is tracked"
+    );
+}
+
+/// A helper whose workspace or allowed path leads into a registered
+/// repository, even through a link, is cancelled: it reads mirrors only.
+#[tokio::test]
+async fn a_helper_placed_in_a_repository_is_cancelled_wherever_the_path_leads_from() {
+    let harness = Harness::new().await;
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    link_common::queued_item(&harness.ctx, repo.path()).await;
+    let own = harness.ctx.paths.orchestrator_workspace.clone();
+    std::fs::create_dir_all(own.join("notes")).unwrap();
+    let link = own.join("alpha");
+    std::os::unix::fs::symlink(repo.path(), &link).unwrap();
+    let (agents, pump) = running_pump(&harness).await;
+    harness.fake.set_default("cancel", Scripted::ok());
+    agents.set_scope(CHILD, json!({ "workspace_root": link }));
+    let inside = repo.path().join("src");
+    agents.set_scope(
+        CHILD_2,
+        json!({ "workspace_root": own, "allowed_paths": [inside] }),
+    );
+    agents.set_scope(GRANDCHILD, json!({ "workspace_root": own.join("notes") }));
+    for helper in [CHILD, CHILD_2, GRANDCHILD] {
+        push(&harness, created(helper, ORCH, ALLOWED), keys::CURSOR_FLEET).await;
+    }
+    pump.abort();
+
+    let cancels = harness.fake.received_named("cancel");
+    let cancelled: Vec<&str> = cancels.iter().filter_map(|c| c["agent"].as_str()).collect();
+    assert_eq!(cancelled, [CHILD, CHILD_2], "{cancels:?}");
+    for cancel in &cancels {
+        let reason = cancel["reason"].as_str().unwrap();
+        assert!(reason.contains("inside repository `alpha`"), "{reason}");
+        assert!(
+            reason.starts_with("archon policy: it was given "),
+            "{reason}"
+        );
+    }
+    let blockers = harness.notifications(NotificationKind::Blocker).await;
+    assert_eq!(blockers.len(), 2, "{blockers:?}");
+    let wording = format!("Cancelled agent {CHILD}: it was given ");
+    assert!(blockers[0].starts_with(&wording), "{blockers:?}");
+    assert!(
+        blockers.iter().all(|text| !text.contains("model policy")),
+        "its model was allowed: {blockers:?}"
+    );
+    let kept = harness.kv(&format!("link_unchecked_{GRANDCHILD}")).await;
+    assert_eq!(
+        kept, None,
+        "a helper in the orchestrator's workspace passes"
+    );
+}
+
+/// An item's agents are placed by Archon: the same paths are theirs.
+#[tokio::test]
+async fn a_stage_agents_child_may_work_in_its_items_repository() {
+    let harness = Harness::new().await;
+    let repo = tempfile::tempdir().unwrap();
+    stage_with_task(&harness, repo.path()).await;
+    let (agents, pump) = running_pump_beside(&harness, &[STAGE]).await;
+    agents.set_scope(CHILD, json!({ "workspace_root": repo.path() }));
+    push(&harness, created(CHILD, STAGE, ALLOWED), keys::CURSOR_FLEET).await;
+    pump.abort();
+    let cancels = harness.fake.received_named("cancel");
+    assert!(cancels.is_empty(), "{cancels:?}");
+    assert!(harness.kv(&format!("link_child_{CHILD}")).await.is_some());
 }
 
 /// A running stage for `STAGE`, with Aether reporting its task as active.
@@ -783,8 +1091,7 @@ async fn stage_questions_and_spend_are_attributed_to_the_item_and_survive_replay
     let harness = Harness::new().await;
     let repo = tempfile::tempdir().unwrap();
     let stage = stage_with_task(&harness, repo.path()).await;
-    let (agents, pump) = running_pump(&harness).await;
-    agents.set(STAGE, "running");
+    let (_agents, pump) = running_pump_beside(&harness, &[STAGE]).await;
     assert_eq!(
         harness.fake.received_named("get_task")[0]["id"],
         STAGE_TASK,
@@ -884,8 +1191,7 @@ async fn a_settled_stage_reaches_the_executor_once_even_when_replayed() {
     let harness = Harness::new().await;
     let repo = tempfile::tempdir().unwrap();
     let stage = stage_with_task(&harness, repo.path()).await;
-    let (agents, pump) = running_pump(&harness).await;
-    agents.set(STAGE, "running");
+    let (_agents, pump) = running_pump_beside(&harness, &[STAGE]).await;
     let done = json!({"type": "task.completed",
                       "result": {"summary": "VERDICT: PASS", "artifacts": [], "structured": null}});
     push(
@@ -966,6 +1272,8 @@ async fn a_stage_agent_that_dies_without_settling_fails_its_stage_as_infra() {
 const SPAWN_RUN: &str = "run_0001";
 /// How long a settle may wait for a spawning stage's reply (`SPAWN_GRACE`).
 const SPAWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often that wait looks again unasked (`SPAWN_RECHECK`).
+const SPAWN_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A settling event for `agent` in Aether run `run`.
 fn settled_in(agent: &str, task: &str, run: &str) -> Value {
@@ -1018,6 +1326,25 @@ async fn an_unsent_spawn_holds_up_no_event() {
     assert!(took < SPAWN_GRACE / 2, "waited {took:?}");
 }
 
+/// The stop of what a settled stage agent delegated waits for its turn to
+/// end (§6.3), so the fleet stream asks Aether for that end.
+#[tokio::test]
+async fn the_fleet_stream_asks_for_an_agents_completed_turn() {
+    let harness = Harness::new().await;
+    let (_agents, pump) = running_pump(&harness).await;
+    let subscribes = harness.fake.received_named("subscribe");
+    pump.abort();
+    let fleet: Vec<_> = subscribes
+        .iter()
+        .filter(|s| s["query"]["agent"].is_null())
+        .collect();
+    assert_eq!(fleet.len(), 1, "one fleet subscription: {subscribes:?}");
+    let types = fleet[0]["query"]["types"].as_array().expect("its types");
+    for ended in ["agent.completed", "agent.failed", "agent.cancelled"] {
+        assert!(types.contains(&json!(ended)), "{ended} in {types:?}");
+    }
+}
+
 /// A run node's own events, a retired node's `agent.cancelled` above
 /// all, are recognised and skipped at once, even in the Aether run of a
 /// stage that is spawning under it.
@@ -1042,9 +1369,27 @@ async fn a_run_nodes_events_are_skipped_without_waiting() {
     assert_eq!(still.state, StageState::Spawning, "a node is not its stage");
 }
 
+/// Record the spawn reply of `stage` as `spawn::issue` does, without the
+/// signal that follows it.
+async fn record_spawned(harness: &Harness, stage: &StageRun) {
+    let mut store = harness.ctx.store.lock().await;
+    let mut spawned = store.stage_run(&stage.id).unwrap();
+    assert_eq!(spawned.state, StageState::Spawning, "not settled early");
+    spawned.aether_agent = Some(link_common::agent_id(STAGE));
+    spawned.aether_task = Some(AetherTaskId::parse(STAGE_TASK).unwrap());
+    spawned.state = StageState::Running;
+    store.upsert_stage_run(&spawned).unwrap();
+}
+
+async fn settled(harness: &Harness, stage: &StageRun) -> bool {
+    let store = harness.ctx.store.lock().await;
+    store.stage_run(&stage.id).unwrap().state.is_terminal()
+}
+
 /// The wait still covers the race it exists for: a settle in a spawning
 /// stage's Aether run, arriving before its spawn reply is recorded, settles
-/// the stage once the reply is.
+/// the stage once the reply is. Nothing signals this record, so the wait
+/// finds it at its next look.
 #[tokio::test]
 async fn a_settle_racing_its_spawn_reply_waits_for_it() {
     let harness = Harness::new().await;
@@ -1055,22 +1400,39 @@ async fn a_settle_racing_its_spawn_reply_waits_for_it() {
         .fake
         .push_event(settled_in(STAGE, STAGE_TASK, SPAWN_RUN));
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    {
-        let mut store = harness.ctx.store.lock().await;
-        let mut spawned = store.stage_run(&stage.id).unwrap();
-        assert_eq!(spawned.state, StageState::Spawning, "not settled early");
-        spawned.aether_agent = Some(link_common::agent_id(STAGE));
-        spawned.aether_task = Some(AetherTaskId::parse(STAGE_TASK).unwrap());
-        spawned.state = StageState::Running;
-        store.upsert_stage_run(&spawned).unwrap();
-    }
+    record_spawned(&harness, &stage).await;
     harness
-        .eventually("the racing settle reached its stage", || async {
-            let store = harness.ctx.store.lock().await;
-            store.stage_run(&stage.id).unwrap().state.is_terminal()
+        .eventually("the racing settle reached its stage", || {
+            settled(&harness, &stage)
         })
         .await;
     pump.abort();
+}
+
+/// A recorded spawn ends the wait itself: the settle reaches its stage long
+/// before the wait would have looked again.
+#[tokio::test]
+async fn a_recorded_spawn_ends_the_wait_for_it_at_once() {
+    let harness = Harness::new().await;
+    let repo = tempfile::tempdir().unwrap();
+    let stage = spawning_stage(&harness.ctx, repo.path(), SPAWN_RUN, Some("agt_0300")).await;
+    let (_agents, pump) = running_pump(&harness).await;
+    harness
+        .fake
+        .push_event(settled_in(STAGE, STAGE_TASK, SPAWN_RUN));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!settled(&harness, &stage).await, "the settle is waiting");
+    record_spawned(&harness, &stage).await;
+    let recorded = tokio::time::Instant::now();
+    harness.ctx.spawn_recorded.notify_waiters();
+    harness
+        .eventually("the waiting settle reached its stage", || {
+            settled(&harness, &stage)
+        })
+        .await;
+    let took = recorded.elapsed();
+    pump.abort();
+    assert!(took < SPAWN_RECHECK / 2, "the settle waited {took:?}");
 }
 
 const GRANDCHILD: &str = "agt_0103";
@@ -1087,8 +1449,68 @@ async fn spent_in_total(harness: &Harness) -> f64 {
     store.spend_totals(archon_core::now(), true).unwrap().1
 }
 
+/// Whether the dispatcher was asked for a pass since the last look.
+async fn dispatcher_woken(harness: &Harness) -> bool {
+    let woken = harness.ctx.dispatch.notified();
+    tokio::time::timeout(Duration::ZERO, woken).await.is_ok()
+}
+
+/// A usage update costs a dispatch pass only when a total or daily budget is
+/// set, and then the pass holding work at the budget follows at once.
+#[tokio::test]
+async fn usage_wakes_the_dispatcher_only_while_a_global_budget_is_set() {
+    let harness = Harness::new().await;
+    let repo = tempfile::tempdir().unwrap();
+    stage_with_task(&harness, repo.path()).await;
+    let (_agents, pump) = running_pump_beside(&harness, &[STAGE]).await;
+    assert!(
+        dispatcher_woken(&harness).await,
+        "connecting asks for a pass"
+    );
+
+    push(&harness, usage_of(STAGE, 0.25), keys::CURSOR_FLEET).await;
+    assert!((spent_in_total(&harness).await - 0.25).abs() < 1e-9);
+    assert!(
+        !dispatcher_woken(&harness).await,
+        "no budget this spend could reach"
+    );
+
+    let budgeted = Caps {
+        budget_usd_daily: 10.0,
+        ..Caps::default()
+    };
+    *harness.ctx.caps_override.lock().await = Some(budgeted);
+    push(&harness, usage_of(STAGE, 0.5), keys::CURSOR_FLEET).await;
+    pump.abort();
+    assert!((spent_in_total(&harness).await - 0.5).abs() < 1e-9);
+    assert!(
+        dispatcher_woken(&harness).await,
+        "the daily budget is checked"
+    );
+}
+
+/// A stage agent under `node` with three generations beneath it, the
+/// grandchild on a refused model, and spend reported by each of the four.
+async fn push_three_generations_with_usage(harness: &Harness, node: &str) {
+    let fleet = keys::CURSOR_FLEET;
+    push(harness, created(STAGE, node, ALLOWED), fleet).await;
+    push(harness, created(CHILD, STAGE, ALLOWED), fleet).await;
+    push(harness, created(GRANDCHILD, CHILD, DENIED), fleet).await;
+    let deepest = created(GREAT_GRANDCHILD, GRANDCHILD, ALLOWED);
+    push(harness, deepest, fleet).await;
+    for (agent, cost) in [
+        (STAGE, 0.25),
+        (CHILD, 0.5),
+        (GRANDCHILD, 1.0),
+        (GREAT_GRANDCHILD, 2.0),
+    ] {
+        push(harness, usage_of(agent, cost), fleet).await;
+    }
+}
+
 /// A stage agent that delegates before its spawn reply is recorded,
-/// and its children's children, are all policed and billed to the item.
+/// and its children's children, are all policed and billed to the item;
+/// a child a third delegation down is cancelled for its depth.
 #[tokio::test]
 async fn children_delegated_before_their_stage_is_recorded_are_policed_at_every_depth() {
     let mut config = Config::default();
@@ -1103,29 +1525,21 @@ async fn children_delegated_before_their_stage_is_recorded_are_policed_at_every_
     let item = harness.ctx.store.lock().await.run(&stage.run).unwrap().item;
     let (_agents, pump) = running_pump(&harness).await;
     harness.fake.set_default("cancel", Scripted::ok());
-    let fleet = keys::CURSOR_FLEET;
-    push(&harness, created(STAGE, node, ALLOWED), fleet).await;
-    push(&harness, created(CHILD, STAGE, ALLOWED), fleet).await;
-    push(&harness, created(GRANDCHILD, CHILD, DENIED), fleet).await;
-    push(
-        &harness,
-        created(GREAT_GRANDCHILD, GRANDCHILD, ALLOWED),
-        fleet,
-    )
-    .await;
-    for (agent, cost) in [
-        (STAGE, 0.25),
-        (CHILD, 0.5),
-        (GRANDCHILD, 1.0),
-        (GREAT_GRANDCHILD, 2.0),
-    ] {
-        push(&harness, usage_of(agent, cost), fleet).await;
-    }
+    push_three_generations_with_usage(&harness, node).await;
     pump.abort();
 
     let cancels = harness.fake.received_named("cancel");
-    assert_eq!(cancels.len(), 1, "{cancels:?}");
-    assert_eq!(cancels[0]["agent"], GRANDCHILD);
+    let cancelled: Vec<&str> = cancels.iter().filter_map(|c| c["agent"].as_str()).collect();
+    assert_eq!(cancelled, [GRANDCHILD, GREAT_GRANDCHILD], "{cancels:?}");
+    let model = cancels[0]["reason"].as_str().unwrap();
+    assert!(model.contains("is not allowed"), "{model}");
+    let depth = cancels[1]["reason"].as_str().unwrap();
+    assert!(
+        depth.contains(
+            "3 delegations below its stage agent; `[limits] max_delegation_depth` allows 2"
+        ),
+        "{depth}"
+    );
     let owned = Some(format!("\"{item}\""));
     assert_eq!(harness.kv(&format!("link_child_{CHILD}")).await, owned);
     assert_eq!(
@@ -1238,4 +1652,320 @@ async fn a_check_cut_short_by_a_lost_connection_is_retried() {
     assert_eq!(cancels.len(), 1, "{cancels:?}");
     assert_eq!(cancels[0]["agent"], CHILD);
     assert_eq!(harness.kv(&format!("link_unchecked_{CHILD}")).await, None);
+}
+
+/// An aetherd that is not running is asked for every second, not at a growing
+/// interval: one that Archon restarts is found before a command shows the gap.
+#[tokio::test]
+async fn an_aetherd_that_starts_late_is_found_within_a_second_or_so() {
+    use archon_aether::client::Endpoint;
+    let harness = Harness::new().await;
+    let socket = harness.dir.path().join("late.sock");
+    let pump = tokio::spawn(pump::run(
+        harness.ctx.clone(),
+        Endpoint::Unix(socket.clone()),
+    ));
+    // A doubling interval would have its attempts 1, 3, 7 and 15 s in.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(!pump.is_finished(), "an absent aetherd is not fatal");
+    assert!(!harness.ctx.aether.is_connected());
+
+    let late = fake::FakeAether::start(&socket).await.unwrap();
+    let found = tokio::time::Instant::now() + Duration::from_secs(3);
+    while late.connections_accepted() == 0 {
+        assert!(tokio::time::Instant::now() < found, "not found in 3 s");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    pump.abort();
+}
+
+const HELPER_5: &str = "agt_0105";
+
+/// Repositories `alpha` (refusing [`DENIED`]) and `beta`, mirrored in the
+/// orchestrator's workspace; returns where they are and that workspace.
+async fn two_mirrored_repos(harness: &Harness) -> (tempfile::TempDir, PathBuf) {
+    let repos = tempfile::tempdir().unwrap();
+    let (alpha, beta) = (repos.path().join("alpha"), repos.path().join("beta"));
+    std::fs::create_dir_all(alpha.join(".archon")).unwrap();
+    std::fs::create_dir_all(&beta).unwrap();
+    let denied = format!("[models]\ndeny = [\"{}/{}\"]\n", DENIED.0, DENIED.1);
+    std::fs::write(alpha.join(".archon/config.toml"), denied).unwrap();
+    link_common::queued_item(&harness.ctx, &alpha).await;
+    let second = Repo {
+        id: RepoId::new(),
+        name: "beta".into(),
+        path: beta,
+        ship: ShipMode::Local,
+        base_branch: None,
+        default_pipeline: None,
+        autonomy_max: Default::default(),
+        added_at: archon_core::now(),
+    };
+    harness.ctx.store.lock().await.insert_repo(&second).unwrap();
+    let own = harness.ctx.paths.orchestrator_workspace.clone();
+    let mirrors = mirror::mirrors_root(&own);
+    std::fs::create_dir_all(mirrors.join("alpha/.git/worktrees/w1")).unwrap();
+    std::fs::create_dir_all(mirrors.join("alpha/src")).unwrap();
+    std::fs::create_dir_all(mirrors.join("beta")).unwrap();
+    std::fs::create_dir_all(own.join(mirror::SCRATCH_DIR)).unwrap();
+    (repos, own)
+}
+
+/// The agents cancelled so far, each with the reason Aether was given.
+fn cancelled(harness: &Harness) -> Vec<(String, String)> {
+    let text = |cancel: &Value, field: &str| cancel[field].as_str().unwrap().to_owned();
+    let cancels = harness.fake.received_named("cancel");
+    cancels
+        .iter()
+        .map(|cancel| (text(cancel, "agent"), text(cancel, "reason")))
+        .collect()
+}
+
+/// A helper answers only to the repositories whose mirrors it reads: `alpha`
+/// refusing a model does not refuse it in `beta`'s mirror or in scratch.
+#[tokio::test]
+async fn a_helper_follows_the_policy_of_the_mirrors_its_scope_reads() {
+    let harness = Harness::new().await;
+    let (_repos, own) = two_mirrored_repos(&harness).await;
+    let mirrors = mirror::mirrors_root(&own);
+    let scratch = own.join(mirror::SCRATCH_DIR);
+    let (agents, pump) = running_pump(&harness).await;
+    harness.fake.set_default("cancel", Scripted::ok());
+    agents.set_scope(CHILD, json!({ "workspace_root": mirrors.join("beta") }));
+    agents.set_scope(
+        CHILD_2,
+        json!({ "workspace_root": mirrors.join("alpha/src") }),
+    );
+    agents.set_scope(GRANDCHILD, json!({ "workspace_root": scratch }));
+    agents.set_scope(
+        GREAT_GRANDCHILD,
+        json!({ "workspace_root": scratch, "allowed_paths": [mirrors.join("alpha")] }),
+    );
+    agents.set_scope(HELPER_5, json!({ "workspace_root": own }));
+    for helper in [CHILD, CHILD_2, GRANDCHILD, GREAT_GRANDCHILD, HELPER_5] {
+        push(&harness, created(helper, ORCH, DENIED), keys::CURSOR_FLEET).await;
+    }
+    pump.abort();
+
+    let cancels = cancelled(&harness);
+    let agents: Vec<&str> = cancels.iter().map(|(agent, _)| agent.as_str()).collect();
+    assert_eq!(agents, [CHILD_2, GREAT_GRANDCHILD, HELPER_5], "{cancels:?}");
+    for (_, reason) in &cancels[..2] {
+        assert!(reason.contains("is not allowed"), "{reason}");
+        assert!(reason.contains("here the mirror of `alpha`;"), "{reason}");
+    }
+    let whole = &cancels[2].1;
+    assert!(whole.contains("here every repository's mirror;"), "{whole}");
+    for kept in [CHILD, GRANDCHILD] {
+        let tracked = harness.kv(&format!("link_child_{kept}")).await;
+        assert_eq!(
+            tracked.as_deref(),
+            Some("null"),
+            "{kept} is a tracked helper"
+        );
+        assert_eq!(harness.kv(&format!("link_unchecked_{kept}")).await, None);
+    }
+}
+
+/// Aether gives an isolated child a git worktree of the mirror, outside the
+/// orchestrator's workspace: it still answers to that mirror's repository.
+#[tokio::test]
+async fn an_isolated_child_of_a_mirror_answers_to_that_mirrors_repository() {
+    let harness = Harness::new().await;
+    let (repos, own) = two_mirrored_repos(&harness).await;
+    let isolated = repos.path().join("aether/delegated/workspace");
+    std::fs::create_dir_all(&isolated).unwrap();
+    let git_dir = mirror::mirrors_root(&own).join("alpha/.git/worktrees/w1");
+    std::fs::write(
+        isolated.join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    let (agents, pump) = running_pump(&harness).await;
+    harness.fake.set_default("cancel", Scripted::ok());
+    for helper in [CHILD, CHILD_2] {
+        agents.set_scope(helper, json!({ "workspace_root": isolated }));
+    }
+    push(&harness, created(CHILD, ORCH, DENIED), keys::CURSOR_FLEET).await;
+    push(
+        &harness,
+        created(CHILD_2, ORCH, ALLOWED),
+        keys::CURSOR_FLEET,
+    )
+    .await;
+    pump.abort();
+
+    let cancels = cancelled(&harness);
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert_eq!(cancels[0].0, CHILD);
+    assert!(
+        cancels[0].1.contains("here the mirror of `alpha`;"),
+        "{}",
+        cancels[0].1
+    );
+    let tracked = harness.kv(&format!("link_child_{CHILD_2}")).await;
+    assert_eq!(
+        tracked.as_deref(),
+        Some("null"),
+        "an allowed model works there"
+    );
+}
+
+/// A code question needs no item: a helper reads the mirror, never the checkout
+/// or the items' worktrees, also through a link the repository tracks.
+#[tokio::test]
+async fn a_helper_reads_a_mirror_and_is_kept_out_of_the_checkout_and_worktrees() {
+    let harness = Harness::new().await;
+    let (repos, own) = two_mirrored_repos(&harness).await;
+    let checkout = repos.path().join("alpha");
+    let mirror_dir = mirror::mirrors_root(&own).join("alpha");
+    std::os::unix::fs::symlink(&checkout, mirror_dir.join("vendored")).unwrap();
+    let worktree = harness.ctx.paths.worktrees.join("item-1");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let (agents, pump) = running_pump(&harness).await;
+    harness.fake.set_default("cancel", Scripted::ok());
+    agents.set_scope(CHILD, json!({ "workspace_root": mirror_dir.join("src") }));
+    agents.set_scope(CHILD_2, json!({ "workspace_root": checkout }));
+    agents.set_scope(GRANDCHILD, json!({ "workspace_root": worktree }));
+    agents.set_scope(
+        GREAT_GRANDCHILD,
+        json!({ "workspace_root": mirror_dir.join("vendored") }),
+    );
+    for helper in [CHILD, CHILD_2, GRANDCHILD, GREAT_GRANDCHILD] {
+        push(&harness, created(helper, ORCH, ALLOWED), keys::CURSOR_FLEET).await;
+    }
+    pump.abort();
+
+    let cancels = cancelled(&harness);
+    let agents: Vec<&str> = cancels.iter().map(|(agent, _)| agent.as_str()).collect();
+    assert_eq!(
+        agents,
+        [CHILD_2, GRANDCHILD, GREAT_GRANDCHILD],
+        "{cancels:?}"
+    );
+    assert!(
+        cancels[0].1.contains("inside repository `alpha`"),
+        "{}",
+        cancels[0].1
+    );
+    assert!(
+        cancels[1].1.contains("inside the items' worktrees"),
+        "{}",
+        cancels[1].1
+    );
+    assert!(
+        cancels[2].1.contains("inside repository `alpha`"),
+        "{}",
+        cancels[2].1
+    );
+    for (_, reason) in &cancels {
+        assert!(reason.ends_with("in its mirror under `repos/`"), "{reason}");
+    }
+    let tracked = harness.kv(&format!("link_child_{CHILD}")).await;
+    assert_eq!(
+        tracked.as_deref(),
+        Some("null"),
+        "the mirror is the helper's to read"
+    );
+    assert_eq!(harness.kv(&format!("link_unchecked_{CHILD}")).await, None);
+}
+
+/// The orchestrator's helper may delegate once more; a third level is
+/// cancelled, like under a stage agent.
+#[tokio::test]
+async fn the_orchestrators_helpers_delegate_one_level_deeper_and_no_further() {
+    let harness = Harness::new().await;
+    let (_agents, pump) = running_pump(&harness).await;
+    harness.fake.set_default("cancel", Scripted::ok());
+    let fleet = keys::CURSOR_FLEET;
+    push(&harness, created(CHILD, ORCH, ALLOWED), fleet).await;
+    push(&harness, created(GRANDCHILD, CHILD, ALLOWED), fleet).await;
+    push(
+        &harness,
+        created(GREAT_GRANDCHILD, GRANDCHILD, ALLOWED),
+        fleet,
+    )
+    .await;
+    pump.abort();
+
+    let cancels = cancelled(&harness);
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert_eq!(cancels[0].0, GREAT_GRANDCHILD);
+    let reason = &cancels[0].1;
+    assert!(
+        reason.contains(
+            "3 delegations below the orchestrator; `[limits] max_delegation_depth` allows 2"
+        ),
+        "{reason}"
+    );
+    for kept in [CHILD, GRANDCHILD] {
+        let tracked = harness.kv(&format!("link_child_{kept}")).await;
+        assert_eq!(
+            tracked.as_deref(),
+            Some("null"),
+            "{kept} is a tracked helper"
+        );
+    }
+    let blockers = harness.notifications(NotificationKind::Blocker).await;
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(blockers[0].contains("3 delegations below the orchestrator"));
+}
+
+/// `[limits] max_delegation_depth` moves where a helper's descendants are
+/// cancelled: at 1, already the helper's own child.
+#[tokio::test]
+async fn the_configured_delegation_depth_decides_how_deep_helpers_go() {
+    let mut config = Config::default();
+    config.limits.max_delegation_depth = 1;
+    let harness = Harness::with(config, None).await;
+    let (_agents, pump) = running_pump(&harness).await;
+    harness.fake.set_default("cancel", Scripted::ok());
+    let fleet = keys::CURSOR_FLEET;
+    push(&harness, created(CHILD, ORCH, ALLOWED), fleet).await;
+    push(&harness, created(GRANDCHILD, CHILD, ALLOWED), fleet).await;
+    pump.abort();
+
+    let cancels = cancelled(&harness);
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert_eq!(cancels[0].0, GRANDCHILD);
+    assert!(
+        cancels[0].1.contains(
+            "2 delegations below the orchestrator; `[limits] max_delegation_depth` allows 1"
+        ),
+        "{}",
+        cancels[0].1
+    );
+    let tracked = harness.kv(&format!("link_child_{CHILD}")).await;
+    assert_eq!(tracked.as_deref(), Some("null"), "the helper itself runs");
+}
+
+/// Aether folded the orchestrator's context: what it was told of the
+/// directives may be gone, so they are stated again in a trigger of their own.
+#[tokio::test]
+async fn a_compacted_orchestrator_is_told_its_directives_again() {
+    let mut harness = Harness::new().await;
+    let (_agents, pump) = running_pump(&harness).await;
+    let compacted = json!({"type": "compaction.completed", "checkpoint": "chk_1",
+                           "version": 1, "from_seq": 1, "to_seq": 40});
+    orch(&harness, compacted.clone()).await;
+    assert!(
+        harness.drain_triggers().await.is_empty(),
+        "no directive is in force: nothing to restate"
+    );
+
+    let directive = Directive::new(
+        "no yolo today",
+        DirectiveSource::Operator,
+        None,
+        archon_core::now(),
+    );
+    let mut store = harness.ctx.store.lock().await;
+    store.insert_directive(&directive.unwrap()).unwrap();
+    drop(store);
+    orch(&harness, compacted).await;
+    pump.abort();
+    let restated = TriggerEvent::DirectivesRestated {
+        reason: "your context was compacted".into(),
+    };
+    assert_eq!(harness.drain_triggers().await, vec![restated]);
 }

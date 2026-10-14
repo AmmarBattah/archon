@@ -1,10 +1,12 @@
-//! Model policy for agents Archon did not create itself: children delegated
-//! by a stage agent, the orchestrator, or another such child, at any depth.
-//! A child outside the policy is cancelled and reported (ARCHITECTURE §7.4).
+//! Policy for agents Archon did not create itself: children delegated by a
+//! stage agent, the orchestrator, or another such child. A child outside the
+//! model policy, delegated too deep, or (a helper of the orchestrator) placed
+//! in a repository or worktree is cancelled and reported (ARCHITECTURE §7.4).
 //! A child is owned before it is checked, so its spend, and its subtree's,
 //! never depends on the check succeeding. A watched child is forgotten once
 //! none of its events can still arrive.
 
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use archon_aether::AetherEvent;
@@ -18,9 +20,12 @@ use archon_core::model::{Effort, ModelChoice, ModelRef};
 use archon_core::notify::NotificationKind;
 use archon_core::policy::ModelPolicy;
 use archon_core::protocol::RepoRef;
+use archon_queue::Store;
+use serde_json::Value;
 
 use super::fleet;
 use crate::context::DaemonContext;
+use crate::mirror::{self, Reach};
 use crate::triggers::{self, TriggerEvent};
 use crate::{executor, feed};
 
@@ -49,6 +54,12 @@ fn unchecked_key(agent: &AetherAgentId) -> String {
 /// report it twice.
 fn cancelled_key(agent: &AetherAgentId) -> String {
     format!("link_cancelled_{agent}")
+}
+
+/// `kv`: how many delegations a watched child is below a stage agent or the
+/// orchestrator, neither of which has an entry.
+fn depth_key(agent: &AetherAgentId) -> String {
+    format!("link_depth_{agent}")
 }
 
 /// `kv`: an agent Aether created under a run node, which is a stage agent,
@@ -80,14 +91,20 @@ pub(super) async fn agent_created(
         let mut store = ctx.store.lock().await;
         if let Some(run) = store.agent_run(parent)? {
             store.link_agent_run(agent, &run)?;
+            // Its stage's cost includes it; the effort is read when the stage ends.
+            store.record_delegated(agent, parent, model, None)?;
         }
     }
     if already_checked(ctx, agent).await? {
         return Ok(());
     }
-    adopt(ctx, agent, item.as_ref()).await?;
-    let policy = effective_policy(ctx, item.as_ref()).await?;
-    match violation(ctx, agent, model, &policy).await? {
+    let depth = adopt(ctx, agent, parent, item.as_ref()).await?;
+    let most = ctx.config.limits.max_delegation_depth;
+    let refusal = match depth_refusal(depth, most, item.is_none()) {
+        Some(refusal) => Some(refusal),
+        None => violation(ctx, agent, model, item.as_ref()).await?,
+    };
+    match refusal {
         Some(refusal) => cancel_child(ctx, agent, model, item, &refusal).await,
         None => ctx.store.lock().await.kv_delete(&unchecked_key(agent)),
     }
@@ -112,8 +129,8 @@ async fn record_stage_agent(
     store.kv_set(&key, item.as_str())
 }
 
-/// The item a new child works for, when its parent is Archon's: the
-/// orchestrator (no item), a stage agent, or a watched child.
+/// The item a new child works for, when its parent is Archon's: a stage agent,
+/// a watched child, or an orchestrator (no item), also one since replaced.
 async fn parent_item(
     ctx: &DaemonContext,
     parent: &AetherAgentId,
@@ -121,8 +138,8 @@ async fn parent_item(
     if let Some(owner) = fleet::owner(ctx, parent).await? {
         return Ok(Some(fleet::item_of(ctx, &owner).await?));
     }
-    let orchestrator = crate::supervisor::current_orchestrator(ctx).await?;
-    Ok((orchestrator.as_ref() == Some(parent)).then_some(None))
+    let orchestrator = crate::supervisor::is_own_orchestrator(ctx, parent).await?;
+    Ok(orchestrator.then_some(None))
 }
 
 /// Stage agents were checked when Archon spawned them; a replayed
@@ -138,30 +155,79 @@ async fn already_checked(ctx: &DaemonContext, agent: &AetherAgentId) -> Result<b
     Ok(owned && store.kv_get(&unchecked_key(agent))?.is_none())
 }
 
-/// Record the child as Archon's, pending its verdict.
+/// Record the child of `parent` as Archon's, pending its verdict. Returns how
+/// many delegations it is below a stage agent or the orchestrator.
 async fn adopt(
     ctx: &DaemonContext,
     agent: &AetherAgentId,
+    parent: &AetherAgentId,
     item: Option<&QueueItemId>,
-) -> Result<(), ArchonError> {
+) -> Result<u32, ArchonError> {
     let raw = serde_json::to_string(&item)?;
     let mut store = ctx.store.lock().await;
     if let Some(owned) = store.kv_get(&child_key(agent))? {
         assert_eq!(owned, raw, "a child works for one item");
     }
+    let depth = depth_of(&store, parent)?.saturating_add(1);
+    assert!(depth >= 1, "a delegated child is below its parent");
     store.kv_set(&child_key(agent), &raw)?;
-    store.kv_set(&unchecked_key(agent), "1")
+    store.kv_set(&depth_key(agent), &depth.to_string())?;
+    store.kv_set(&unchecked_key(agent), "1")?;
+    Ok(depth)
+}
+
+/// 0 for a stage agent or an orchestrator: neither is a watched child.
+fn depth_of(store: &Store, agent: &AetherAgentId) -> Result<u32, ArchonError> {
+    let key = depth_key(agent);
+    let Some(raw) = store.kv_get(&key)? else {
+        return Ok(0);
+    };
+    raw.parse()
+        .map_err(|e| ArchonError::Store(format!("kv {key} = {raw:?}: {e}")))
+}
+
+/// Why a child `depth` delegations down may not run, if it is too deep.
+fn depth_refusal(depth: u32, most: u32, helper: bool) -> Option<String> {
+    assert!(depth >= 1, "a watched child is below its top agent");
+    assert!(most >= 1, "validated with the config");
+    if depth <= most {
+        return None;
+    }
+    let top = if helper {
+        "the orchestrator"
+    } else {
+        "its stage agent"
+    };
+    Some(format!(
+        "it is {depth} delegations below {top}; `[limits] max_delegation_depth` allows {most} \
+         (an agent {most} down is delegated with `leaf: true`)"
+    ))
+}
+
+/// Why the child may not run: it breaks its model policy, or it is the
+/// orchestrator's helper (no `item`) placed inside a repository.
+async fn violation(
+    ctx: &DaemonContext,
+    agent: &AetherAgentId,
+    model: &ModelRef,
+    item: Option<&QueueItemId>,
+) -> Result<Option<String>, ArchonError> {
+    let Some(item) = item else {
+        return helper_violation(ctx, agent, model).await;
+    };
+    let policy = item_policy(ctx, item).await?;
+    let of_model = || model_refusal(&policy, model).map(|refusal| refusal.to_string());
+    if policy.max_effort.is_none() {
+        return Ok(of_model());
+    }
+    let Some(held) = held_by_aether(ctx, agent).await? else {
+        return Ok(of_model());
+    };
+    Ok(policy_refusal(&policy, model, &held).map(|refusal| refusal.to_string()))
 }
 
 /// Global policy narrowed by the item's repository, as for its stages.
-async fn effective_policy(
-    ctx: &DaemonContext,
-    item: Option<&QueueItemId>,
-) -> Result<ModelPolicy, ArchonError> {
-    let global = ctx.config.models.policy();
-    let Some(item) = item else {
-        return Ok(global);
-    };
+async fn item_policy(ctx: &DaemonContext, item: &QueueItemId) -> Result<ModelPolicy, ArchonError> {
     let repo = {
         let store = ctx.store.lock().await;
         match store.item(item)?.repo {
@@ -169,47 +235,78 @@ async fn effective_policy(
             None => None,
         }
     };
+    let global = ctx.config.models.policy();
     let Some(repo) = repo else {
         return Ok(global);
     };
     match RepoConfig::load(&repo.path) {
         Ok(config) => Ok(global.narrowed_by(&config.models.policy())),
-        // The dispatcher refuses such a repo's new work; keep watching with
-        // the global policy rather than stop watching.
+        // The dispatcher refuses such a repo's new work; keep watching
+        // without its narrowing rather than stop watching.
         Err(error) => {
-            tracing::warn!(repo = %repo.name, %error, "repo config unreadable; using global policy");
+            tracing::warn!(repo = %repo.name, %error, "repo config unreadable; its policy is not applied");
             Ok(global)
         }
     }
 }
 
-/// Why the child breaks `policy`, if it does. Effort is only in the
-/// agent's config, so it is fetched only when a cap exists.
-async fn violation(
+/// Why an orchestrator's helper may not run: its scope leads into a repository
+/// or worktree, or it breaks the policy as the repositories it reads narrow it.
+async fn helper_violation(
     ctx: &DaemonContext,
     agent: &AetherAgentId,
     model: &ModelRef,
-    policy: &ModelPolicy,
-) -> Result<Option<ArchonError>, ArchonError> {
-    let Some(cap) = policy.max_effort else {
-        return Ok(model_refusal(policy, model));
+) -> Result<Option<String>, ArchonError> {
+    let held = held_by_aether(ctx, agent).await?;
+    let roots = held.as_ref().map(scope_roots).unwrap_or_default();
+    let reach = mirror_reach(ctx, roots.clone()).await?;
+    let policy = mirror::helper_policy(ctx, &reach).await?;
+    let refusal = match &held {
+        Some(held) => policy_refusal(&policy, model, held),
+        None => model_refusal(&policy, model),
     };
-    let effort = match child_effort(ctx, agent).await? {
+    if let Some(refusal) = refusal {
+        return Ok(Some(format!(
+            "{refusal}. A helper follows the policy of each repository whose mirror its \
+             workspace holds, here {}; `workspace_root` of one mirror, or of `scratch`, \
+             narrows that",
+            reach.describe()
+        )));
+    }
+    placed_in_a_repository(ctx, roots).await
+}
+
+/// Which mirrors the scope `roots` read. No root (the agent is gone, or
+/// Aether names none) reads every mirror, as far as Archon can tell.
+async fn mirror_reach(ctx: &DaemonContext, roots: Vec<PathBuf>) -> Result<Reach, ArchonError> {
+    let workspace = ctx.paths.orchestrator_workspace.clone();
+    let git_dirs = mirror::git_dirs_root(&ctx.paths.data_dir);
+    tokio::task::spawn_blocking(move || mirror::reach(&workspace, &git_dirs, &roots))
+        .await
+        .map_err(|e| ArchonError::io("the mirror reach check", std::io::Error::other(e)))
+}
+
+/// Why the child's model or effort breaks `policy`, if either does.
+fn policy_refusal(policy: &ModelPolicy, model: &ModelRef, held: &Value) -> Option<ArchonError> {
+    let Some(cap) = policy.max_effort else {
+        return model_refusal(policy, model);
+    };
+    let effort = match child_effort(held) {
         ChildEffort::Known(effort) => effort,
-        ChildEffort::Unknown => return Ok(model_refusal(policy, model)),
+        ChildEffort::Unknown => return model_refusal(policy, model),
         // A cap the effort cannot be compared with is not met.
         ChildEffort::Unrecognised(raw) => {
             let refusal = ArchonError::Policy(format!(
                 "effort {raw:?} is not one Archon can compare with the configured maximum {cap}"
             ));
-            return Ok(model_refusal(policy, model).or(Some(refusal)));
+            return model_refusal(policy, model).or(Some(refusal));
         }
     };
     let choice = ModelChoice {
         model: model.clone(),
         effort,
     };
-    Ok(policy.check(&choice).err())
+    policy.check(&choice).err()
 }
 
 fn model_refusal(policy: &ModelPolicy, model: &ModelRef) -> Option<ArchonError> {
@@ -226,33 +323,100 @@ fn model_refusal(policy: &ModelPolicy, model: &ModelRef) -> Option<ArchonError> 
 #[derive(Debug, PartialEq)]
 enum ChildEffort {
     Known(Effort),
-    /// No effort in its config, or the agent is gone already (it ended, or
-    /// this is a replay after it was reaped): only its model is checked.
+    /// No effort in its config: only its model is checked.
     Unknown,
     Unrecognised(String),
 }
 
-async fn child_effort(
+/// The agent as Aether holds it. `None` when it is gone already (it ended,
+/// or this is a replay after it was reaped): only its model is checked.
+async fn held_by_aether(
     ctx: &DaemonContext,
     agent: &AetherAgentId,
-) -> Result<ChildEffort, ArchonError> {
+) -> Result<Option<Value>, ArchonError> {
     let client = ctx.aether.client()?;
     let command = Command::GetAgent { id: agent.clone() };
-    let data = match client.request(command, "agent").await {
-        Ok(data) => data,
+    match client.request(command, "agent").await {
+        Ok(held) => Ok(Some(held)),
         Err(ArchonError::NotFound(why)) => {
-            tracing::info!(%agent, %why, "child gone before its effort was read; checking its model only");
-            return Ok(ChildEffort::Unknown);
+            tracing::info!(%agent, %why, "child gone before Aether was asked about it; checking its model only");
+            Ok(None)
         }
-        Err(error) => return Err(error),
+        Err(error) => Err(error),
+    }
+}
+
+fn child_effort(held: &Value) -> ChildEffort {
+    let Some(raw) = held.pointer("/config/effort").and_then(Value::as_str) else {
+        return ChildEffort::Unknown;
     };
-    let Some(raw) = data.pointer("/config/effort").and_then(|v| v.as_str()) else {
-        return Ok(ChildEffort::Unknown);
-    };
-    Ok(match Effort::from_str(raw) {
+    match Effort::from_str(raw) {
         Ok(effort) => ChildEffort::Known(effort),
         Err(_) => ChildEffort::Unrecognised(raw.to_owned()),
-    })
+    }
+}
+
+/// The refusal of an orchestrator's helper (§4.4) whose workspace or allowed
+/// paths lead into a repository or worktree: about its place, not its model.
+/// Its mirrors are inside the orchestrator's workspace, which is its.
+async fn placed_in_a_repository(
+    ctx: &DaemonContext,
+    roots: Vec<PathBuf>,
+) -> Result<Option<String>, ArchonError> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let mut closed = vec![(
+        "the items' worktrees".to_owned(),
+        ctx.paths.worktrees.clone(),
+    )];
+    for repo in ctx.store.lock().await.repos()? {
+        closed.push((format!("repository `{}`", repo.name), repo.path));
+    }
+    let own = ctx.paths.orchestrator_workspace.clone();
+    let found = tokio::task::spawn_blocking(move || closed_place_holding(&roots, &own, &closed))
+        .await
+        .map_err(|e| ArchonError::io("the workspace check", std::io::Error::other(e)))?;
+    Ok(found.map(|(root, place)| {
+        format!(
+            "it was given {}, which is inside {place}; only a queued item's agents work \
+             there. A helper reads a repository in its mirror under `repos/`",
+            root.display()
+        )
+    }))
+}
+
+/// Every directory the agent's scope lets its tools act in.
+fn scope_roots(held: &Value) -> Vec<PathBuf> {
+    let path = |value: &Value| value.as_str().map(PathBuf::from);
+    let root = held.pointer("/scope/workspace_root").and_then(path);
+    let allowed = held.pointer("/scope/allowed_paths");
+    let allowed = allowed.and_then(Value::as_array).into_iter().flatten();
+    root.into_iter().chain(allowed.filter_map(path)).collect()
+}
+
+/// The first of `roots` that leads into a `closed` place, with its name. Links
+/// are followed; what stays inside `own`, the orchestrator's workspace, is its.
+fn closed_place_holding(
+    roots: &[PathBuf],
+    own: &Path,
+    closed: &[(String, PathBuf)],
+) -> Option<(PathBuf, String)> {
+    // A path that does not exist leads nowhere else: compared as written.
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let own = resolved(own);
+    let closed: Vec<(&String, PathBuf)> = closed.iter().map(|(n, p)| (n, resolved(p))).collect();
+    for root in roots {
+        assert!(root.is_absolute(), "Aether scopes are absolute: {root:?}");
+        let at = resolved(root);
+        if at.starts_with(&own) {
+            continue;
+        }
+        if let Some((name, _)) = closed.iter().find(|(_, place)| at.starts_with(place)) {
+            return Some((root.clone(), (*name).clone()));
+        }
+    }
+    None
 }
 
 async fn cancel_child(
@@ -260,7 +424,7 @@ async fn cancel_child(
     agent: &AetherAgentId,
     model: &ModelRef,
     item: Option<QueueItemId>,
-    refusal: &ArchonError,
+    refusal: &str,
 ) -> Result<(), ArchonError> {
     let client = ctx.aether.client()?;
     match client
@@ -379,6 +543,7 @@ async fn forget_child(ctx: &DaemonContext, agent: &AetherAgentId) -> Result<(), 
     store.kv_delete(&child_key(agent))?;
     store.kv_delete(&unchecked_key(agent))?;
     store.kv_delete(&cancelled_key(agent))?;
+    store.kv_delete(&depth_key(agent))?;
     store.kv_delete(&ended_key(agent))
 }
 

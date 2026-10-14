@@ -10,7 +10,10 @@ use archon_core::notify::{FeedEntry, Notification, NotificationKind};
 use archon_core::run::{PipelineRun, RunState, StageOutcome, StageRun, StageState, Verdict};
 use archon_pipeline::{EngineAction, SpawnPlan};
 
-use super::{FollowUp, RunTable, finish, gates, pages, recover, siblings, spawn, team};
+use super::{
+    FollowUp, RunTable, descendants, finish, gates, pages, recover, resume, ship, siblings, spawn,
+    team,
+};
 use crate::context::DaemonContext;
 use crate::disk::{self, FullDisk};
 use crate::resolve;
@@ -24,19 +27,26 @@ pub(super) async fn settle(
         let mut table = ctx.runs.lock().await;
         return settle_locked(ctx, &mut table, id, outcome).await;
     }
-    let (stage, run) = {
-        let _table = ctx.runs.lock().await;
+    let (stage, run, review, daemon_ships) = {
+        let table = ctx.runs.lock().await;
         let store = ctx.store.lock().await;
         let stage = store.stage_run(id)?;
         if stage.state.is_terminal() {
             return Ok(FollowUp::default());
         }
         let run = store.run(&stage.run)?;
-        (stage, run)
+        let driver = table.drivers.get(&run.id);
+        let review = super::review::Owed {
+            reviewers: driver.map_or(0, |d| d.reviewers_owed(&stage.stage_id)),
+            records_ship: driver.is_some_and(|d| d.records_ship(&stage.stage_id)),
+        };
+        let daemon_ships = driver.is_some_and(|d| d.ships_by_daemon());
+        (stage, run, review, daemon_ships)
     };
     // Leave the stage live until verification is persisted. If interrupted,
     // reconnect reconciliation reads the task outcome and verifies it again.
-    let outcome = super::ship::verify(ctx, &run, &stage, outcome).await?;
+    let outcome = ship::verify(ctx, &run, &stage, daemon_ships, outcome).await?;
+    let outcome = super::review::verify(ctx, &run, &stage, review, outcome).await?;
     let mut table = ctx.runs.lock().await;
     let (stage, run, all) = {
         let store = ctx.store.lock().await;
@@ -48,6 +58,14 @@ pub(super) async fn settle(
             return Ok(FollowUp::poke());
         }
         let all = store.stage_runs(&current_run.id)?;
+        assert_eq!(
+            current_stage.run, current_run.id,
+            "a stage settles into its own run"
+        );
+        assert!(
+            all.iter().any(|s| s.id == current_stage.id),
+            "the run lists the stage it settles"
+        );
         (current_stage, current_run, all)
     };
     // Verification failures are final stage outcomes, not infrastructure
@@ -95,16 +113,39 @@ async fn persist(
     outcome: StageOutcome,
 ) -> Result<FollowUp, ArchonError> {
     let settled = settled_stage(stage, outcome, archon_core::now());
-    ctx.store.lock().await.upsert_stage_run(&settled)?;
+    let (owes_stop, kept) = {
+        let mut store = ctx.store.lock().await;
+        let kept = resume::after_settle(&store, &settled)?;
+        let owes_stop = descendants::owe(&mut store, &settled)?;
+        store.upsert_stage_run(&settled)?;
+        (owes_stop, kept)
+    };
     table.spawn_errors.remove(&settled.id);
+    let mut follow = decide(ctx, table, run, &settled, all).await?;
+    follow.kept.extend(kept);
+    if owes_stop {
+        follow.descendant_stops.push(settled.id);
+    }
+    Ok(follow)
+}
+
+/// Feed a stored settle to the run's driver and apply what it decides.
+async fn decide(
+    ctx: &DaemonContext,
+    table: &mut RunTable,
+    run: PipelineRun,
+    settled: &StageRun,
+    all: &[StageRun],
+) -> Result<FollowUp, ArchonError> {
+    assert!(settled.state.is_terminal(), "the driver hears of settles");
     if run.state.is_terminal() {
         return Ok(FollowUp::poke());
     }
     let (actions, publish) = match table.drivers.get_mut(&run.id) {
         // A gate stage's page is published when its question is asked.
         Some(driver) => (
-            driver.on_stage_settled(&settled, all),
-            pages::lists_pages(&settled) && driver.gates().subject(&settled.stage_id).is_none(),
+            driver.on_stage_settled(settled, all),
+            pages::lists_pages(settled) && driver.gates().subject(&settled.stage_id).is_none(),
         ),
         None => {
             // A driver is missing only if an earlier rebuild failed; retry it
@@ -115,13 +156,17 @@ async fn persist(
     };
     let mut follow = apply(ctx, table, run, actions).await?;
     if publish {
-        follow.publish.push(settled.id);
+        follow.publish.push(settled.id.clone());
     }
     Ok(follow)
 }
 
 /// The terminal stage run for `outcome`.
-fn settled_stage(mut stage: StageRun, outcome: StageOutcome, now: Timestamp) -> StageRun {
+pub(super) fn settled_stage(
+    mut stage: StageRun,
+    outcome: StageOutcome,
+    now: Timestamp,
+) -> StageRun {
     assert!(
         !stage.state.is_terminal(),
         "stage {} settled twice",
@@ -137,7 +182,10 @@ fn settled_stage(mut stage: StageRun, outcome: StageOutcome, now: Timestamp) -> 
             stage.structured = structured;
             StageState::Completed
         }
-        StageOutcome::Failed { error, .. } => StageState::Failed { error },
+        StageOutcome::Failed { error, infra } => {
+            stage.infrastructure_failure = infra;
+            StageState::Failed { error }
+        }
         StageOutcome::Cancelled { reason } => {
             stage.summary = reason;
             StageState::Cancelled
@@ -247,9 +295,11 @@ async fn infra_retry(
         stage.stage_id, run.id,
     );
     progress(ctx, run, text).await?;
-    // Issued at once, or by the sweep once a disk hold ends.
+    // Issued at once, or by the sweep once a disk hold ends; in either
+    // case after what the failed agent delegated is stopped.
     Ok(Some(FollowUp {
         issue: vec![replacement],
+        descendant_stops: vec![stage.id.clone()],
         poke: kind == RetryKind::DiskFull,
         ..FollowUp::default()
     }))
@@ -293,6 +343,8 @@ async fn replace(
     };
     let per_item_cap = resolve::caps(ctx).await.budget_usd_per_item;
     let mut store = ctx.store.lock().await;
+    // Owed before the replacement exists, so it never starts beside them.
+    descendants::owe(&mut store, failed)?;
     let Some(id) = spawn::reserve_replacement(ctx, &mut store, failed, &plan, nth, per_item_cap)?
     else {
         return Ok(None);
@@ -477,6 +529,7 @@ async fn apply_decision(
                 wait = Some(awaited);
             }
             EngineAction::MergeTeam(plan) => return Ok(team::queue(table, &run, plan)),
+            EngineAction::Ship(plan) => return Ok(ship::queue(table, &run, plan)),
         }
     }
     if let Some(wait) = wait {
@@ -496,7 +549,8 @@ async fn apply_decision(
     Ok(FollowUp::poke())
 }
 
-/// A finish comes at most once, cancels never with a gate, a merge alone.
+/// A finish comes at most once, cancels never with a gate, and a team merge
+/// or a delivery alone.
 fn check_actions(actions: &[EngineAction]) {
     let finishes = actions
         .iter()
@@ -505,10 +559,6 @@ fn check_actions(actions: &[EngineAction]) {
     let cancels = actions
         .iter()
         .any(|a| matches!(a, EngineAction::CancelStage { .. }));
-    let merges = actions
-        .iter()
-        .filter(|a| matches!(a, EngineAction::MergeTeam(_)))
-        .count();
     let waits = actions
         .iter()
         .any(|a| matches!(a, EngineAction::AwaitOperator(_)));
@@ -517,9 +567,10 @@ fn check_actions(actions: &[EngineAction]) {
         !cancels || !waits,
         "stage cancels come with a finish or a team's next spawns"
     );
+    let alone = |a: &EngineAction| matches!(a, EngineAction::MergeTeam(_) | EngineAction::Ship(_));
     assert!(
-        merges == 0 || actions.len() == 1,
-        "a team merge comes alone"
+        !actions.iter().any(alone) || actions.len() == 1,
+        "a team merge or a delivery comes alone"
     );
 }
 

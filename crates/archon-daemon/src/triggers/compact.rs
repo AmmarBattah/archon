@@ -34,11 +34,34 @@ pub(super) struct Held {
     /// never too old.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pushed_at: Option<Timestamp>,
+    /// Routine news: it waits for the orchestrator's next turn instead of
+    /// waking it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
+    /// News that wakes the orchestrator only from then on; anything waking
+    /// it sooner carries this along.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_until: Option<Timestamp>,
 }
 
 impl Held {
+    /// News pushed at `now` that wakes the orchestrator, or `quiet` news.
+    pub fn new(event: TriggerEvent, now: Timestamp, quiet: bool) -> Self {
+        Self {
+            event,
+            pushed_at: Some(now),
+            quiet,
+            defer_until: None,
+        }
+    }
+
     fn is_old(&self, now: Timestamp) -> bool {
         self.pushed_at.is_some_and(|at| now - at > MAX_NEWS_AGE)
+    }
+
+    /// Whether this news wakes the orchestrator at `now`.
+    pub fn wakes(&self, now: Timestamp) -> bool {
+        !self.quiet && self.defer_until.is_none_or(|at| at <= now)
     }
 }
 
@@ -47,6 +70,8 @@ impl Held {
 pub(super) struct Facts {
     /// Current state by item; an item missing here was pruned.
     pub items: HashMap<QueueItemId, QueueState>,
+    /// What each item's last run cost by now, settlements included.
+    pub costs: HashMap<QueueItemId, f64>,
     /// Reports whose Lavish session is still open.
     pub open_reports: HashSet<ReportId>,
     /// Gate questions the operator has not answered yet.
@@ -76,6 +101,18 @@ impl Facts {
         Ok(facts)
     }
 
+    /// `event` telling the cost its item's run settled at since it finished:
+    /// a provider bills the last turns shortly after the run ends.
+    pub fn with_settled_cost(&self, mut event: TriggerEvent) -> TriggerEvent {
+        if let TriggerEvent::ItemFinished { item, cost_usd, .. } = &mut event
+            && let Some(settled) = self.costs.get(item)
+        {
+            assert!(settled.is_finite() && *settled >= 0.0, "a recorded cost");
+            *cost_usd = *settled;
+        }
+        event
+    }
+
     fn learn_item(&mut self, store: &Store, item: &QueueItemId) -> Result<(), ArchonError> {
         if self.items.contains_key(item) {
             return Ok(());
@@ -83,6 +120,13 @@ impl Facts {
         match store.item(item) {
             Ok(found) => {
                 assert_eq!(&found.id, item, "the store returns the item asked for");
+                if let Some(run) = store.runs_for_item(item)?.last() {
+                    let cost = match store.outcome(&run.id)? {
+                        Some(outcome) => outcome.cost_usd,
+                        None => store.spend_for_run(&run.id, true)?,
+                    };
+                    self.costs.insert(item.clone(), cost);
+                }
                 self.items.insert(found.id, found.state);
                 Ok(())
             }
@@ -125,6 +169,8 @@ pub(super) fn needs_compaction(held: &[Held], now: Timestamp) -> bool {
 /// folded into that one, so compacting twice never loses a count.
 pub(super) fn compact(held: Vec<Held>, facts: &Facts, now: Timestamp) -> Vec<Held> {
     assert!(!held.is_empty(), "only held news is compacted");
+    // A digest of news that would have woken the orchestrator wakes it too.
+    let (quiet, defer_until) = digest_wake(&held);
     let relevance = classify(&held, facts, now);
     assert_eq!(relevance.len(), held.len(), "one verdict per event");
     let pinned = relevance
@@ -150,9 +196,26 @@ pub(super) fn compact(held: Vec<Held>, facts: &Facts, now: Timestamp) -> Vec<Hel
     let mut events = vec![Held {
         event: digest(dropped),
         pushed_at: None,
+        quiet,
+        defer_until,
     }];
     events.extend(kept);
     events
+}
+
+/// When a digest of `held` wakes the orchestrator: never if all of it is
+/// quiet, else when the first of it would have.
+fn digest_wake(held: &[Held]) -> (bool, Option<Timestamp>) {
+    let waking: Vec<&Held> = held.iter().filter(|news| !news.quiet).collect();
+    if waking.is_empty() {
+        return (true, None);
+    }
+    if waking.iter().any(|news| news.defer_until.is_none()) {
+        return (false, None);
+    }
+    let first = waking.iter().filter_map(|news| news.defer_until).min();
+    assert!(first.is_some(), "deferred news has a time to wake at");
+    (false, first)
 }
 
 /// The events of `held` marked in `keep`, and a count by type of the rest,
@@ -209,7 +272,8 @@ fn classify(held: &[Held], facts: &Facts, now: Timestamp) -> Vec<Relevance> {
 /// item still sits in the state it reports; a retry supersedes it. One
 /// asked for on GitHub is pinned then, as its thread awaits the outcome. An
 /// `item_blocked` stays current while the item is still blocked. An earlier
-/// digest is folded into the new one.
+/// digest is folded into the new one. A `mirror` change is rare and says what
+/// the orchestrator reads is stale, so it is always kept.
 fn relevance_of(
     event: &TriggerEvent,
     facts: &Facts,
@@ -218,7 +282,8 @@ fn relevance_of(
     match event {
         TriggerEvent::OperatorAnswer { .. }
         | TriggerEvent::AgentMessage { .. }
-        | TriggerEvent::ChatAnswer { .. } => Relevance::Pinned,
+        | TriggerEvent::ChatAnswer { .. }
+        | TriggerEvent::Mirror { .. } => Relevance::Pinned,
         TriggerEvent::GateOpened { question, .. } => {
             match facts.open_gate_questions.contains(question) {
                 true => Relevance::Pinned,
@@ -273,10 +338,7 @@ mod tests {
     use super::*;
 
     fn at(event: TriggerEvent, pushed_at: Timestamp) -> Held {
-        Held {
-            event,
-            pushed_at: Some(pushed_at),
-        }
+        Held::new(event, pushed_at, false)
     }
 
     fn budget(scope: &str) -> TriggerEvent {
@@ -295,6 +357,7 @@ mod tests {
             summary: "s".into(),
             pr_url: None,
             cost_usd: 1.0,
+            lesson_hint: None,
             origin: None,
         }
     }
@@ -350,8 +413,8 @@ mod tests {
             .collect();
         assert!(!needs_compaction(&held, now));
         let legacy = Held {
-            event: budget("old"),
             pushed_at: None,
+            ..Held::new(budget("old"), now, false)
         };
         assert!(!needs_compaction(&[legacy], now), "no push time is not old");
         let old = at(budget("old"), now - MAX_NEWS_AGE - TimeDelta::seconds(1));
@@ -567,6 +630,44 @@ mod tests {
     }
 
     #[test]
+    fn a_digest_wakes_the_orchestrator_unless_all_its_news_was_quiet() {
+        let now = archon_core::now();
+        let routine = |n: usize| Held {
+            quiet: true,
+            ..at(budget(&n.to_string()), now)
+        };
+        let quiet: Vec<Held> = (0..MAX_BATCH_EVENTS + 2).map(routine).collect();
+        let held = compact(quiet.clone(), &Facts::default(), now);
+        assert!(held.iter().all(|news| news.quiet), "nothing here wakes");
+        let mut mixed = vec![at(budget("first"), now)];
+        mixed.extend(quiet);
+        let held = compact(mixed, &Facts::default(), now);
+        assert!(matches!(held[0].event, TriggerEvent::NewsDigest { .. }));
+        assert!(!held[0].quiet, "the dropped waking event still wakes");
+    }
+
+    #[test]
+    fn a_digest_of_deferred_news_comes_due_with_the_first_of_it() {
+        let now = archon_core::now();
+        let count = MAX_BATCH_EVENTS + 2;
+        let minutes = |n: usize| TimeDelta::minutes(i64::try_from(n).unwrap());
+        // The newest news comes due first.
+        let deferred = |n: usize| Held {
+            defer_until: Some(now + minutes(count - n)),
+            ..at(budget(&n.to_string()), now)
+        };
+        let held: Vec<Held> = (0..count).map(deferred).collect();
+        let held = compact(held, &Facts::default(), now);
+        assert!(matches!(held[0].event, TriggerEvent::NewsDigest { .. }));
+        assert!(!held[0].quiet, "deferred news wakes the orchestrator later");
+        assert_eq!(held[0].defer_until, Some(now + minutes(1)));
+        assert!(
+            held.iter().all(|news| !news.wakes(now)),
+            "none of it is due yet"
+        );
+    }
+
+    #[test]
     fn nothing_dropped_means_no_digest() {
         let now = archon_core::now();
         let held = vec![at(budget("daily"), now), at(answer(), now)];
@@ -588,5 +689,13 @@ mod tests {
         let back: Held = serde_json::from_value(legacy).unwrap();
         assert_eq!(back.pushed_at, None);
         assert_eq!(back.event, budget("daily"));
+        assert!(!back.quiet, "news saved before quiet news existed wakes");
+        let routine = Held {
+            quiet: true,
+            ..at(budget("daily"), now)
+        };
+        let raw = serde_json::to_value(&routine).unwrap();
+        assert_eq!(raw["quiet"], true);
+        assert_eq!(serde_json::from_value::<Held>(raw).unwrap(), routine);
     }
 }

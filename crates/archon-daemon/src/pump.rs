@@ -14,7 +14,9 @@ use std::time::Duration;
 use archon_aether::backend::task_outcome;
 use archon_aether::client::Endpoint;
 use archon_aether::{AetherClient, AetherEvent};
+use archon_core::aether_ids::AetherAgentId;
 use archon_core::error::ArchonError;
+use archon_core::id::QueueItemId;
 use archon_core::run::{StageOutcome, StageRun};
 use archon_queue::store::keys;
 use tokio::time::Instant;
@@ -31,6 +33,9 @@ pub const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 pub const ORCHESTRATOR_EVENT_TYPES: &[&str] = &[
     "agent.message",
     "agent.turn_completed",
+    // Whether the turn's wait ends by itself, so that the turn after it
+    // continues the same answer (see `ReplyTracker`).
+    "agent.waiting",
     "agent.started",
     "question.asked",
     "agent.failed",
@@ -43,6 +48,8 @@ pub const ORCHESTRATOR_EVENT_TYPES: &[&str] = &[
     "inbox.consumed",
     // Aether restarted the orchestrator into a new agent (`aether restart`).
     "agent.restarted",
+    // Its older context became a summary: the directives are stated again.
+    "compaction.completed",
 ];
 
 pub const FLEET_EVENT_TYPES: &[&str] = &[
@@ -53,9 +60,42 @@ pub const FLEET_EVENT_TYPES: &[&str] = &[
     "task.cancelled",
     "agent.failed",
     "agent.cancelled",
+    // A settled stage agent ended its turn: what it delegated is stopped (§6.3).
+    "agent.completed",
+    // A kept agent resumed for a fix answers by ending its turn (§6.7).
+    "agent.turn_completed",
     "agent.usage_updated",
     "question.asked",
 ];
+
+/// What the fleet's records say an agent other than the orchestrator is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FleetRole {
+    /// A stage agent of this item.
+    Stage(QueueItemId),
+    /// Delegated to by a stage agent of this item, at any depth.
+    StageChild(QueueItemId),
+    /// Delegated to by an orchestrator, at any depth.
+    OrchestratorChild,
+}
+
+/// The recorded role of `agent`; `None` for an agent Archon does not manage.
+pub(crate) async fn fleet_role(
+    ctx: &DaemonContext,
+    agent: &AetherAgentId,
+) -> Result<Option<FleetRole>, ArchonError> {
+    let Some(owner) = fleet::owner(ctx, agent).await? else {
+        return Ok(None);
+    };
+    Ok(Some(match owner {
+        fleet::Owner::Stage(stage) => {
+            FleetRole::Stage(ctx.store.lock().await.run(&stage.run)?.item)
+        }
+        fleet::Owner::StageAgent { item } => FleetRole::Stage(item),
+        fleet::Owner::Child { item: Some(item) } => FleetRole::StageChild(item),
+        fleet::Owner::Child { item: None } => FleetRole::OrchestratorChild,
+    }))
+}
 
 /// An outage shorter than this stays out of the operator's chat.
 const QUIET_OUTAGE: Duration = Duration::from_secs(30);
@@ -63,8 +103,8 @@ const QUIET_OUTAGE: Duration = Duration::from_secs(30);
 /// Runs until shutdown; never returns `Ok` early. Connection failures are
 /// retried with `BACKOFF_MIN..BACKOFF_MAX`; only a store failure is fatal.
 /// Also supervises the Lavish report polls, the orchestrator's deferred
-/// revivals, the `archon` MCP server's health and the GitHub watcher's
-/// target, which need an `Arc` context.
+/// revivals and owed sweeps, the `archon` MCP server's health and the
+/// GitHub watcher's target, which need an `Arc` context.
 pub async fn run(ctx: Arc<DaemonContext>, endpoint: Endpoint) -> Result<(), ArchonError> {
     let saved = ctx.store.lock().await.kv_get(REPLY_STATE_KEY)?;
     *ctx.replies.lock().await = feed::restore_replies(saved.as_deref())?;
@@ -72,6 +112,7 @@ pub async fn run(ctx: Arc<DaemonContext>, endpoint: Endpoint) -> Result<(), Arch
         link_loop(ctx.clone(), endpoint),
         reports::supervise(ctx.clone()),
         supervisor::revive_when_due(ctx.clone()),
+        supervisor::sweep_when_owed(ctx.clone()),
         supervisor::watch_mcp(ctx.clone()),
         github::watch_github(ctx.clone())
     )?;
@@ -90,6 +131,7 @@ async fn link_loop(ctx: Arc<DaemonContext>, endpoint: Endpoint) -> Result<(), Ar
                 backoff = BACKOFF_MIN;
                 ctx.aether.replace(Some(client.clone()))?;
                 supervisor::check_mcp_soon(&ctx);
+                supervisor::sweep_soon(&ctx);
                 github::check_github_soon(&ctx);
                 let served = session(&ctx, &client).await;
                 ctx.aether.replace(None)?;
@@ -99,13 +141,31 @@ async fn link_loop(ctx: Arc<DaemonContext>, endpoint: Endpoint) -> Result<(), Ar
                 outage = Outage::started();
             }
             Err(error) => {
-                tracing::warn!(%error, ?backoff, "cannot reach aetherd");
+                let absent = nothing_listens(&endpoint, &error);
+                outage.log(&error, absent, backoff);
                 outage.note(&ctx, &error).await?;
+                // No daemon is burdened by being asked again soon, and one
+                // that starts is found within a second.
+                if absent {
+                    backoff = BACKOFF_MIN;
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
             }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+}
+
+/// Whether `error` says no daemon holds the local socket at `endpoint`: it
+/// is missing, or left behind by an aetherd that has exited.
+fn nothing_listens(endpoint: &Endpoint, error: &ArchonError) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    let ArchonError::Io { cause, .. } = error else {
+        return false;
+    };
+    matches!(endpoint, Endpoint::Unix(_)) && matches!(cause.kind(), NotFound | ConnectionRefused)
 }
 
 /// Tracks one stretch without Aether so the operator hears about it once,
@@ -114,6 +174,8 @@ async fn link_loop(ctx: Arc<DaemonContext>, endpoint: Endpoint) -> Result<(), Ar
 struct Outage {
     since: Instant,
     announced: bool,
+    /// The log already says that nothing listens.
+    absence_logged: bool,
 }
 
 impl Outage {
@@ -121,7 +183,20 @@ impl Outage {
         Self {
             since: Instant::now(),
             announced: false,
+            absence_logged: false,
         }
+    }
+
+    /// Logs a failed connection. `absent` attempts repeat every second, so
+    /// only the first of a stretch is a warning.
+    fn log(&mut self, error: &ArchonError, absent: bool, backoff: Duration) {
+        if absent && self.absence_logged {
+            tracing::debug!(%error, "still nothing listens for aetherd");
+            return;
+        }
+        self.absence_logged = absent;
+        let retry = if absent { BACKOFF_MIN } else { backoff };
+        tracing::warn!(%error, ?retry, "cannot reach aetherd");
     }
 
     async fn note(&mut self, ctx: &DaemonContext, error: &ArchonError) -> Result<(), ArchonError> {
@@ -248,7 +323,7 @@ async fn reconcile_stage(
 /// so nothing will ever settle it: it fails as infrastructure.
 async fn settle_forgotten(
     ctx: &DaemonContext,
-    agent: &archon_core::aether_ids::AetherAgentId,
+    agent: &AetherAgentId,
     why: &str,
 ) -> Result<(), ArchonError> {
     tracing::warn!(%agent, %why, "Aether forgot a live stage; failing it");

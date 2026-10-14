@@ -239,7 +239,7 @@ fn item(state: QueueState, repo: Option<RepoId>, minute: i64) -> QueueItem {
     QueueItem {
         id: QueueItemId::new(),
         repo,
-        pipeline: "default-pr-review".into(),
+        pipeline: "direct".into(),
         title: "t".into(),
         brief: "b".into(),
         priority: Priority::Normal,
@@ -252,6 +252,7 @@ fn item(state: QueueState, repo: Option<RepoId>, minute: i64) -> QueueItem {
         autonomy: Default::default(),
         origin: None,
         fresh_retries: 0,
+        initiative: None,
         created_at: at,
         updated_at: at,
     }
@@ -283,6 +284,7 @@ fn succeeded(repo: &RepoId, branch: &str, minute: i64) -> ItemDetail {
         finished_at: Some(item.updated_at),
     };
     ItemDetail {
+        steers: Vec::new(),
         waiting_on: None,
         waiting_reason: None,
         item,
@@ -290,6 +292,8 @@ fn succeeded(repo: &RepoId, branch: &str, minute: i64) -> ItemDetail {
         stages: Vec::new(),
         spent_usd: 0.0,
         gates: Vec::new(),
+        delegations: Default::default(),
+        switched_to: None,
     }
 }
 
@@ -394,6 +398,7 @@ fn result_branches_follow_completion_order_per_repo() {
     ]
     .into();
     let failed = ItemDetail {
+        steers: Vec::new(),
         waiting_on: None,
         waiting_reason: None,
         item: item(
@@ -408,6 +413,8 @@ fn result_branches_follow_completion_order_per_repo() {
         stages: Vec::new(),
         spent_usd: 0.0,
         gates: Vec::new(),
+        delegations: Default::default(),
+        switched_to: None,
     };
     let details = [
         succeeded(&api, "archon/late", 5),

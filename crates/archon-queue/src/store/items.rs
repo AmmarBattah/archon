@@ -126,7 +126,7 @@ fn write_columns(conn: &Connection, item: &QueueItem) -> Result<(), ArchonError>
     let changed = conn
         .execute(
             "UPDATE items SET repo = ?2, pipeline = ?3, priority = ?4, state = ?5, tags = ?6,
-                              created_at = ?7, updated_at = ?8, data = ?9
+                              created_at = ?7, updated_at = ?8, data = ?9, initiative_id = ?10
              WHERE id = ?1",
             params![
                 item.id.as_str(),
@@ -138,6 +138,7 @@ fn write_columns(conn: &Connection, item: &QueueItem) -> Result<(), ArchonError>
                 ts(&item.created_at),
                 ts(&item.updated_at),
                 to_json(item, "queue item")?,
+                item.initiative.as_ref().map(|i| i.as_str()),
             ],
         )
         .ctx("write item")?;
@@ -224,32 +225,48 @@ pub(super) fn insert(
     key: Option<&str>,
     asked: &AutonomyPatch,
 ) -> Result<QueueItem, ArchonError> {
-    validate_new(item, key)?;
-    let request = request_value(item);
     let tx = write_tx(conn)?;
+    let stored = insert_in(&tx, item, key, asked)?;
+    tx.commit().ctx("commit item")?;
+    Ok(stored)
+}
+
+pub(super) fn insert_in(
+    tx: &Connection,
+    item: &QueueItem,
+    key: Option<&str>,
+    asked: &AutonomyPatch,
+) -> Result<QueueItem, ArchonError> {
+    validate_new(item, key)?;
+    assert_eq!(item.state, QueueState::Queued);
+    assert!(
+        !tx.is_autocommit(),
+        "item insertion belongs to a transaction"
+    );
+    let request = request_value(item);
     if let Some(key) = key
-        && let Some((first, stored)) = find_by_key(&tx, key)?
+        && let Some((first, stored)) = find_by_key(tx, key)?
     {
         let stored: serde_json::Value = from_json(&stored, "enqueue request")?;
         check_replay(key, &first, &stored, request, asked)?;
-        return load(&tx, &first);
+        return load(tx, &first);
     }
-    if exists(&tx, &item.id)? {
+    if exists(tx, &item.id)? {
         return Err(ArchonError::Invalid(format!(
             "queue item {} already exists",
             item.id
         )));
     }
     if let Some(repo) = &item.repo
-        && !repos::exists(&tx, repo)?
+        && !repos::exists(tx, repo)?
     {
         return Err(ArchonError::NotFound(format!("repository {repo}")));
     }
-    check_dependencies(&tx, &item.id, &item.dependencies)?;
+    check_dependencies(tx, &item.id, &item.dependencies)?;
     tx.execute(
         "INSERT INTO items (id, repo, pipeline, priority, state, tags, idempotency_key,
-                            request, created_at, updated_at, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                            request, created_at, updated_at, data, initiative_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             item.id.as_str(),
             item.repo.as_ref().map(|r| r.as_str()),
@@ -262,11 +279,11 @@ pub(super) fn insert(
             ts(&item.created_at),
             ts(&item.updated_at),
             to_json(item, "queue item")?,
+            item.initiative.as_ref().map(|i| i.as_str()),
         ],
     )
     .ctx("insert item")?;
-    replace_deps(&tx, item)?;
-    tx.commit().ctx("commit item")?;
+    replace_deps(tx, item)?;
     Ok(item.clone())
 }
 
@@ -356,6 +373,11 @@ pub(super) fn transition_in(
     debug_assert!(before.can_transition_to(&item.state));
     check_run_refs(tx, id, &item.state)?;
     write_columns(tx, &item)?;
+    if let QueueState::Succeeded { run, .. } = &before
+        && item.state == QueueState::Queued
+    {
+        super::outcomes::correct(tx, run, archon_core::outcome::Correction::RetryAfterDone)?;
+    }
     Ok(item)
 }
 
@@ -372,7 +394,8 @@ pub(super) fn update(conn: &mut Connection, item: &QueueItem) -> Result<(), Arch
             item.state.kind()
         )));
     }
-    if stored.repo != item.repo
+    if stored.initiative != item.initiative
+        || stored.repo != item.repo
         || stored.pipeline != item.pipeline
         || stored.created_at != item.created_at
     {

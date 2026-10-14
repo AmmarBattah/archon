@@ -15,6 +15,7 @@ use archon_core::protocol::{
     Request, ServerFrame, Welcome,
 };
 use archon_core::queue::{QueueItem, QueueState};
+use archon_core::steer::{SteerRecord, SteeredBy};
 use common::{Env, git_repo, start_daemon, wait_for_exit};
 use serde_json::Value;
 
@@ -171,6 +172,7 @@ impl Canned {
             autonomy: archon_core::autonomy::Autonomy::default(),
             origin: None,
             fresh_retries: 0,
+            initiative: None,
             state: QueueState::Queued,
             created_at: now,
             updated_at: now,
@@ -215,11 +217,18 @@ impl Canned {
                     pr_url: None,
                     waiting_on: self.waiting_on.clone(),
                     waiting_reason: self.waiting_reason.clone(),
+                    switched_to: None,
                 }])
             }
             Request::Say { .. } | Request::Answer { .. } => Reply::Ok,
             Request::ListQuestions { .. } => Reply::Questions(vec![self.question.clone()]),
             Request::GetItem { .. } => Reply::ItemDetail(Box::new(ItemDetail {
+                steers: vec![SteerRecord {
+                    at: self.item.created_at,
+                    by: SteeredBy::Operator,
+                    what: "amended the brief".into(),
+                    note: Some("Use the v2 client.".into()),
+                }],
                 waiting_on: self.waiting_on.clone(),
                 waiting_reason: self.waiting_reason.clone(),
                 item: self.item.clone(),
@@ -227,8 +236,10 @@ impl Canned {
                 stages: vec![],
                 spent_usd: 0.0,
                 gates: vec![],
+                delegations: Default::default(),
+                switched_to: None,
             })),
-            Request::CancelItem { .. } | Request::RetryItem { .. } => {
+            Request::CancelItem { .. } | Request::RetryItem { .. } | Request::SteerItem { .. } => {
                 Reply::Item(self.item.clone())
             }
             Request::OrchestratorRestart => Reply::Orchestrator(OrchestratorInfo {
@@ -287,6 +298,17 @@ fn orchestrator_and_item_commands_print_json() {
     for verb in ["cancel", "retry"] {
         assert_eq!(json(&env, &["queue", verb, &item])["id"], item, "{verb}");
     }
+    let steer = ["queue", "steer", &item, "--note", "Use the v2 client."];
+    assert_eq!(json(&env, &steer)["id"], item);
+    let said = String::from_utf8(env.run(&steer).stdout).unwrap();
+    assert_eq!(said, format!("Steered {item}: amended the brief.\n"));
+    let shown = String::from_utf8(env.run(&["queue", "show", &item]).stdout).unwrap();
+    assert!(
+        shown.contains(" by operator: amended the brief\n  note: Use the v2 client.\n"),
+        "{shown}"
+    );
+    let empty = env.command(&["queue", "steer", &item]).output().unwrap();
+    assert_eq!(empty.status.code(), Some(1), "a steer changes something");
     let restarted = json(&env, &["orchestrator", "restart"]);
     assert_eq!(restarted["agent"], "agt_fake", "{restarted}");
 }
@@ -317,6 +339,39 @@ fn json_errors_keep_codes_messages_and_exit_status() {
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("archon: "));
     common::stop_daemon(&env, daemon);
+}
+
+#[test]
+fn a_command_line_that_does_not_parse_is_an_envelope_under_json() {
+    let env = Env::new();
+    let cases: [&[&str]; 4] = [
+        &["--json", "queue", "steer", "qi_x", "--budget-usd", "-1"],
+        &["queue", "steer", "qi_x", "--budget-usd", "-1", "--json"],
+        &["--json", "no-such-command"],
+        &["--json", "initiatives", "update", "ini_x"],
+    ];
+    for args in cases {
+        let out = env.command(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        let value = parse(args, &out.stdout);
+        assert_eq!(value["error"]["code"], "invalid_argument", "{value}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            !message.is_empty() && !message.starts_with("error:"),
+            "{message}"
+        );
+        assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
+    }
+    let plain = env
+        .command(&["queue", "steer", "qi_x", "--budget-usd", "-1"])
+        .output()
+        .unwrap();
+    assert_eq!(plain.status.code(), Some(2));
+    assert!(plain.stdout.is_empty(), "{plain:?}");
+    assert!(String::from_utf8_lossy(&plain.stderr).starts_with("error: "));
+    let help = env.command(&["--json", "--help"]).output().unwrap();
+    assert!(help.status.success(), "help is still help: {help:?}");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
 }
 
 #[test]
@@ -354,7 +409,7 @@ fn caller_errors_have_typed_json_categories() {
             &["pause", "--hard", "--pipeline", "ask"],
             "invalid_argument",
         ),
-        (&["repo", "set", "missing"], "invalid_argument"),
+        (&["repo", "set", "missing"], "not_found"),
         (&["pipelines", "list", "--repo", "missing"], "not_found"),
         (&["setup", "--resync"], "invalid_argument"),
         (&["daemon", "stop", "--aether"], "invalid_argument"),
@@ -401,6 +456,7 @@ fn queue_and_status_views_put_the_current_operator_wait_first() {
         pr_url: None,
         waiting_on: canned.waiting_on.clone(),
         waiting_reason: None,
+        switched_to: None,
     }];
     canned.status = Some(status);
     let id = canned.item.id.to_string();
@@ -490,6 +546,7 @@ fn queued_waiting_reason_is_visible_in_queue_and_status_text_and_json() {
         pr_url: None,
         waiting_on: None,
         waiting_reason: canned.waiting_reason.clone(),
+        switched_to: None,
     }];
     canned.status = Some(status);
     let id = canned.item.id.to_string();

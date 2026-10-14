@@ -11,6 +11,7 @@ fn archon(home: &Path, args: &[&str]) -> Output {
         // Nothing listens here, so nothing can reach a real daemon.
         .env("ARCHON_SOCKET", home.join("archond.sock"))
         .env("NO_COLOR", "1")
+        .env_remove("RUST_LOG")
         .output()
         .expect("running the archon binary")
 }
@@ -45,6 +46,23 @@ fn a_broken_user_pipeline_fails_the_check() {
     );
 }
 
+/// The problem is said once, as a line of the command's own output: no log
+/// line of the loader's is printed beside it.
+#[test]
+fn a_broken_pipeline_is_reported_in_the_output_and_not_as_a_log_line() {
+    let home = tempfile::tempdir().unwrap();
+    let broken = home.path().join("config/pipelines/broken");
+    write(&broken.join("pipeline.toml"), "this is = not [valid toml");
+    let reported = format!("broken broken (user) at {}: ", broken.display());
+    for command in ["check", "list"] {
+        let out = archon(home.path(), &["pipelines", command]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout.matches(&reported).count(), 1, "{command}: {stdout}");
+        assert_eq!(stderr, "", "{command} logged beside its output");
+    }
+}
+
 #[test]
 fn a_broken_repo_pipeline_fails_the_check_for_that_repo() {
     let home = tempfile::tempdir().unwrap();
@@ -76,4 +94,33 @@ fn a_broken_repo_pipeline_fails_the_check_for_that_repo() {
     );
     let listing: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(listing["problems"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn missing_proposal_is_not_found_and_names_its_path() {
+    let home = tempfile::tempdir().unwrap();
+    let out = archon(home.path(), &["--json", "pipelines", "accept", "missing"]);
+    assert!(!out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("not_found"), "{text}");
+    assert!(text.contains("missing.proposed"), "{text}");
+}
+
+#[test]
+fn learning_empty_states_and_proposals_do_not_start_a_daemon() {
+    let home = tempfile::tempdir().unwrap();
+    for (args, expected) in [
+        (vec!["lessons"], "No lessons match this selection."),
+        (vec!["pipelines", "proposals"], "No pipeline proposals."),
+    ] {
+        let out = archon(home.path(), &args);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected);
+        assert!(!home.path().join("archond.sock").exists());
+        assert!(!home.path().join("data").exists());
+    }
 }

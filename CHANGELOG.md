@@ -1,5 +1,331 @@
 # Changelog
 
+## 1.1.0
+
+Released 2026-10-14.
+
+Work needs fewer agents and fewer tokens, and you can change it while it
+runs. `archond` now pushes and opens the pull request itself. The
+orchestrator answers code questions from its own copy of your repositories
+and delegates research to helpers. `archon queue steer` changes a running
+item without restarting it. Dependent changes stack, a change across
+repositories is one initiative, and `archond` learns which models pass for
+each stage.
+
+### Upgrading
+
+The store migration is one-way: once 1.1.0's `archond` has started, a 1.0
+`archond` refuses the store. Back it up first:
+
+1. `archon daemon stop`.
+2. Copy `archon.db` from the data directory (`~/.local/share/archon` by
+   default) to a name of your own.
+3. `archon update`. It also says when your Aether is too old (`aether
+   update`).
+4. `archon setup`. With Archon's own Aether instance, the first `archon`
+   command repairs the `archon` MCP server and restarts that `aetherd` once.
+   Shared mode: `archon setup` registers the server when it is missing and
+   says what an existing one lacks; add `send_caller_meta = true` to it in
+   your Aether config and restart your `aetherd`.
+5. `archon aether mcp refresh archon` (shared mode: `aether mcp refresh
+   archon`), so Aether lists 1.1.0's tools, then `archon orchestrator
+   restart`. `archon doctor` reports a registration that still lists other
+   tools than this `archon` serves, and the refresh that fixes it.
+
+Eight built-in pipelines are gone (see "Breaking changes"). An item queued
+on one fails when it would start, naming the pipeline to use: let such items
+start before you update, or enqueue them again on `direct` or `adaptive`.
+Point a repository's `default_pipeline` that names one at its replacement.
+
+To go back to 1.0.1, see "Back up before a release that migrates the store"
+in [docs/install.md](docs/install.md): stop `archond`, install 1.0.1 and put
+the copy back. What 1.1.0 recorded since is lost. A running orchestrator
+keeps the prompt and tools it started with until `archon orchestrator
+restart`: until then it cannot delegate, steer, stack or use `adaptive`,
+`direct` or its mirrors.
+
+### Breaking changes
+
+- **Eight built-in pipelines are folded into `direct` and `adaptive`.**
+  `quick-pr`, `default-pr-review` and `strict-pr-review` are `direct` at
+  review level `none`, `standard` or `strict`; `bugfix`, `docs`,
+  `test-coverage` and `dependency-upgrade` are `direct`; and `team-pr` is
+  an example to copy, `docs/examples/pipelines/team-pr`. Naming one is
+  refused with its replacement unless a pipeline of yours has that name. A
+  run already going finishes on the pipeline it started with. An item that
+  names no pipeline runs `direct`, at the level it asks or your default
+  review level, so with no knob set it is reviewed once, as on
+  `default-pr-review`; the review level no longer picks a pipeline.
+  `refactor`, `performance` and the pipelines that do not ship stay.
+- `archon` and `archond` speak protocol 7 (1.0.1 spoke 5), and a client and
+  a daemon of different protocols refuse each other ("upgrade the older
+  one"): restart `archond` after updating.
+- The built-in pipelines have no `ship` stage. A model plan, `--goto` or
+  `--remove` naming `ship` for one of them is refused. Items queued or
+  retried from 1.0.1 drop their `ship` model plan entry by themselves. A
+  pipeline of your own that ends in a `kind = "ship"` stage keeps working.
+- `[limits] max_parallel_agents` defaults to 8, up from 3. A config that
+  sets it keeps its value.
+- `archond` needs git 2.38 or later for the git it runs itself; `archon
+  doctor` checks it.
+- A cancelled item no longer wakes the orchestrator: it reads the
+  cancellation at its next turn. Failures, blockers, successes, items
+  tagged `notify` and GitHub requests still wake it, as in 1.0.1, but a
+  routine success while other items are queued or running waits, up to 5
+  minutes, for the last of them, so one turn reports them together. The feed
+  shows each outcome at once. The new `[orchestrator] wake_on_success =
+  false` leaves routine successes for its next turn.
+- In dedicated mode `archon daemon stop` stops Archon's own `aetherd` after
+  `archond`; `--keep-aether` stops only `archond`. `--aether` and `--all`
+  still work, and are still refused in shared mode.
+
+### Shipping and review
+
+- **`archond` ships; no agent does.** One stage, usually the last that
+  commits, returns a ship record (`commit`, `tree`, `checks`, the pull
+  request's `title` and `body`). Once every stage has passed, `archond`
+  checks the worktree (the run's own branch, clean, exactly the recorded
+  tree, every new commit under the repository's git identity), pushes
+  without forcing and without hooks, and opens or reuses the pull request
+  with `gh`. That saves about 40 seconds and 166,000 input tokens per item.
+  `local` mode runs the same checks and pushes nothing, and `merge = auto`
+  asks GitHub to merge once checks allow. An item succeeds once its pull
+  request is open: `archond` does not wait for CI or repair a failing check.
+- **No program a repository or an agent configures runs as `archond`.**
+  Delivery, restacking and worktree removal read files only through
+  `archond`'s own git directory under `<data>/daemon-git`, over the
+  repository's objects, with no hook, filter, merge driver, fsmonitor,
+  `core.sshCommand` or credential helper from the repository or a
+  `.gitattributes`. Push and fetch use your global git config and
+  `GIT_SSH_COMMAND`, and every git command has a time limit.
+- New worktrees and read-only snapshots are checked out through that same
+  git directory, so no hook and no filter that a repository or an agent
+  configures runs as `archond`. Your own global filters, such as Git LFS,
+  still apply.
+- Untracked caches (`__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`,
+  `.ruff_cache`, `node_modules`, a top-level `target`, and
+  `worktrees.cache_dirs`) no longer keep a finished worktree from being
+  removed. Untracked source still does. A work stage is told to commit no
+  build cache either: parallel branches that each committed `__pycache__`
+  conflicted.
+- The push sends the commit the checks proved
+  (`<commit>:refs/heads/<branch>`), not whatever the branch holds by then,
+  and a stacked run missing its parent's commit is refused before anything
+  leaves. The git identity commits must carry is recorded at `archon repo
+  add`, and again by `archon repo set <repo>`, which with no option
+  records only that; a repository added before 1.1.0 has it recorded at
+  its first delivery. A `user.email` an agent sets later does not count.
+- A refused delivery fails the item as `stage ship: <what to change>`.
+  What only you can fix (no `origin`, a lapsed `gh` login, a branch rule)
+  is a blocker. Network and GitHub failures are retried five times, and the
+  retries survive a daemon restart. Delivery survives a restart and a retry
+  without opening a second pull request.
+- Auto-merge is owed until GitHub takes it: a failure is retried for about
+  two hours, and a refusal is one blocker saying the pull request is
+  delivered but will not merge by itself. The feed says "auto-merge is on",
+  never that a delivered pull request merged.
+- Your own pipeline opts in with `[pipeline.ship] stage = "<id>"`;
+  `docs/examples/pipelines/bugfix-tdd` shows how.
+- **New built-in `direct`**: one agent implements a change one author can
+  make and check, whatever its size, runs the checks it affects and
+  commits. It is the cheapest pipeline that ships, and the one an item that
+  names no pipeline runs. There are 10 built-ins.
+- **New built-in `adaptive`**: one lead sizes the work, delegates the parts
+  worth splitting, integrates them, and has the integrated diff reviewed by
+  fresh reviewers at the item's review level.
+- **The review level belongs to the item.** `none`, `standard` or `strict`
+  is no, one or three independent reviewers in `adaptive` and `direct`,
+  within your autonomy ceiling. A pipeline whose review stages are its own
+  refuses another level.
+- **A review pass is checked, not believed.** The lead names each
+  reviewer's agent id, and each reviewer returns a structured verdict on
+  the commit it read. Archon accepts only completed direct children, and
+  every commit it delivers must have been read by enough passing
+  reviewers. When the reviewed stage also writes the ship record, the
+  commit they passed must hold the tree that ships. A failed verdict
+  stands until a later pass reads past it, and a fix can be reviewed as a
+  delta, also when the review of an earlier fix failed. A review of an amended commit supersedes the verdict on the commit
+  it replaced, instead of failing the run.
+- **A model plan is optional.** A stage left out gets the learned choice,
+  else the orchestrator's model where your policy allows it, else the first
+  allowed model. The item shows the filled plan.
+- **A stage can hand a task back** with `ESCALATE:` (too large or risky for
+  its pipeline, with a recommendation) or `BLOCKED:` (what it needs from
+  you). Nothing ships, and the orchestrator moves the item to a pipeline
+  that fits.
+- Reviewers and verifiers rely on a full-suite result only when it names
+  the tree they review (`git rev-parse HEAD^{tree}`), and otherwise run the
+  suite themselves.
+- The contracts of all built-in stages together are 15 % shorter, with
+  every safety rule kept.
+
+### Orchestrator
+
+- It answers, delegates or queues, taking the cheapest that fits. A
+  question about your code needs no item: it reads a **mirror**, a local
+  clone of each registered repository at its base commit, with no remote,
+  no hooks and a hook that refuses any push. Its git directory is under
+  `<data>/mirror-git`, out of a helper's reach, so nothing a helper writes
+  runs as `archond`. A finished item refreshes its own repository's mirror,
+  and your next message refreshes them all. A refresh that fails is said
+  once, and holds nothing up.
+- Wide reads, research and second opinions go to **helpers** through
+  Aether's `delegate`. A helper works in a mirror or a scratch directory.
+  It is cancelled if it lands in a registered repository or a worktree,
+  or runs a model `[models]` refuses. Helpers count toward budgets, not caps.
+  A helper may delegate once more. Every change to a repository is still an
+  item, under the pipeline's gates, the caps and the autonomy ceiling.
+- It is woken for a failure, a blocker, a success, an item tagged
+  `notify`, a GitHub request and a finished initiative. Other news comes
+  with its next turn, and a routine success waits for the work still
+  running. Urgent news (your answer, a blocker, an opened gate, report
+  feedback, an escalation, a budget hold) is delivered at once instead of
+  waiting out the coalescing window. A message of yours reaches it after
+  the news held for it: `archond` delivers that news first, waiting up to
+  10 seconds.
+- It sends any change one author can make and check to `direct`, whatever
+  its size, and sets the review level by risk: none when the change's own
+  tests prove it. It queues a clear change without reading the code first,
+  and relays a success in a line, without checking again what `archond`
+  checked.
+- `list_pipelines` shows a line per pipeline, and a pipeline named in the
+  call in full: a few hundred bytes instead of several kilobytes.
+- Its prompt is 12 KiB, down from 19, and its tool descriptions are 18.0 kB,
+  down from 30.1: about 5,000 fewer tokens in every context. Directives are
+  sent in full once, then only as changes.
+- Only the current orchestrator may call Archon tools that change
+  something. A replaced orchestrator, a helper or a stage agent is refused.
+  The helpers of a replaced orchestrator are cancelled.
+- A stage agent's `message_orchestrator` is written to the feed whole, and
+  an escalation shows in `archon chat` as a blocker.
+
+### Steering and the fix loop
+
+- `archon queue steer <id>` and `steer_item` change an item without
+  cancelling it. `--note` amends the brief for every agent working on it;
+  `--model`, `--effort`, `--budget-usd` and `--extend` change the running
+  stage; `--abort`, `--remove`, `--insert` and `--switch` change the stages
+  still to come. The model policy, the budgets and the required review hold
+  as for an enqueue. While a run delivers, only a note is taken, and no
+  steer may leave a run with nothing to ship. A steered run survives a
+  daemon restart.
+- A failed item given `--insert` or `--switch` is queued again on its own
+  branch, with what it committed. `archon queue show`, `queue list`,
+  `status` and `get_item` name the pipeline a steer switched an item to.
+- Every steer is kept with the item: who made it, when and what it
+  changed, including a review level it raised or lowered. A steer is not a
+  verdict on the work: learning does not count it against a model.
+- The implementer is kept through its fix loop: it waits while the review
+  runs and then gets the findings, with its context intact, and the fix
+  attempt's own budget on top of what it already spent. A fix whose final
+  message leaves out the ship record is asked for it once before the stage
+  fails. Reviewers stay fresh. A stage's prompt carries `## Handoff from
+  earlier stages`.
+
+### Stacked changes and initiatives
+
+- An item that `depends_on` an unmerged item of its repository is stacked
+  on it: its branch forks from the parent's, its pull request targets the
+  parent's branch, and its reviewer sees the diff from that base. Once a
+  parent merges, `archond` retargets the child and merges forward, never
+  force-pushing. A conflict queues a fix item, which never runs beside its
+  item. Restacking merges in `archond`'s own git directory and writes
+  nothing on a conflict. Only a dependency that shipped is stacked on.
+- GitHub is asked once per repository per maintenance pass, and a merged or
+  closed pull request is not asked about again. A stack or initiative whose
+  maintenance fails is its own blocker, told once, and no longer stops the
+  others.
+- A change across repositories is one **initiative**: `enqueue_initiative`
+  creates all its members or none, with a shared contract of up to 2 KiB,
+  and `update_initiative` appends to the contract or replaces it; running
+  members get the whole new text. An atomic initiative opens draft pull
+  requests and readies them together once every member passed. It never
+  merges them: you merge the set. A failed member fails the initiative and
+  holds its queued members. Members build at once against the contract
+  unless one waits (`after`) for another's code, and `initiative_finished`
+  carries each member's outcome, so no member needs reading.
+- `archon initiatives` lists them, `create <file>` starts one from a JSON or
+  TOML file, and `update <id> --append-file` or `--contract-file` extends
+  or replaces its contract. `show`, `update`, `cancel` and `retry` take an
+  `ini_…` id or its start, as item commands do.
+
+### Learning
+
+- `archond` records every finished run's outcome, cost, wall time, diff
+  size and corrections: a retry, a rejected gate, a correction you send as
+  `correction {"item":"qi_…","stage":"…","cause":"quality","reason":"…"}`
+  and, for 14 days, a pull request review that requests changes or a close
+  without merge. Only a `quality` correction counts against the stage it
+  names: steers, scope, effort, infrastructure and budget do not. A stage
+  whose review Archon refused counts as no pass.
+- Learning never holds up a run. It happens after the run finished; a gap
+  is filled by a recurring reconciliation, and a run whose record cannot be
+  read is skipped with a marker. Costs come from the spend ledger, so they
+  include what the provider settles after the run ends, and a stage steered
+  to another model is recorded per model.
+- A stage left out of a model plan gets the cheapest allowed choice whose
+  pass rate is, with confidence, close to the best's, from runs of the same
+  repository, pipeline revision, review level, task class (`task:<class>`)
+  and diff size (`diff:small`, `medium` or `large`). Up to 10 % of items try
+  another ready, allowed model, one with no history included; one clearly
+  worse over five runs is not tried. A plan you wrote is never changed.
+- `archon lessons` records, lists, edits, pins, retracts and accepts short
+  lessons. A run's agents get at most six, quoted as untrusted advice. A
+  lesson the orchestrator records names its source item, stays in that
+  item's repository, and is proposed, with low weight, until a clean run
+  confirms it or you accept it. Confidence decays from a lesson's last use,
+  so age alone never retracts one that wins. Read-only `lessons` commands
+  work with the daemon stopped.
+- Every 20 outcomes of a repository queue a $1 errand that proposes lessons
+  and pipelines: one per repository at a time, and at most $3 a day in all
+  (`distill_daily_budget_usd`). History from before the update informs
+  routing but is never distilled. `archon pipelines proposals` shows a
+  proposed pipeline before `archon pipelines accept`.
+- `[learning]` holds `enabled`, `distill_every`, `distill_daily_budget_usd`
+  and `explore_rate`.
+
+### Pipelines
+
+- `allow_delegation = true` lets a stage agent delegate under `tools =
+  guarded`. A delegating agent gets a `## Delegation` section: leaf children
+  only, isolated workspaces for editing, the model policy, and the rules
+  each child must be given. When it ends, Archon stops what it left running
+  before the next stage starts.
+- No stage agent sees Aether's schedule tools.
+- `[pipeline.review]` declares the review a work stage holds.
+
+### Speed and cost
+
+- Independent runs start, spawn and ship in parallel, up to 8 at a time.
+  A slow Aether call or `git push` holds back only its own run or
+  repository.
+- A usage update runs no dispatch pass unless a budget is set, and an early
+  stage event is settled when its spawn is recorded.
+- A stage's cost includes the agents it delegated to, shown per agent in
+  `archon queue show`. A turn is charged what the provider billed instead
+  of the higher of that and the list price. A stage resumed on a kept agent
+  is charged only what that agent and its children spent during that
+  attempt, not their earlier attempts again.
+
+### Setup
+
+- `archon setup` writes a `config.toml` with every key commented out when
+  there is none.
+- `archon doctor` warns about a pre-1.0 `archon.toml`, which is still not
+  read, and reports an `archon` MCP server whose tools differ from the ones
+  this `archon` serves, with the refresh that fixes it.
+- `archon daemon stop --aether` waits until Archon's `aetherd` is gone.
+- A detached start appends to the daemon log beside the socket
+  (`archond.log`) instead of truncating it, after a line marking the start.
+  Past 16 MiB the log moves to `archond.log.1` first. A failed autostart
+  shows only that start's part.
+- Under `--json`, a command line that does not parse prints the JSON error
+  envelope (`invalid_argument`, exit 2) instead of clap's text.
+- Limits that were fixed are now `[limits]` keys with the old values as
+  defaults: `max_delegation_depth` (2), `max_agent_messages` (20),
+  `initiative_members` (16) and `initiative_contract_bytes` (2048). Each
+  refusal names its key.
+
 ## 1.0.1
 
 Gates and questions can now be answered in the orchestrator's chat, so

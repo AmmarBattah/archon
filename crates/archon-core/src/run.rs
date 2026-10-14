@@ -87,8 +87,19 @@ impl StageOutcome {
     /// The prefix a stage uses in `fail_task` to escalate to the operator.
     pub const BLOCKED_PREFIX: &'static str = "BLOCKED:";
 
+    /// The prefix a stage uses in `fail_task` to hand its item back to the
+    /// orchestrator: the work needs another shape than this run has.
+    pub const ESCALATE_PREFIX: &'static str = "ESCALATE:";
+
     pub fn is_operator_blocker(&self) -> bool {
         matches!(self, Self::Failed { error, .. } if error.trim_start().starts_with(Self::BLOCKED_PREFIX))
+    }
+
+    /// Whether `error` ends its run at once: an operator blocker or an
+    /// escalation, neither of which a fix loop or a retry can resolve.
+    pub fn ends_run(error: &str) -> bool {
+        let error = error.trim_start();
+        error.starts_with(Self::BLOCKED_PREFIX) || error.starts_with(Self::ESCALATE_PREFIX)
     }
 }
 
@@ -110,6 +121,10 @@ pub struct StageRun {
     /// 0-based slot within a fan-out stage; 0 for single-agent stages.
     pub fan_index: u32,
     pub choice: ModelChoice,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_segments: Vec<ModelSegment>,
+    #[serde(default)]
+    pub infrastructure_failure: bool,
     /// Aether identifiers, present once Aether acknowledged creation.
     pub aether_agent: Option<AetherAgentId>,
     pub aether_task: Option<AetherTaskId>,
@@ -120,6 +135,34 @@ pub struct StageRun {
     pub cost_usd: f64,
     pub started_at: Timestamp,
     pub finished_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelSegment {
+    pub delivery: String,
+    pub choice: ModelChoice,
+    pub started_at: Timestamp,
+    pub cost_before_usd: f64,
+}
+
+/// The key under a result's `review` where Archon, and only Archon, writes
+/// why it refused the review pass the result claims.
+pub const REVIEW_REFUSED_KEY: &str = "unverified";
+
+impl StageRun {
+    pub fn current_choice(&self) -> &ModelChoice {
+        self.model_segments
+            .last()
+            .map_or(&self.choice, |s| &s.choice)
+    }
+
+    /// Whether Archon refused the review pass this stage's result claims.
+    pub fn review_refused(&self) -> bool {
+        let review = self.structured.as_ref().and_then(|s| s.get("review"));
+        let why = review.and_then(|review| review.get(REVIEW_REFUSED_KEY));
+        why.and_then(serde_json::Value::as_str)
+            .is_some_and(|why| !why.trim().is_empty())
+    }
 }
 
 /// The newest `pr_url` a completed stage reported (the ship stage's), from
@@ -339,6 +382,25 @@ mod tests {
     }
 
     #[test]
+    fn blockers_and_escalations_end_a_run_and_other_failures_do_not() {
+        assert!(StageOutcome::ends_run("  BLOCKED: no push access"));
+        assert!(StageOutcome::ends_run(
+            "ESCALATE: needs a review; use adaptive"
+        ));
+        assert!(!StageOutcome::ends_run(
+            "tests failed: ESCALATE: is not a prefix here"
+        ));
+        let escalated = StageOutcome::Failed {
+            error: "ESCALATE: too large".into(),
+            infra: false,
+        };
+        assert!(
+            !escalated.is_operator_blocker(),
+            "the operator is not asked"
+        );
+    }
+
+    #[test]
     fn gate_answers_read_as_approve_reject_or_feedback() {
         assert_eq!(
             GateDecision::from_answer("yes").unwrap(),
@@ -395,6 +457,8 @@ mod tests {
             stage_id: "ship".into(),
             attempt: 1,
             fan_index: 0,
+            model_segments: Vec::new(),
+            infrastructure_failure: false,
             choice: ModelChoice {
                 model: "claude-code/opus".parse().unwrap(),
                 effort: crate::model::Effort::Low,
@@ -433,11 +497,23 @@ mod tests {
     }
 
     #[test]
+    fn a_review_is_refused_only_with_archons_reason_on_record() {
+        let review = |review: serde_json::Value| Some(serde_json::json!({"review": review}));
+        let refused = review(serde_json::json!({"verdict": "pass", REVIEW_REFUSED_KEY: "why"}));
+        assert!(stage(StageState::Completed, refused).review_refused());
+        let checked = review(serde_json::json!({"verdict": "pass", "reviewer_agents": ["agt_r"]}));
+        assert!(!stage(StageState::Completed, checked).review_refused());
+        let blank = review(serde_json::json!({REVIEW_REFUSED_KEY: "  "}));
+        assert!(!stage(StageState::Completed, blank).review_refused());
+        assert!(!stage(StageState::Completed, None).review_refused());
+    }
+
+    #[test]
     fn a_run_finishes_once() {
         let mut run = PipelineRun {
             id: PipelineRunId::new(),
             item: QueueItemId::new(),
-            pipeline: "quick-pr".into(),
+            pipeline: "direct".into(),
             shipped: false,
             aether_run: None,
             workspace: "/archon/worktrees/x".into(),

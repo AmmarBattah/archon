@@ -5,8 +5,16 @@ resolves the repository and pipeline defaults and checks stage ids, model
 choices, model policy, autonomy ceilings, dependencies, budgets and idempotency.
 No orchestrator or MCP stdio harness is needed to submit work.
 
-For a repository-free question, save a brief in `brief.md` and a model plan
-in `plan.json`:
+The smallest enqueue names a title and a brief; Archon chooses the model
+of every stage from your policy:
+
+```sh
+item=$(archon queue add --title 'Explain the cache design' \
+  --pipeline ask --brief-file brief.md)
+```
+
+To choose the models yourself, for a repository-free question, save a brief
+in `brief.md` and a model plan in `plan.json`:
 
 ```json
 {"answer": [{"model": "codex/gpt-6.1-sol", "effort": "high"}]}
@@ -21,7 +29,11 @@ archon queue wait "$item" --timeout 30m
 
 `--brief-file -` reads UTF-8 text from stdin. The model plan is a JSON or TOML
 file with the same stage-to-choice-array shape as MCP `model_plan`. The file
-extension must be `.json` or `.toml`. The equivalent TOML plan is:
+extension must be `.json` or `.toml`. The file is optional, and it may name
+only some stages: a stage it leaves out gets the choice learned for the
+repository ([configuration](configuration.md#learning)), else the
+orchestrator's model where your policy allows it, else the first allowed
+model, at the effort the pipeline's tier suggests. The equivalent TOML plan is:
 
 ```toml
 [[answer]]
@@ -67,6 +79,8 @@ Exit statuses:
 - **0:** every item succeeded.
 - **3:** every item is terminal and at least one failed or was cancelled.
 - **4:** the timeout expired, even if some items already failed.
+- **5:** an item waits on a dependency that failed, so it cannot finish by
+  itself; `blocked_dependencies` names it.
 - **1:** a command or daemon error; **2:** a clap argument parsing error.
 
 Text output lists the last observed item ids and states and adds a timeout
@@ -76,3 +90,11 @@ in argument order. At timeout, the array may be partial or empty if connection
 or an initial request has not completed; later refreshes preserve earlier
 observations. Command errors use the usual `{"error":{"code":...,"message":...}}`
 envelope instead. Waiting never cancels an item.
+
+## Errors
+
+Under `--json` an error prints one `{"error":{"code":...,"message":...}}`
+object on stdout and nothing on stderr, and exits 1. A command line that
+does not parse (an unknown flag, a missing argument) prints the same
+envelope with the code `invalid_argument` and exits 2, as it does without
+`--json`. `queue wait` reports what it waited for with the statuses above.

@@ -9,7 +9,7 @@ use crate::Timestamp;
 use crate::autonomy::Autonomy;
 use crate::error::ArchonError;
 use crate::github::GithubThread;
-use crate::id::{PipelineRunId, QueueItemId, RepoId};
+use crate::id::{InitiativeId, PipelineRunId, QueueItemId, RepoId};
 use crate::model::{ModelPlan, ModelReasons};
 
 /// Input checks shared by the CLI and daemon enqueue boundaries.
@@ -35,6 +35,10 @@ pub fn check_enqueue(
     check_tags(tags)?;
     check_item_budget(budget)
 }
+
+/// The tag that wakes the orchestrator when the item finishes, however it
+/// ends; an untagged success only joins its next trigger (§5.4).
+pub const NOTIFY_TAG: &str = "notify";
 
 pub fn check_tags(tags: &[String]) -> Result<(), ArchonError> {
     if tags.iter().any(|tag| tag.trim().is_empty()) {
@@ -149,7 +153,7 @@ impl QueueState {
                     Succeeded { .. } | Failed { .. } | Cancelled { .. }
                 )
                 | (Blocked { .. }, Queued | Cancelled { .. })
-                | (Failed { .. } | Cancelled { .. }, Queued)
+                | (Succeeded { .. } | Failed { .. } | Cancelled { .. }, Queued)
         )
     }
 }
@@ -183,12 +187,20 @@ pub struct QueueItem {
     /// branch, on a branch of its own (ARCHITECTURE §13).
     #[serde(default)]
     pub fresh_retries: u32,
+    /// The initiative it is a member of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiative: Option<InitiativeId>,
     pub state: QueueState,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
 
 impl QueueItem {
+    /// Whether whoever queued it asked to be told when it finishes.
+    pub fn wants_notice(&self) -> bool {
+        self.tags.iter().any(|tag| tag == NOTIFY_TAG)
+    }
+
     /// Apply a transition, refusing illegal edges.
     pub fn transition(&mut self, next: QueueState, at: Timestamp) -> Result<(), ArchonError> {
         if !self.state.can_transition_to(&next) {
@@ -248,7 +260,7 @@ pub struct Caps {
 impl Default for Caps {
     fn default() -> Self {
         Self {
-            max_parallel_agents: 3,
+            max_parallel_agents: 8,
             max_per_repo: 0,
             max_per_pipeline: BTreeMap::new(),
             max_active_runs: 0,
@@ -276,7 +288,7 @@ mod tests {
         QueueItem {
             id: QueueItemId::new(),
             repo: Some(RepoId::new()),
-            pipeline: "quick-pr".into(),
+            pipeline: "direct".into(),
             title: "t".into(),
             brief: "b".into(),
             priority: Priority::Normal,
@@ -288,6 +300,7 @@ mod tests {
             autonomy: Autonomy::default(),
             origin: None,
             fresh_retries: 0,
+            initiative: None,
             state: QueueState::Queued,
             created_at: crate::now(),
             updated_at: crate::now(),

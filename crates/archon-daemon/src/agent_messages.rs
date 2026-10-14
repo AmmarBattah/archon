@@ -2,9 +2,7 @@
 
 use archon_aether::events::InboxMessage;
 use archon_core::aether_ids::AetherAgentId;
-use archon_core::agent_message::{
-    AgentMessage, MAX_AGENT_MESSAGES, MessageKind, MessageSender, check_text,
-};
+use archon_core::agent_message::{AgentMessage, MessageKind, MessageSender, check_text};
 use archon_core::error::ArchonError;
 use archon_core::notify::FeedItem;
 use archon_core::protocol::Reply;
@@ -13,6 +11,7 @@ use archon_queue::Store;
 use serde::{Deserialize, Serialize};
 
 use crate::context::DaemonContext;
+use crate::pump::FleetRole;
 use crate::{executor, feed, triggers};
 
 #[derive(Serialize, Deserialize)]
@@ -46,11 +45,13 @@ fn read<T: serde::de::DeserializeOwned>(
         .transpose()
 }
 
-fn next_count(store: &Store, key: &str) -> Result<u32, ArchonError> {
+/// The count `key` reaches with one more message, within `most`.
+fn next_count(store: &Store, key: &str, most: u32) -> Result<u32, ArchonError> {
+    assert!(most >= 1, "validated with the config");
     let count: u32 = read(store, key)?.unwrap_or(0);
-    if count >= MAX_AGENT_MESSAGES {
+    if count >= most {
         return Err(ArchonError::Invalid(format!(
-            "message_orchestrator limit reached ({MAX_AGENT_MESSAGES} messages per agent or run-node external inbox); this message was refused"
+            "message_orchestrator limit reached ({most} messages per agent or run-node external inbox, `[limits] max_agent_messages`); this message was refused"
         )));
     }
     Ok(count + 1)
@@ -76,11 +77,10 @@ pub(crate) async fn send(
     })?;
     let receipt = {
         let mut store = ctx.store.lock().await;
-        let stage = store.stage_run_by_agent(agent)?.ok_or_else(|| {
-            ArchonError::Forbidden(format!(
-                "message_orchestrator is for recorded stage agents; {agent} is not one. If your stage just started, retry shortly while continuing your work"
-            ))
-        })?;
+        let Some(stage) = store.stage_run_by_agent(agent)? else {
+            drop(store);
+            return Err(not_a_stage_agent(ctx, agent).await?);
+        };
         if stage.state.is_terminal() {
             return Err(ArchonError::Forbidden(
                 "this stage has already settled".into(),
@@ -89,7 +89,8 @@ pub(crate) async fn send(
         let run = store.run(&stage.run)?;
         let sender = MessageSender::Agent { id: agent.clone() };
         let key = counter_key(&sender, agent);
-        let count = next_count(&store, &key)?.to_string();
+        let most = ctx.config.limits.max_agent_messages;
+        let count = next_count(&store, &key, most)?.to_string();
         let operator: Option<OperatorMessage> = read(&store, &operator_key(agent))?;
         let original_sender =
             if kind == MessageKind::Relay && operator.is_some_and(|m| m.text == text) {
@@ -118,6 +119,31 @@ pub(crate) async fn send(
     })
 }
 
+/// Why `agent` may not message the orchestrator, said so that only an agent
+/// whose stage is still being recorded tries again.
+async fn not_a_stage_agent(
+    ctx: &DaemonContext,
+    agent: &AetherAgentId,
+) -> Result<ArchonError, ArchonError> {
+    let why = match crate::pump::fleet_role(ctx, agent).await? {
+        Some(FleetRole::Stage(_)) => format!(
+            "the stage of {agent} is still being recorded. Try once more in a few seconds, and keep working meanwhile"
+        ),
+        Some(FleetRole::StageChild(item)) => format!(
+            "{agent} was delegated part of item {item} by one. Do not retry: report to the agent that delegated to you, which can send the message"
+        ),
+        Some(FleetRole::OrchestratorChild) => format!(
+            "{agent} was delegated to by the orchestrator. Do not retry: put what it should know in your result"
+        ),
+        None => format!(
+            "Archon has no stage on record for {agent}. If your stage started moments ago, try once more in a few seconds; otherwise do not retry"
+        ),
+    };
+    Ok(ArchonError::Forbidden(format!(
+        "message_orchestrator is for stage agents, and {why}. Nothing was sent."
+    )))
+}
+
 fn publish(ctx: &DaemonContext, receipt: &FeedItem) {
     feed::publish(ctx, vec![receipt.clone()]);
     triggers::wake(ctx);
@@ -129,19 +155,14 @@ pub(crate) async fn inbox(
     seq: u64,
     incoming: &InboxMessage,
 ) -> Result<(), ArchonError> {
-    let cursor = format!("message_inbox:{target}");
+    let cursor = cursor_key(target);
     let known = {
         let store = ctx.store.lock().await;
         let seen: u64 = read(&store, &cursor)?.unwrap_or(0);
         if seq <= seen {
             return Ok(());
         }
-        executor::node_run(&store, target)?.is_some()
-            || store.stage_run_by_agent(target)?.is_some()
-            || store
-                .kv_get(archon_queue::store::keys::ORCHESTRATOR_AGENT)?
-                .as_deref()
-                == Some(target.as_str())
+        is_known(&store, target)?
     };
     if !known {
         match executor::recover_message_node(ctx, target).await {
@@ -149,11 +170,7 @@ pub(crate) async fn inbox(
             Err(error) if error.is_store() || matches!(error, ArchonError::Unavailable(_)) => {
                 return Err(error);
             }
-            Err(refusal) => {
-                refuse_inbox(ctx, target, seq, incoming, &refusal).await?;
-                ctx.store.lock().await.kv_set(&cursor, &seq.to_string())?;
-                return Ok(());
-            }
+            Err(refusal) => return refuse_past(ctx, target, seq, incoming, &refusal).await,
         }
     }
     let result = {
@@ -166,31 +183,65 @@ pub(crate) async fn inbox(
             remember_operator(&mut store, target, seq, incoming)?;
             return Ok(());
         };
-        let key = counter_key(&incoming.sender, target);
-        match check_text(&incoming.text).and_then(|()| next_count(&store, &key)) {
-            Ok(count) => {
-                let count = count.to_string();
-                let seq = seq.to_string();
-                node_message(&store, target, run, incoming).and_then(|message| {
-                    triggers::record_message(
-                        &mut store,
-                        message,
-                        &[(&key, &count), (&cursor, &seq)],
-                    )
-                })
-            }
-            Err(refusal) => Err(refusal),
-        }
+        let most = ctx.config.limits.max_agent_messages;
+        admit(&mut store, target, run, seq, incoming, most)
     };
     match result {
         Ok(receipt) => publish(ctx, &receipt),
         Err(error) if error.is_store() => return Err(error),
-        Err(refusal) => {
-            refuse_inbox(ctx, target, seq, incoming, &refusal).await?;
-            ctx.store.lock().await.kv_set(&cursor, &seq.to_string())?;
-        }
+        Err(refusal) => refuse_past(ctx, target, seq, incoming, &refusal).await?,
     }
     Ok(())
+}
+
+fn cursor_key(target: &AetherAgentId) -> String {
+    format!("message_inbox:{target}")
+}
+
+/// Whether `target` is a run node's, a stage's or the orchestrator's agent.
+fn is_known(store: &Store, target: &AetherAgentId) -> Result<bool, ArchonError> {
+    let orchestrator = store.kv_get(archon_queue::store::keys::ORCHESTRATOR_AGENT)?;
+    Ok(executor::node_run(store, target)?.is_some()
+        || store.stage_run_by_agent(target)?.is_some()
+        || orchestrator.as_deref() == Some(target.as_str()))
+}
+
+/// Record `incoming` to `run`'s node within the sender's `most` messages,
+/// moving the inbox cursor past `seq` in the same write.
+fn admit(
+    store: &mut Store,
+    target: &AetherAgentId,
+    run: archon_core::id::PipelineRunId,
+    seq: u64,
+    incoming: &InboxMessage,
+    most: u32,
+) -> Result<FeedItem, ArchonError> {
+    check_text(&incoming.text)?;
+    let key = counter_key(&incoming.sender, target);
+    let count = next_count(store, &key, most)?;
+    assert!(
+        (1..=most).contains(&count),
+        "a counted message is within the limit"
+    );
+    let message = node_message(store, target, run, incoming)?;
+    assert_eq!(message.addressed_to_run_node.as_ref(), Some(target));
+    let (cursor, count, seq) = (cursor_key(target), count.to_string(), seq.to_string());
+    triggers::record_message(store, message, &[(&key, &count), (&cursor, &seq)])
+}
+
+/// Refuse `incoming` to its sender and move the inbox cursor past `seq`.
+async fn refuse_past(
+    ctx: &DaemonContext,
+    target: &AetherAgentId,
+    seq: u64,
+    incoming: &InboxMessage,
+    refusal: &ArchonError,
+) -> Result<(), ArchonError> {
+    refuse_inbox(ctx, target, seq, incoming, refusal).await?;
+    ctx.store
+        .lock()
+        .await
+        .kv_set(&cursor_key(target), &seq.to_string())
 }
 
 fn remember_operator(

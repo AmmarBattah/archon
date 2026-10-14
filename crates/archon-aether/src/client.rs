@@ -20,7 +20,7 @@ use crate::connection::{BoxRead, BoxWrite, EventSink, Router, Shared, WRITE_QUEU
 use crate::events::AetherEvent;
 use crate::github::{WatcherConfig, WatcherStatus};
 use crate::wire::{
-    ALLOWLIST_PROTOCOL_VERSION, Agent, AgentPatch, CLIENT_NAME, Command, CreateAgent,
+    ALLOWLIST_PROTOCOL_VERSION, Agent, AgentPatch, AgentQuery, CLIENT_NAME, Command, CreateAgent,
     DaemonDefaults, ErrorReply, EventQuery, Hello, MIN_PROTOCOL_VERSION, ModelInfo,
     OPERATOR_LOGINS_PROTOCOL_VERSION, PROTOCOL_VERSION, ProviderInfo, RawReply, Subscribed, Task,
     Welcome,
@@ -366,6 +366,11 @@ impl AetherClient {
         Ok(agent)
     }
 
+    /// The agents `query` selects, as Aether holds them now.
+    pub async fn list_agents(&self, query: AgentQuery) -> Result<Vec<Agent>, ArchonError> {
+        self.typed(Command::ListAgents { query }, "agents").await
+    }
+
     pub async fn get_task(&self, id: &AetherTaskId) -> Result<Task, ArchonError> {
         let task: Task = self
             .typed(Command::GetTask { id: id.clone() }, "task")
@@ -405,6 +410,34 @@ impl AetherClient {
             idempotency_key: Some(idempotency_key.to_owned()),
         };
         self.request(command, "message_sent").await.map(drop)
+    }
+
+    /// One page of the events matching `query` with `seq > after`, oldest
+    /// first; Aether caps a page at 5000.
+    pub async fn events_after(
+        &self,
+        after: u64,
+        query: EventQuery,
+        limit: usize,
+    ) -> Result<Vec<AetherEvent>, ArchonError> {
+        assert!(limit > 0, "a page holds at least one event");
+        let command = Command::GetEvents {
+            after,
+            limit,
+            query,
+        };
+        let raw: Vec<serde_json::Value> = self.typed(command, "events").await?;
+        let events = raw
+            .into_iter()
+            .map(crate::events::parse_event)
+            .collect::<Result<Vec<AetherEvent>, _>>()
+            .map_err(|e| ArchonError::Protocol(format!("`events` reply did not decode: {e}")))?;
+        if events.len() > limit || events.iter().any(|e| e.seq <= after) {
+            return Err(ArchonError::Protocol(format!(
+                "`events` reply is not a page of at most {limit} events after {after}"
+            )));
+        }
+        Ok(events)
     }
 
     pub async fn trigger(
@@ -450,6 +483,19 @@ impl AetherClient {
             reason: Some(reason.to_owned()),
         };
         self.request(command, "ok").await.map(drop)
+    }
+
+    /// Stop the turn `agent` is in. `false` when it was in none.
+    pub async fn interrupt(&self, agent: &AetherAgentId) -> Result<bool, ArchonError> {
+        #[derive(serde::Deserialize)]
+        struct Interrupted {
+            was_running: bool,
+        }
+        let command = Command::Interrupt {
+            agent: agent.clone(),
+        };
+        let reply: Interrupted = self.typed(command, "interrupted").await?;
+        Ok(reply.was_running)
     }
 
     /// Revive a failed agent in place; `Err` when Aether refuses.

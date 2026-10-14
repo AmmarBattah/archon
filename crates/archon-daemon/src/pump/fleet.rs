@@ -21,7 +21,10 @@ use crate::{executor, feed};
 /// waits for its spawn reply to be recorded (the reply and the first
 /// events can cross). The post-spawn `check_outcome` settles it otherwise.
 const SPAWN_GRACE: Duration = Duration::from_secs(5);
-const SPAWN_POLL: Duration = Duration::from_millis(100);
+/// The wait ends when a spawn is recorded. A stage that stops spawning any
+/// other way (a sweep, a store written elsewhere) is seen this often.
+const SPAWN_RECHECK: Duration = Duration::from_secs(1);
+const _: () = assert!(SPAWN_RECHECK.as_millis() <= SPAWN_GRACE.as_millis());
 
 /// Who an Archon-managed agent works for.
 #[derive(Debug)]
@@ -55,12 +58,25 @@ pub(super) async fn handle(ctx: &DaemonContext, event: &AetherEvent) -> Result<(
         | EventKind::TaskFailed { .. }
         | EventKind::TaskCancelled { .. } => task_settled(ctx, event, agent).await,
         EventKind::AgentFailed { .. } | EventKind::AgentCancelled { .. } => {
-            agent_died(ctx, event, agent).await
+            agent_died(ctx, event, agent).await?;
+            turn_ended(ctx);
+            Ok(())
         }
+        EventKind::AgentCompleted => {
+            turn_ended(ctx);
+            Ok(())
+        }
+        EventKind::AgentTurnCompleted { .. } => executor::turn_ended(ctx, agent).await,
         EventKind::AgentUsageUpdated { usage } => record_usage(ctx, event, agent, usage).await,
         EventKind::QuestionAsked { question } => question_asked(ctx, event, agent, question).await,
         _ => Ok(()),
     }
+}
+
+/// An agent ended for good: the stop of what it delegated, which waited for
+/// its turn to end, and the spawns behind it need not wait for the next tick.
+fn turn_ended(ctx: &DaemonContext) {
+    ctx.dispatch.notify_one();
 }
 
 /// The owner of an agent Archon manages; `None` for anyone else's agent
@@ -113,7 +129,9 @@ async fn task_settled(
     };
     let same_task = match (&stage.aether_task, &event.task) {
         (Some(ours), Some(theirs)) => ours == theirs,
-        (None, _) => true,
+        // Resumed on a kept agent, whose task settled with an earlier
+        // attempt: a replayed event of that task is not this one's (§6.7).
+        (None, _) => false,
         (Some(_), None) => false,
     };
     if !same_task || stage.state.is_terminal() {
@@ -204,14 +222,24 @@ async fn stage_awaiting_spawn(
 ) -> Result<Option<StageRun>, ArchonError> {
     let deadline = tokio::time::Instant::now() + SPAWN_GRACE;
     loop {
+        // Listening before the store is read: a spawn recorded between the
+        // read and the wait still ends the wait.
+        let recorded = ctx.spawn_recorded.notified();
+        tokio::pin!(recorded);
+        recorded.as_mut().enable();
         match look_up(ctx, event, agent).await? {
             Lookup::Stage(stage) => return Ok(Some(*stage)),
             Lookup::NotStage => return Ok(None),
-            Lookup::MaybeSpawning if tokio::time::Instant::now() >= deadline => {
-                tracing::debug!(%agent, seq = event.seq, "no spawning stage claimed the agent");
-                return Ok(None);
-            }
-            Lookup::MaybeSpawning => tokio::time::sleep(SPAWN_POLL).await,
+            Lookup::MaybeSpawning => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            tracing::debug!(%agent, seq = event.seq, "no spawning stage claimed the agent");
+            return Ok(None);
+        }
+        tokio::select! {
+            () = &mut recorded => {}
+            () = tokio::time::sleep_until(deadline.min(now + SPAWN_RECHECK)) => {}
         }
     }
 }
@@ -263,7 +291,7 @@ async fn record_usage(
     usage: &UsageTotals,
 ) -> Result<(), ArchonError> {
     let Some(owner) = owner(ctx, agent).await? else {
-        return Ok(());
+        return retired_orchestrator_usage(ctx, event, agent, usage).await;
     };
     let item = item_of(ctx, &owner).await?;
     record_spend(ctx, event, agent, item.clone(), usage).await?;
@@ -280,8 +308,32 @@ async fn record_usage(
         executor::check_item_budget(ctx, &item, has_usage && !has_cost && !has_estimate, stage)
             .await?;
     }
-    // Spend can cross a budget cap; let the dispatcher re-check.
-    ctx.dispatch.notify_one();
+    recheck_global_budgets(ctx).await;
+    Ok(())
+}
+
+/// Spend changes what the dispatcher plans only by reaching the total or
+/// the daily budget (`plan_dispatch`), so only then does new spend wake it.
+async fn recheck_global_budgets(ctx: &DaemonContext) {
+    let caps = crate::resolve::caps(ctx).await;
+    if caps.budget_usd_total > 0.0 || caps.budget_usd_daily > 0.0 {
+        ctx.dispatch.notify_one();
+    }
+}
+
+/// The orchestrator's own stream follows only the agent in charge, so the
+/// last spend of one it replaced is counted from the fleet's.
+async fn retired_orchestrator_usage(
+    ctx: &DaemonContext,
+    event: &AetherEvent,
+    agent: &AetherAgentId,
+    usage: &UsageTotals,
+) -> Result<(), ArchonError> {
+    if !crate::supervisor::is_retired_orchestrator(ctx, agent).await? {
+        return Ok(());
+    }
+    record_spend(ctx, event, agent, None, usage).await?;
+    recheck_global_budgets(ctx).await;
     Ok(())
 }
 
@@ -305,6 +357,7 @@ pub(super) async fn record_spend(
         item,
         cost_usd: usage.cost_usd,
         cost_basis: usage.cost_basis,
+        cost_complete: usage.cost_complete,
         estimated_cost_usd: estimate,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,

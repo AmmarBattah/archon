@@ -2,7 +2,11 @@
 //! (`team`), and the snapshot a read-only run works in (`snapshot`). Shells
 //! out to `git`; every failure carries git's stderr.
 
+pub(crate) mod clean;
+pub(crate) mod daemon_git;
+pub(crate) mod shadow;
 pub mod snapshot;
+pub(crate) mod stack;
 pub mod team;
 
 use std::path::{Path, PathBuf};
@@ -16,6 +20,9 @@ use archon_core::id::QueueItemId;
 const MAX_SLUG_CHARS: usize = 40;
 /// Trailing characters of the item's ULID used in branch names.
 const ITEM_SHORT_CHARS: usize = 8;
+/// Under the worktree root, which no repository name starts with a dot:
+/// the shadow new worktrees are checked out through.
+const SHADOW_HOME: &str = ".archon";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -30,6 +37,8 @@ pub struct Worktree {
 pub struct WorktreeManager {
     root: PathBuf,
     branch_prefix: String,
+    /// `worktrees.cache_dirs`: untracked files there never keep a worktree.
+    cache_dirs: Vec<PathBuf>,
 }
 
 impl WorktreeManager {
@@ -38,7 +47,19 @@ impl WorktreeManager {
         Self {
             root,
             branch_prefix,
+            cache_dirs: Vec::new(),
         }
+    }
+
+    /// Also count untracked files in `cache_dirs`, relative to a worktree, as
+    /// no change when removing one, besides the built-in caches.
+    pub fn with_cache_dirs(mut self, cache_dirs: Vec<PathBuf>) -> Self {
+        assert!(
+            cache_dirs.iter().all(|dir| dir.is_relative()),
+            "config validation keeps cache directories relative"
+        );
+        self.cache_dirs = cache_dirs;
+        self
     }
 
     /// `<prefix><last 8 of item ulid, lowercase>-<slug(title), ≤ 40 chars>`,
@@ -86,7 +107,13 @@ impl WorktreeManager {
                 path.display()
             )));
         }
-        create_at(repo_path, path, check_branch(branch)?, base)
+        create_at(
+            &self.shadow_home(),
+            repo_path,
+            path,
+            check_branch(branch)?,
+            base,
+        )
     }
 
     /// As [`Self::create`], for a pipeline with a team stage: the item's
@@ -108,7 +135,8 @@ impl WorktreeManager {
             )));
         }
         let path = root.join(archon_pipeline::team::RUN_TREE_DIR);
-        let created = create_at(repo_path, path, check_branch(branch)?, base)?;
+        let home = self.shadow_home();
+        let created = create_at(&home, repo_path, path, check_branch(branch)?, base)?;
         debug_assert_eq!(created.path.parent(), Some(root.as_path()));
         Ok(created)
     }
@@ -150,15 +178,37 @@ impl WorktreeManager {
         Ok(Some(aside))
     }
 
-    /// `git worktree remove` (never `--force`); the branch is kept.
-    pub fn remove(&self, repo_path: &Path, worktree: &Path) -> Result<(), ArchonError> {
+    /// Where the shadow that checks out new worktrees ([`add_checked_out`]) lives.
+    pub(crate) fn shadow_home(&self) -> PathBuf {
+        self.root.join(SHADOW_HOME)
+    }
+
+    /// Remove a worktree that holds no work but untracked caches, asking the shadow
+    /// under `data_dir` whether it is clean so no filter runs; the branch stays.
+    pub fn remove(
+        &self,
+        data_dir: &Path,
+        repo_path: &Path,
+        worktree: &Path,
+    ) -> Result<(), ArchonError> {
         assert!(
             worktree.starts_with(&self.root),
             "refusing to remove {} outside the worktree root",
             worktree.display()
         );
         assert!(repo_path.is_absolute(), "repository paths are canonical");
-        git(repo_path, &["worktree", "remove", path_arg(worktree)?])?;
+        let shadow = shadow::Shadow::of(data_dir, repo_path)?;
+        if let Some(why) = clean::unremovable(&shadow, worktree, &self.cache_dirs)? {
+            return Err(ArchonError::Invalid(format!(
+                "{} is kept: {why}",
+                worktree.display()
+            )));
+        }
+        // A locked worktree is still refused: that takes `--force` twice.
+        let args = ["worktree", "remove", "--force", path_arg(worktree)?];
+        daemon_git::DaemonGit::sealed_in(repo_path)
+            .args(args)
+            .text()?;
         debug_assert!(!worktree.exists(), "git reported success but left the tree");
         Ok(())
     }
@@ -190,6 +240,7 @@ fn holds_team_run(path: &Path) -> Result<bool, ArchonError> {
 /// Add (or reuse) the worktree at `path` on `branch`, forking a new
 /// branch from `base`, which defaults to the repo's `HEAD` commit.
 fn create_at(
+    shadow_home: &Path,
     repo_path: &Path,
     path: PathBuf,
     branch: String,
@@ -217,16 +268,69 @@ fn create_at(
     let path_text = path_arg(&path)?;
     // A kept branch (worktree removed by `archon gc`) is checked out again.
     let args: Vec<&str> = match branch_exists(repo_path, &branch)? {
-        true => vec!["worktree", "add", path_text, &branch],
-        false => vec!["worktree", "add", "-b", &branch, path_text, &base],
+        true => vec![path_text, &branch],
+        false => vec!["-b", &branch, path_text, &base],
     };
-    git(repo_path, &args)?;
+    add_checked_out(shadow_home, repo_path, &path, &args)?;
+    debug_assert!(
+        head(&path)?.is_branch(&branch),
+        "git added it on the branch"
+    );
     Ok(Worktree {
         path,
         branch,
         base,
         added: true,
     })
+}
+
+/// `git worktree add --no-checkout <args>` for `path`, then its files checked out through the
+/// shadow under `shadow_home`, so no hook or filter a repository or agent configured runs.
+pub(crate) fn add_checked_out(
+    shadow_home: &Path,
+    repo_path: &Path,
+    path: &Path,
+    args: &[&str],
+) -> Result<(), ArchonError> {
+    assert!(shadow_home.is_absolute(), "the shadow's home is absolute");
+    assert!(!path.exists(), "a worktree is added where nothing is");
+    let shadow = shadow::Shadow::of(shadow_home, repo_path)?;
+    let add = [&["worktree", "add", "--no-checkout"][..], args].concat();
+    daemon_git::DaemonGit::sealed_in(repo_path)
+        .args(add)
+        .text()?;
+    let Err(error) = check_out(&shadow, path) else {
+        return Ok(());
+    };
+    // A registered worktree with no files would be reused as is, all deleted.
+    let path_text = path_arg(path)?;
+    let remove = ["worktree", "remove", "--force", path_text];
+    match daemon_git::DaemonGit::sealed_in(repo_path)
+        .args(remove)
+        .text()
+    {
+        Ok(_) => Err(error),
+        Err(undo) => Err(error.with_detail(&format!("removing {path_text} also failed: {undo}"))),
+    }
+}
+
+/// Check out `HEAD` into the worktree `tree`, added with no index and no files.
+fn check_out(shadow: &shadow::Shadow, tree: &Path) -> Result<(), ArchonError> {
+    let commit = daemon_git::DaemonGit::sealed_in(tree)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .text()?;
+    assert!(
+        stack::is_commit_id(&commit),
+        "rev-parse --verify prints a commit id"
+    );
+    let index = clean::index_of(tree)?;
+    assert!(!index.exists(), "--no-checkout writes no index");
+    shadow
+        .git(Some(tree), daemon_git::Config::Operator)?
+        .env("GIT_INDEX_FILE", path_arg(&index)?)
+        .args(["read-tree", "-m", "-u", &commit])
+        .text()
+        .map(drop)
 }
 
 /// A worktree directory deleted by hand stays registered in git, which
@@ -377,14 +481,49 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, ArchonError> {
     Ok(stdout.trim().to_owned())
 }
 
+/// The full id of the commit `name` resolves to in `dir`; `None` when there is none.
+pub(crate) fn commit_id(dir: &Path, name: &str) -> Result<Option<String>, ArchonError> {
+    let commit = format!("{name}^{{commit}}");
+    let id = git_exit(dir, &["rev-parse", "-q", "--verify", commit.as_str()])?;
+    assert!(
+        id.as_ref().is_none_or(|id| matches!(id.len(), 40 | 64)),
+        "rev-parse --verify prints a full object id"
+    );
+    Ok(id)
+}
+
+/// Whether `ancestor` is `of` or one of its ancestors.
+pub(crate) fn is_ancestor(dir: &Path, ancestor: &str, of: &str) -> Result<bool, ArchonError> {
+    let args = ["merge-base", "--is-ancestor", ancestor, of];
+    Ok(git_exit(dir, &args)?.is_some())
+}
+
+/// The best common ancestor of commits `a` and `b`; `None` when they share none.
+pub(crate) fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>, ArchonError> {
+    git_exit(dir, &["merge-base", a, b])
+}
+
+/// `git` whose exit 1 answers no (`None`) rather than failing; stdout on success.
+/// Both `rev-parse -q --verify` and `merge-base --is-ancestor` exit 1 exactly so.
+fn git_exit(dir: &Path, args: &[&str]) -> Result<Option<String>, ArchonError> {
+    let output = git_output(dir, args)?;
+    match output.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(git_failure(dir, args, &output)),
+    }
+}
+
 fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, ArchonError> {
     assert!(!args.is_empty(), "a git command needs arguments");
-    // A role controls its worktree: no fsmonitor command it configured
-    // runs as the daemon.
+    // A role controls its worktree: no hook or fsmonitor command it
+    // configured runs as the daemon.
     Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["-c", "core.fsmonitor=false"])
+        .args(daemon_git::no_programs())
         .args(args)
         .output()
         .map_err(|e| ArchonError::io(format!("running git in {}", dir.display()), e))
@@ -450,6 +589,73 @@ mod tests {
         assert_eq!(
             manager.branch_name(&item, "¿?", 1),
             "archon/q69g5fav-fresh1"
+        );
+    }
+
+    /// A repository whose `.gitattributes` names a smudge filter and whose
+    /// post-checkout hook both leave a marker in `root` when anything runs them.
+    fn planted_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let git = daemon_git::DaemonGit::sealed_in(&repo);
+            git.args(args.to_vec()).text().unwrap()
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=planted\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "tracked\n").unwrap();
+        git(&["add", "."]);
+        let who = ["-c", "user.name=a", "-c", "user.email=a@example.invalid"];
+        git(&[&who[..], &["commit", "--quiet", "-m", "x"]].concat());
+        let smudge = format!("touch {}; cat", root.join("smudged").display());
+        git(&["config", "filter.planted.smudge", &smudge]);
+        let hook = repo.join(".git/hooks/post-checkout");
+        let script = format!("#!/bin/sh\ntouch {}\n", root.join("hooked").display());
+        archon_core::testing::write_script(&hook, &script);
+        repo
+    }
+
+    #[test]
+    fn a_new_worktree_is_checked_out_without_the_repository_s_filters_or_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = planted_repo(&root);
+        let manager = WorktreeManager::new(root.join("worktrees"), "archon/".into());
+        let item = QueueItemId::parse("qi_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let branch = manager.branch_name(&item, "planted", 0);
+
+        let created = manager.create(&repo, "demo", &item, &branch, None).unwrap();
+        assert!(created.added && head(&created.path).unwrap().is_branch(&branch));
+        let file = std::fs::read_to_string(created.path.join("a.txt")).unwrap();
+        assert_eq!(file, "tracked\n");
+        let status =
+            daemon_git::DaemonGit::sealed_in(&created.path).args(["status", "--porcelain"]);
+        assert_eq!(
+            status.text().unwrap(),
+            "",
+            "index and files are the branch's"
+        );
+        assert!(
+            !root.join("smudged").exists(),
+            "the repository's filter never ran"
+        );
+        assert!(
+            !root.join("hooked").exists(),
+            "the repository's hook never ran"
+        );
+
+        let plain = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(root.join("plain"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(plain.success());
+        assert!(
+            root.join("smudged").exists() && root.join("hooked").exists(),
+            "the planted filter and hook are real: plain git runs them"
         );
     }
 

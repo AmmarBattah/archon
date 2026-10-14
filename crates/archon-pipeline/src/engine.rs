@@ -7,19 +7,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use archon_core::catalog::StageKind;
+use archon_core::catalog::{StageKind, WorkspaceMode};
 use archon_core::error::ArchonError;
 use archon_core::id::{PipelineRunId, StageRunId};
 use archon_core::model::{ModelChoice, ModelPlan};
 use archon_core::run::{
     GateDecision, GateSubject, PipelineRun, RunState, StageOutcome, StageRun, StageState,
 };
+use archon_core::steer::Then;
 
-use crate::autonomy::OperatorGates;
+use crate::autonomy::{self, OperatorGates};
 use crate::gate::{self, GroupResult};
-use crate::spec::{PipelineSpec, StageSpec};
+use crate::ship::{self, BodyAdditions, SHIP_STEP, ShipOutcome, ShipPlan, ShipRecord};
+use crate::spec::{PipelineSpec, ReviewDuty, StageSpec};
 use crate::team::{self, MergeOutcome, MergePlan, RoleBranch, TeamSlot};
-use crate::{contract, sections, template};
+use crate::{contract, review, sections, template};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineAction {
@@ -39,6 +41,9 @@ pub enum EngineAction {
     /// Every role of a team stage passed: merge their branches onto the run
     /// branch, then report through [`RunDriver::on_team_merged`].
     MergeTeam(MergePlan),
+    /// Every stage of a pipeline archond ships passed: deliver its commits,
+    /// then report through [`RunDriver::on_shipped`].
+    Ship(ShipPlan),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,9 +69,18 @@ pub struct SpawnPlan {
     /// Stage contract (ARCHITECTURE §8.6) for `config.instructions`.
     pub instructions: String,
     pub timeout_minutes: u32,
+    pub allow_delegation: bool,
+    /// The pipeline's workspace mode: what a delegating agent's children may do.
+    pub workspace: WorkspaceMode,
     /// The slot's role, branch and worktree on a team stage; `None` for
     /// every other kind, whose agents work in the run's workspace.
     pub team: Option<TeamSlot>,
+    /// A later stage may loop back here: the agent is kept after its task
+    /// settles so that the next attempt can resume it.
+    pub keep: bool,
+    /// What the kept agent of the slot's previous attempt is told instead of
+    /// spawning anew; `None` when only a fresh agent will do.
+    pub resume: Option<String>,
 }
 
 /// Errors carried into `RunState::Failed` are capped; the full feedback
@@ -96,8 +110,14 @@ pub struct RunDriver {
     merges: BTreeMap<(String, u32), MergeOutcome>,
     /// `(stage index, attempt)` merges this instance already asked for.
     merging: BTreeSet<(usize, u32)>,
+    /// How archond's delivery of the run ended; persisted by the daemon.
+    shipped: Option<ShipOutcome>,
+    /// Whether this instance already asked for that delivery.
+    shipping: bool,
     /// Team siblings this instance already asked to cancel.
     cancelling: BTreeSet<StageRunId>,
+    /// Steered aborts by `(stage id, attempt)`; persisted by the daemon.
+    aborts: BTreeMap<(String, u32), Then>,
 }
 
 /// A live role of a team group another role already failed, and why it is
@@ -118,6 +138,8 @@ enum Replay {
     AwaitOperator { stage: usize, wait: OperatorWait },
     /// The team stage at index `stage` passed and its merge has no outcome.
     AwaitMerge { stage: usize, plan: MergePlan },
+    /// Every stage passed and archond's delivery has no outcome.
+    AwaitShip { plan: ShipPlan },
 }
 
 /// Per-stage counters of one replay.
@@ -143,6 +165,9 @@ struct Position {
     entered: BTreeSet<(usize, u32)>,
     /// Gate stages the operator approved, with the operator's note.
     approved: BTreeMap<String, Option<String>>,
+    /// The ship record of the record stage's latest pass, and the review
+    /// line Archon wrote for it.
+    record: Option<(ShipRecord, Option<String>)>,
 }
 
 impl Position {
@@ -155,6 +180,7 @@ impl Position {
             previous: BTreeMap::new(),
             entered: BTreeSet::new(),
             approved: BTreeMap::new(),
+            record: None,
         };
         at.enter(0, entries, String::new());
         at
@@ -195,7 +221,10 @@ impl RunDriver {
             awaited: BTreeSet::new(),
             merges: BTreeMap::new(),
             merging: BTreeSet::new(),
+            shipped: None,
+            shipping: false,
             cancelling: BTreeSet::new(),
+            aborts: BTreeMap::new(),
         };
         driver.check_prompts_render()?;
         Ok(driver)
@@ -333,6 +362,47 @@ impl RunDriver {
         Ok(self.act_on_runs(all))
     }
 
+    /// Record how archond's delivery ended, without acting on it, for resume;
+    /// the same outcome again is a no-op, a different one refused.
+    pub fn record_ship(&mut self, outcome: ShipOutcome) -> Result<(), ArchonError> {
+        if self.spec.ship_record_stage().is_none() {
+            return Err(ArchonError::InvalidTransition(format!(
+                "pipeline {:?} is not shipped by archond",
+                self.spec.name()
+            )));
+        }
+        match &self.shipped {
+            Some(known) if *known == outcome => Ok(()),
+            Some(known) => Err(ArchonError::InvalidTransition(format!(
+                "the run's delivery was already recorded as {known:?}"
+            ))),
+            None => {
+                self.shipped = Some(outcome);
+                Ok(())
+            }
+        }
+    }
+
+    /// archond delivered the run, or could not: finish it either way. `all`
+    /// is every stage run of the run.
+    pub fn on_shipped(
+        &mut self,
+        outcome: ShipOutcome,
+        all: &[StageRun],
+    ) -> Result<Vec<EngineAction>, ArchonError> {
+        self.record_ship(outcome)?;
+        debug_assert!(self.shipped.is_some());
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        Ok(self.act_on_runs(all))
+    }
+
+    /// Whether archond ships this run itself once its last stage passed.
+    pub fn ships_by_daemon(&self) -> bool {
+        self.spec.ship_record_stage().is_some()
+    }
+
     /// The roles of team stage `stage_id` in slot order; `None` for any
     /// other stage.
     pub fn team_roles(&self, stage_id: &str) -> Option<&[String]> {
@@ -344,10 +414,98 @@ impl RunDriver {
         Some(&stage.roles)
     }
 
+    /// Whether stage `stage_id` hands in the ship record archond delivers.
+    pub fn records_ship(&self, stage_id: &str) -> bool {
+        let records = self.spec.ship_record_stage();
+        records.is_some_and(|stage| stage.id == stage_id)
+    }
+
+    /// How many independent reviewers stage `stage_id` owes this run as the
+    /// review its pipeline declares; `0` when it holds none.
+    pub fn reviewers_owed(&self, stage_id: &str) -> u32 {
+        let stage = self.spec.stage(stage_id);
+        let duty = stage.and_then(|stage| self.spec.review_duty(stage));
+        duty.map_or(0, |duty| duty.reviewers)
+    }
+
     /// Whether this instance cancelled `stage_run` as the live sibling of
     /// a team role that failed, rather than because the run finished.
     pub fn cancels_sibling(&self, stage_run: &StageRunId) -> bool {
         self.cancelling.contains(stage_run)
+    }
+
+    /// Record a steer's abort of group `(stage_id, attempt)`; attempt 0 with
+    /// a skip removes an unstarted stage. Then `resume` or [`Self::reconsider`].
+    pub fn record_abort(
+        &mut self,
+        stage_id: &str,
+        attempt: u32,
+        then: Then,
+    ) -> Result<(), ArchonError> {
+        let stages = &self.spec.file.stages;
+        let Some(index) = self.spec.stage_index(stage_id) else {
+            return Err(ArchonError::Invalid(format!(
+                "pipeline {:?} has no stage {stage_id:?} to abort",
+                self.spec.name()
+            )));
+        };
+        if attempt == 0 && then != Then::Skip {
+            return Err(ArchonError::Invalid(format!(
+                "stage {stage_id:?} has not started, so there is nothing to abort; it can only be skipped"
+            )));
+        }
+        let records = |id: &str| self.spec.ship_record_stage().is_some_and(|s| s.id == id);
+        match &then {
+            Then::Retry => {}
+            Then::Skip if index + 1 == stages.len() => {
+                return Err(ArchonError::Invalid(format!(
+                    "stage {stage_id:?} is the last one, so nothing follows a skip: cancel the item instead"
+                )));
+            }
+            Then::Skip if records(stage_id) => {
+                return Err(ArchonError::Invalid(format!(
+                    "stage {stage_id:?} writes the ship record Archon delivers, so it cannot be skipped: retry it, or cancel the item"
+                )));
+            }
+            Then::Skip => {}
+            Then::Goto { to } if self.spec.stage_index(to).is_none() => {
+                return Err(ArchonError::Invalid(format!(
+                    "pipeline {:?} has no stage {to:?} to go to",
+                    self.spec.name()
+                )));
+            }
+            Then::Goto { .. } => {}
+        }
+        self.aborts.insert((stage_id.to_owned(), attempt), then);
+        Ok(())
+    }
+
+    /// The decision the persisted stage runs imply now, after an abort was
+    /// recorded on a live driver. Spawns come once per group, as ever.
+    pub fn reconsider(&mut self, all: &[StageRun]) -> Vec<EngineAction> {
+        assert!(
+            all.windows(2).all(|pair| pair[0].run == pair[1].run),
+            "stage runs of several runs passed together"
+        );
+        if self.finished {
+            return Vec::new();
+        }
+        self.act_on_runs(all)
+    }
+
+    /// Whether `stage`'s agent outlives its task: a single work agent a later
+    /// stage can send back, unless it holds the declared review.
+    pub fn keeps_agent(&self, stage_id: &str) -> bool {
+        let stages = &self.spec.file.stages;
+        let Some(stage) = self.spec.stage(stage_id) else {
+            return false;
+        };
+        let looped_to = stages
+            .iter()
+            .filter_map(|s| s.on_fail.as_ref())
+            .any(|on_fail| on_fail.goto == stage.id);
+        let single_worker = stage.kind == StageKind::Work && stage.fan_out == 1;
+        single_worker && looped_to && !self.spec.holds_review(stage)
     }
 
     /// Actions for a brand-new run: the first stage's spawns.
@@ -376,6 +534,7 @@ impl RunDriver {
         self.emitted.clear();
         self.awaited.clear();
         self.merging.clear();
+        self.shipping = false;
         self.cancelling.clear();
         self.finished = run.state.is_terminal();
         if self.finished {
@@ -425,10 +584,10 @@ impl RunDriver {
             all.iter().all(|s| s.run == failed.run),
             "stage runs of several runs passed together"
         );
-        let blocked = matches!(&failed.state, StageState::Failed { error }
-            if error.trim_start().starts_with(StageOutcome::BLOCKED_PREFIX));
-        // An operator blocker is never retried automatically.
-        if self.finished || blocked {
+        let final_failure =
+            matches!(&failed.state, StageState::Failed { error } if StageOutcome::ends_run(error));
+        // An operator blocker or an escalation is never retried automatically.
+        if self.finished || final_failure {
             return None;
         }
         // Replay as if the slot were still live: the group must be the
@@ -535,6 +694,12 @@ impl RunDriver {
                 }
                 vec![EngineAction::MergeTeam(plan)]
             }
+            Replay::AwaitShip { plan } => {
+                if std::mem::replace(&mut self.shipping, true) {
+                    return Vec::new();
+                }
+                vec![EngineAction::Ship(plan)]
+            }
         }
     }
 
@@ -618,10 +783,22 @@ impl RunDriver {
         };
         let mut at = Position::first(&mut counts.entries);
         // Each pass that does not return consumes a distinct, fully persisted
-        // group, so there are at most `slots.len()` of them.
-        for _ in 0..=slots.len() {
+        // group or an abort, or steps over one removed stage towards one.
+        let passes = (slots.len() + self.aborts.len() + 1) * (stages.len() + 1);
+        for _ in 0..passes {
             let stage = &stages[at.stage];
             let group = group_at(&slots, stage, at.attempt);
+            if let Some(then) = self.abort_at(&stage.id, at.attempt) {
+                if group.iter().flatten().any(|m| !m.state.is_terminal()) {
+                    // Its agents are being stopped; no slot is spawned anew.
+                    let missing = Vec::new();
+                    return Replay::Await { at, missing };
+                }
+                if let Some(stop) = self.after_abort(&mut at, &mut counts, then) {
+                    return stop;
+                }
+                continue;
+            }
             if let Some(stop) = blocked_stop(stage, &group) {
                 return stop;
             }
@@ -648,9 +825,13 @@ impl RunDriver {
         members: &[&StageRun],
     ) -> Option<Replay> {
         let stage = &self.spec.file.stages[at.stage];
-        let (headline, report) = match gate::evaluate(stage, at.attempt, members) {
+        let owed = self.spec.owed(stage);
+        let (headline, report) = match gate::evaluate(stage, at.attempt, members, owed) {
             GroupResult::Fail { headline, report } => (headline, report),
             GroupResult::Pass { summary } if stage.kind != StageKind::Team => {
+                if owed.ship_record {
+                    at.record = Some(passed_record(members, owed.review));
+                }
                 return self.after_pass(at, counts, summary);
             }
             GroupResult::Pass { summary } => {
@@ -682,6 +863,57 @@ impl RunDriver {
             }
             None => Some(self.failed_stop(at.stage, &counts.loops, &headline, &report)),
         }
+    }
+
+    /// The abort recorded for this attempt of the stage, or the standing
+    /// skip of a stage that was removed before it started.
+    fn abort_at(&self, stage_id: &str, attempt: u32) -> Option<&Then> {
+        let exact = self.aborts.get(&(stage_id.to_owned(), attempt));
+        exact.or_else(|| self.aborts.get(&(stage_id.to_owned(), 0)))
+    }
+
+    /// An aborted group is never judged: the run does what the steer said,
+    /// a step back with a fresh fix-loop budget. `Some` ends the replay.
+    fn after_abort(&self, at: &mut Position, counts: &mut Counters, then: &Then) -> Option<Replay> {
+        let stages = &self.spec.file.stages;
+        let from = at.stage;
+        let target = match then {
+            Then::Retry => Some(from),
+            Then::Skip => Some(from + 1).filter(|next| *next < stages.len()),
+            Then::Goto { to } => self.spec.stage_index(to),
+        };
+        let Some(target) = target else {
+            // The stage it named was edited away after the abort was recorded.
+            let error = format!(
+                "stage `{}` was aborted by a steer, and the stage to continue with no longer exists",
+                stages[from].id
+            );
+            return Some(Replay::Stop {
+                cancel: Vec::new(),
+                state: RunState::Failed {
+                    stage_id: stages[from].id.clone(),
+                    error,
+                },
+            });
+        };
+        assert!(
+            target < stages.len(),
+            "the run goes on at one of its stages"
+        );
+        for passed_over in &stages[from..target.max(from)] {
+            at.previous
+                .entry(template::previous_variable(&passed_over.id))
+                .or_insert_with(|| sections::SKIPPED_SUMMARY.to_owned());
+        }
+        if target < from {
+            counts.loops[target..].fill(0);
+        }
+        let feedback = match then {
+            Then::Retry => at.feedback.clone(),
+            Then::Skip | Then::Goto { .. } => String::new(),
+        };
+        at.enter(target, &mut counts.entries, feedback);
+        None
     }
 
     /// A passed group: wait for or apply an operator decision on a gate,
@@ -720,15 +952,87 @@ impl RunDriver {
             }
         }
         if at.stage + 1 == self.spec.file.stages.len() {
-            return Some(Replay::Stop {
-                cancel: Vec::new(),
-                state: RunState::Succeeded { summary },
-            });
+            return Some(self.after_last_pass(at, summary));
         }
         at.previous
             .insert(template::previous_variable(&stage.id), summary);
         at.enter(at.stage + 1, &mut counts.entries, String::new());
         None
+    }
+
+    /// Every stage passed: the run succeeded, once archond delivered it where
+    /// the pipeline leaves shipping to archond.
+    fn after_last_pass(&self, at: &Position, summary: String) -> Replay {
+        let stop = |state| Replay::Stop {
+            cancel: Vec::new(),
+            state,
+        };
+        let Some(record_stage) = self.spec.ship_record_stage() else {
+            return stop(RunState::Succeeded { summary });
+        };
+        // A steer's goto can pass the record stage by: then nothing is proved.
+        if at.record.is_none() {
+            return stop(RunState::Failed {
+                stage_id: SHIP_STEP.to_owned(),
+                error: format!(
+                    "stage `{}`, which writes the ship record, never passed in this run, so \
+                     there is nothing Archon can ship",
+                    record_stage.id
+                ),
+            });
+        }
+        match &self.shipped {
+            None => Replay::AwaitShip {
+                plan: self.ship_plan(at, record_stage, summary),
+            },
+            Some(ShipOutcome::Failed { error }) => stop(RunState::Failed {
+                stage_id: SHIP_STEP.to_owned(),
+                error: gate::clip(error, MAX_ERROR_CHARS),
+            }),
+            Some(shipped) => {
+                let line = shipped.line().expect("a delivery that shipped says where");
+                stop(RunState::Succeeded {
+                    summary: format!("{summary}\n\n{line}"),
+                })
+            }
+        }
+    }
+
+    /// The delivery of the run at `at`, its last stage, which just passed
+    /// with `summary`.
+    fn ship_plan(&self, at: &Position, record_stage: &StageSpec, summary: String) -> ShipPlan {
+        let (record, review) = at
+            .record
+            .clone()
+            .expect("the caller checked that the record stage passed");
+        let stages = &self.spec.file.stages;
+        let passed = |stage: &StageSpec| match stage.id == stages[at.stage].id {
+            true => Some(summary.as_str()),
+            false => at
+                .previous
+                .get(&template::previous_variable(&stage.id))
+                .map(String::as_str),
+        };
+        let report_stage = autonomy::change_report_stage(&self.spec);
+        let is_report = |stage: &StageSpec| report_stage.is_some_and(|r| r.id == stage.id);
+        let recorded_at = self.spec.stage_index(&record_stage.id).expect("a stage");
+        let later: Vec<(&str, &str)> = stages[recorded_at + 1..]
+            .iter()
+            .filter(|stage| !is_report(stage))
+            .filter_map(|stage| Some((stage.id.as_str(), passed(stage)?)))
+            .collect();
+        let added = BodyAdditions {
+            review: review.as_deref(),
+            later: &later,
+            report: report_stage.and_then(passed),
+        };
+        let body = ship::pr_body(&record, added, &self.base_vars["item.id"]);
+        ShipPlan {
+            record_stage: record_stage.id.clone(),
+            record,
+            body,
+            summary,
+        }
     }
 
     /// Loop back from a gate with the operator's feedback: a proposal is
@@ -824,6 +1128,10 @@ impl RunDriver {
         let mode = self.spec.file.pipeline.workspace;
         let context =
             sections::context(&self.spec, stage, &at.feedback, &at.previous, &at.approved);
+        let keep = self.keeps_agent(&stage.id);
+        let owed = self.spec.owed(stage);
+        let resume = (keep && at.attempt > 1 && !at.feedback.trim().is_empty())
+            .then(|| sections::resume_message(stage, at.attempt, &at.feedback, owed));
         fans.iter()
             .map(|&fan| {
                 assert!(fan < stage.fan_out, "slot {fan} outside fan_out");
@@ -836,7 +1144,8 @@ impl RunDriver {
                     prompt.push_str(&format!("\n\n## Your role\n\n{}\n", extra.trim()));
                 }
                 let part = self.team_part(team.as_ref());
-                let instructions = contract::instructions(stage, mode, &vars["workspace"], part);
+                let workspace = &vars["workspace"];
+                let instructions = contract::instructions(stage, mode, workspace, part, owed);
                 EngineAction::Spawn(SpawnPlan {
                     stage_id: stage.id.clone(),
                     attempt: at.attempt,
@@ -846,7 +1155,13 @@ impl RunDriver {
                     prompt,
                     instructions,
                     timeout_minutes: stage.timeout_minutes,
+                    // The run's reviewers are agents the stage delegates to.
+                    allow_delegation: stage.allow_delegation
+                        || owed.review.is_some_and(|duty| duty.reviewers > 0),
+                    workspace: mode,
                     team,
+                    keep,
+                    resume: resume.clone(),
                 })
             })
             .collect()
@@ -958,6 +1273,7 @@ impl RunDriver {
             previous: BTreeMap::new(),
             entered: BTreeSet::new(),
             approved: BTreeMap::new(),
+            record: None,
         };
         for (index, stage) in self.spec.file.stages.iter().enumerate() {
             at.stage = index;
@@ -1091,13 +1407,26 @@ fn group_at<'a>(
         .collect()
 }
 
-/// A `BLOCKED:` failure anywhere in the group ends the run at once: no
-/// loop, and live siblings are cancelled.
+/// The record stage's passed member's ship record, with the line Archon
+/// wrote for the review it holds as `duty`.
+fn passed_record(members: &[&StageRun], duty: Option<ReviewDuty>) -> (ShipRecord, Option<String>) {
+    let [member] = members else {
+        panic!("validated: one agent writes the ship record")
+    };
+    let structured = member.structured.as_ref();
+    let record = ShipRecord::read(structured).expect("the gate passed only with the record");
+    let review = duty.map(|duty| {
+        let held = review::Evidence::read(structured, duty);
+        held.expect("the gate passed only with the review").line()
+    });
+    (record, review)
+}
+
+/// A `BLOCKED:` or `ESCALATE:` failure anywhere in the group ends the run at
+/// once: no loop, and live siblings are cancelled.
 fn blocked_stop(stage: &StageSpec, group: &[Option<&StageRun>]) -> Option<Replay> {
     let error = group.iter().flatten().find_map(|m| match &m.state {
-        StageState::Failed { error }
-            if error.trim_start().starts_with(StageOutcome::BLOCKED_PREFIX) =>
-        {
+        StageState::Failed { error } if StageOutcome::ends_run(error) => {
             Some(error.trim().to_owned())
         }
         _ => None,

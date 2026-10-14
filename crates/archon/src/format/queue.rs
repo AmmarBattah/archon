@@ -5,10 +5,11 @@ use std::fmt::Write as _;
 
 use archon_core::Timestamp;
 use archon_core::protocol::{ItemDetail, ItemSummary};
-use archon_core::queue::QueueState;
+use archon_core::queue::{QueueItem, QueueState};
 use archon_core::run::{
     self, GateDecision, OperatorGate, PipelineRun, RunState, StageRun, StageState,
 };
+use archon_core::steer::SteerRecord;
 
 use super::{RepoNames, duration, repo_label, table};
 use crate::wrap::{sanitize, sanitize_line};
@@ -68,9 +69,19 @@ fn item_row(row: &ItemSummary, names: &RepoNames, now: Timestamp) -> [String; 8]
         duration((now - item.created_at).num_seconds()),
         archon_core::cost::format_usd(row.spent_usd),
         repo_label(names, item.repo.as_ref()),
-        sanitize_line(&item.pipeline),
+        pipeline_label(item, row.switched_to.as_deref()),
         last,
     ]
+}
+
+/// The pipeline the item was queued with, then the one a steer switched it
+/// to, if any.
+fn pipeline_label(item: &QueueItem, switched_to: Option<&str>) -> String {
+    let queued = sanitize_line(&item.pipeline);
+    match switched_to {
+        Some(to) => format!("{queued} → {}", sanitize_line(to)),
+        None => queued,
+    }
 }
 
 fn state_detail(state: &QueueState) -> String {
@@ -112,9 +123,15 @@ pub fn item_detail(detail: &ItemDetail, names: &RepoNames, full: bool) -> String
         out,
         "repo: {}, pipeline: {}, priority: {:?}",
         repo_label(names, item.repo.as_ref()),
-        sanitize_line(&item.pipeline),
+        pipeline_label(item, detail.switched_to.as_deref()),
         item.priority
     );
+    if let Some(initiative) = &item.initiative {
+        let _ = writeln!(
+            out,
+            "initiative: {initiative} (archon initiatives show {initiative})"
+        );
+    }
     if !item.dependencies.is_empty() {
         let deps: Vec<String> = item.dependencies.iter().map(ToString::to_string).collect();
         let _ = writeln!(out, "depends on: {}", deps.join(", "));
@@ -131,28 +148,57 @@ pub fn item_detail(detail: &ItemDetail, names: &RepoNames, full: bool) -> String
         archon_core::cost::format_usd(detail.spent_usd)
     );
     let _ = writeln!(out, "autonomy: {}", item.autonomy.describe());
-    if let Some(reasons) = &item.model_reasons {
-        for (stage, choices) in &item.model_plan.0 {
-            let picks: Vec<_> = choices
-                .iter()
-                .map(|c| format!("{} {}", c.model, c.effort))
-                .collect();
-            let reason = reasons
-                .get(stage)
-                .map_or(String::new(), |r| format!(" ({})", sanitize_line(r)));
-            let _ = writeln!(
-                out,
-                "plan {}: {}{reason}",
-                sanitize_line(stage),
-                picks.join(" + ")
-            );
-        }
-    }
+    plan_lines(&mut out, item);
     for run in &detail.runs {
         run_lines(&mut out, detail, run, full);
     }
+    steer_lines(&mut out, &detail.steers);
     let _ = write!(out, "\n{}", sanitize(item.brief.trim_end()));
     out
+}
+
+/// `plan implement: model effort (reason)` per stage, for an item whose
+/// plan was recorded with reasons.
+fn plan_lines(out: &mut String, item: &QueueItem) {
+    let Some(reasons) = &item.model_reasons else {
+        return;
+    };
+    for (stage, choices) in &item.model_plan.0 {
+        let picks: Vec<_> = choices
+            .iter()
+            .map(|c| format!("{} {}", c.model, c.effort))
+            .collect();
+        let reason = reasons
+            .get(stage)
+            .map_or(String::new(), |r| format!(" ({})", sanitize_line(r)));
+        let _ = writeln!(
+            out,
+            "plan {}: {}{reason}",
+            sanitize_line(stage),
+            picks.join(" + ")
+        );
+    }
+}
+
+/// `steered 2026-10-14 09:30 UTC by operator: what changed`, oldest first,
+/// each with the note it amended the brief with under it.
+fn steer_lines(out: &mut String, steers: &[SteerRecord]) {
+    debug_assert!(
+        steers.is_sorted_by_key(|steer| steer.at),
+        "archond lists steers oldest first"
+    );
+    for steer in steers {
+        let _ = writeln!(
+            out,
+            "steered {} by {}: {}",
+            steer.at.format("%Y-%m-%d %H:%M UTC"),
+            steer.by,
+            sanitize_line(&steer.what)
+        );
+        if let Some(note) = &steer.note {
+            let _ = writeln!(out, "  note: {}", sanitize_line(note));
+        }
+    }
 }
 
 /// `run …: state on branch in workspace`, its pull request, then its stages
@@ -176,6 +222,15 @@ fn run_lines(out: &mut String, detail: &ItemDetail, run: &PipelineRun, full: boo
     }
     for stage in stages {
         let _ = writeln!(out, "  {}", stage_line(stage));
+        if let Some(delegation) = detail.delegations.get(&stage.id) {
+            let _ = writeln!(out, "    cost: {}", delegation.split());
+            for agent in &delegation.agents {
+                let _ = writeln!(out, "      {}", sanitize_line(&agent.line()));
+            }
+        }
+        if let Some(review) = archon_pipeline::review::on_record(stage.structured.as_ref()) {
+            let _ = writeln!(out, "    {}", sanitize_line(&review));
+        }
         let summary = stage.summary.as_deref().unwrap_or_default();
         for line in summary_lines(summary, full) {
             let _ = writeln!(out, "    {line}");
@@ -257,8 +312,8 @@ fn stage_line(stage: &StageRun) -> String {
         stage.attempt,
         stage.fan_index,
         archon_core::cost::format_usd(stage.cost_usd),
-        stage.choice.model,
-        stage.choice.effort,
+        stage.current_choice().model,
+        stage.current_choice().effort,
     )
 }
 
@@ -336,6 +391,7 @@ mod tests {
             autonomy: Autonomy::default(),
             origin: None,
             fresh_retries: 0,
+            initiative: None,
             created_at: archon_core::now(),
             updated_at: archon_core::now(),
         }
@@ -349,6 +405,7 @@ mod tests {
             stage: None,
             spent_usd: 0.0,
             pr_url: None,
+            switched_to: None,
         }
     }
 
@@ -356,7 +413,7 @@ mod tests {
         PipelineRun {
             id: PipelineRunId::new(),
             item: item.id.clone(),
-            pipeline: "quick-pr".into(),
+            pipeline: "direct".into(),
             shipped: false,
             aether_run: None,
             workspace: "/w".into(),
@@ -376,6 +433,8 @@ mod tests {
             stage_id: stage_id.into(),
             attempt: 1,
             fan_index: 0,
+            model_segments: Vec::new(),
+            infrastructure_failure: false,
             choice: ModelChoice {
                 model: "claude-code/opus".parse().unwrap(),
                 effort: Effort::High,
@@ -396,14 +455,14 @@ mod tests {
     fn items_show_stage_age_cost_and_pull_request() {
         let repo = RepoId::new();
         let names: RepoNames = [(repo.clone(), "api".to_owned())].into();
-        let mut running = summary(queue_item(Some(&repo), "add a greeting", "quick-pr"));
+        let mut running = summary(queue_item(Some(&repo), "add a greeting", "direct"));
         running.item.state = QueueState::Running {
             run: PipelineRunId::new(),
         };
         running.item.created_at = at(9, 55);
         running.stage = Some("review".into());
         running.spent_usd = 1.2;
-        let mut shipped = summary(queue_item(Some(&repo), "fix typo", "strict-pr-review"));
+        let mut shipped = summary(queue_item(Some(&repo), "fix typo", "adaptive"));
         shipped.item.state = QueueState::Succeeded {
             run: PipelineRunId::new(),
             summary: "done".into(),
@@ -415,8 +474,8 @@ mod tests {
 
         let text = items(&[running, shipped], &names, at(10, 0));
         let expected = format!(
-            "{a}  running    review  5m      $1.20  api  quick-pr          add a greeting\n\
-             {b}  succeeded  -       2h 30m  $4.10  api  strict-pr-review  fix typo  \
+            "{a}  running    review  5m      $1.20  api  direct    add a greeting\n\
+             {b}  succeeded  -       2h 30m  $4.10  api  adaptive  fix typo  \
              https://github.com/o/r/pull/12"
         );
         assert_eq!(text, expected);
@@ -468,15 +527,15 @@ mod tests {
 
     #[test]
     fn listed_titles_cannot_rewrite_the_screen_or_fake_a_row() {
-        let spoof = "fix typo\x1b[2K\x1b[1G\nqi_FAKE  succeeded  api  quick-pr  done";
-        let mut row = summary(queue_item(None, spoof, "quick-pr"));
+        let spoof = "fix typo\x1b[2K\x1b[1G\nqi_FAKE  succeeded  api  direct  done";
+        let mut row = summary(queue_item(None, spoof, "direct"));
         row.pr_url = Some("https://x/\x1b[2Kpull/1\nqi_FAKE".into());
         let text = items(&[row], &RepoNames::new(), archon_core::now());
         assert_inert(&text);
         assert_eq!(text.lines().count(), 1, "one item, one row: {text:?}");
         assert!(
             text.ends_with(
-                "fix typo[2K[1G qi_FAKE  succeeded  api  quick-pr  done  \
+                "fix typo[2K[1G qi_FAKE  succeeded  api  direct  done  \
                  https://x/[2Kpull/1 qi_FAKE"
             ),
             "{text}"
@@ -484,7 +543,7 @@ mod tests {
     }
 
     fn detail_with_stages() -> ItemDetail {
-        let item = queue_item(None, "add a greeting", "quick-pr");
+        let item = queue_item(None, "add a greeting", "direct");
         let run = pipeline_run(
             &item,
             RunState::Succeeded {
@@ -499,6 +558,7 @@ mod tests {
         ship.aether_agent = None;
         ship.structured = Some(serde_json::json!({"pr_url": "https://github.com/o/r/pull/12"}));
         ItemDetail {
+            steers: Vec::new(),
             waiting_on: None,
             waiting_reason: None,
             stages: vec![review, ship],
@@ -506,6 +566,8 @@ mod tests {
             item,
             spent_usd: 1.0,
             gates: vec![],
+            delegations: Default::default(),
+            switched_to: None,
         }
     }
 
@@ -540,6 +602,105 @@ mod tests {
     }
 
     #[test]
+    fn a_switched_pipeline_is_named_after_the_one_queued() {
+        let mut detail = detail_with_stages();
+        detail.switched_to = Some("adaptive\nqi_FAKE".into());
+        let text = item_detail(&detail, &RepoNames::new(), false);
+        assert!(
+            text.contains("\nrepo: -, pipeline: direct → adaptive qi_FAKE, priority: Normal\n"),
+            "{text}"
+        );
+        let mut row = summary(detail.item.clone());
+        row.switched_to = detail.switched_to.clone();
+        let listing = items(&[row], &RepoNames::new(), archon_core::now());
+        assert!(
+            listing.contains("  direct → adaptive qi_FAKE  add a greeting"),
+            "{listing}"
+        );
+        assert_inert(&listing);
+    }
+
+    #[test]
+    fn item_detail_lists_every_steer_with_who_made_it_and_its_note() {
+        use archon_core::steer::{SteerRecord, SteeredBy};
+        let at = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 14, 9, 30, 0)
+            .unwrap();
+        let mut detail = detail_with_stages();
+        detail.steers = vec![
+            SteerRecord {
+                at,
+                by: SteeredBy::Orchestrator,
+                what: "amended the brief".into(),
+                note: Some("Use the v2 client.\n\x1b[2Kqi_FAKE".into()),
+            },
+            SteerRecord {
+                at: at + chrono::Duration::minutes(5),
+                by: SteeredBy::Operator,
+                what: "removed stage `review`".into(),
+                note: None,
+            },
+        ];
+        let text = item_detail(&detail, &RepoNames::new(), false);
+        let expected = "steered 2026-10-14 09:30 UTC by orchestrator: amended the brief\n\
+                        \x20 note: Use the v2 client. [2Kqi_FAKE\n\
+                        steered 2026-10-14 09:35 UTC by operator: removed stage `review`\n";
+        assert!(text.contains(expected), "{text}");
+        assert_inert(&text);
+        detail.steers.clear();
+        let plain = item_detail(&detail, &RepoNames::new(), false);
+        assert!(!plain.contains("steered"), "{plain}");
+    }
+
+    /// A stage that delegated shows how its cost splits and to which agents it
+    /// went; a declared review shows as Archon holds it, a skip with its reason.
+    #[test]
+    fn item_detail_shows_a_stages_delegated_cost_and_the_review_on_record() {
+        use archon_core::protocol::{DelegatedAgent, StageDelegation};
+        let mut detail = detail_with_stages();
+        let lead = detail.stages[0].aether_agent.clone().unwrap();
+        let helper = |id: &str, effort, cost_usd| DelegatedAgent {
+            agent: AetherAgentId::parse(id).unwrap(),
+            parent: lead.clone(),
+            model: "codex/astra".parse().unwrap(),
+            effort,
+            cost_usd,
+        };
+        let agents = vec![
+            helper("agt_two", Some(Effort::Medium), 0.3),
+            helper("agt_three", None, 0.2),
+        ];
+        let split = StageDelegation::of(0.5, agents);
+        detail.stages[0].cost_usd = split.total_usd();
+        detail.stages[0].structured = Some(serde_json::json!({"review": {
+            "verdict": "pass", "reviewer_model": "codex/astra", "reviewer_agent": "agt_two"}}));
+        detail
+            .delegations
+            .insert(detail.stages[0].id.clone(), split);
+        let text = item_detail(&detail, &RepoNames::new(), false);
+        let expected = "\x20 review attempt 1 slot 1: completed, verdict pass, $1.00, \
+             claude-code/opus (high), agent agt_one\n\
+             \x20   cost: $0.50 own + $0.50 for 2 delegated agent(s)\n\
+             \x20     agt_two codex/astra (medium) $0.30\n\
+             \x20     agt_three codex/astra (effort unknown) $0.20\n\
+             \x20   REVIEW: pass, by codex/astra (agent agt_two)\n\
+             \x20   finding 1\n";
+        assert!(text.contains(expected), "{text}");
+
+        let skipped = serde_json::json!({"review": {"verdict": "skipped", "reason": "a typo"}});
+        detail.stages[0].structured = Some(skipped);
+        let text = item_detail(&detail, &RepoNames::new(), false);
+        assert!(text.contains("\n    REVIEW: skipped: a typo\n"), "{text}");
+        let unchecked = serde_json::json!({"review": {"verdict": "pass", "reviewer_model": "a/b"}});
+        detail.stages[0].structured = Some(unchecked);
+        let text = item_detail(&detail, &RepoNames::new(), false);
+        assert!(
+            !text.contains("REVIEW:"),
+            "an unchecked pass is none: {text}"
+        );
+    }
+
+    #[test]
     fn item_detail_shows_reasons_only_beside_current_plan_choices() {
         let mut detail = detail_with_stages();
         let choice = detail.stages[0].choice.clone();
@@ -571,26 +732,10 @@ mod tests {
         assert_eq!(summary_lines("one\ntwo", false), ["one", "two"]);
     }
 
-    #[test]
-    fn item_detail_strips_escapes_from_agent_text() {
-        let mut item = queue_item(None, "title\x1b]52;c;cm0gLXJm\x07", "quick-pr");
-        item.brief = "line one\x1b[2J\nline two\r".into();
-        item.tags = vec!["t\x1b[8m".into()];
-        item.state = QueueState::Cancelled {
-            reason: Some("gone\u{9b}2J".into()),
-        };
-        let run = pipeline_run(
-            &item,
-            RunState::Failed {
-                stage_id: "implement".into(),
-                error: "boom\x1b[1A\x1b[2K".into(),
-            },
-        );
-        let mut stage = stage_run(&run, "implement", "did it\x1b[2J\nrun x: succeeded\x07");
-        stage.structured = Some(serde_json::json!({"pr_url": "https://x\x1b[2K\n/1"}));
-        let gate = OperatorGate {
+    fn rejected_with_escapes(run: &PipelineRun) -> OperatorGate {
+        OperatorGate {
             run: run.id.clone(),
-            item: item.id.clone(),
+            item: run.item.clone(),
             stage_id: "propose".into(),
             attempt: 1,
             subject: GateSubject::Proposal,
@@ -605,8 +750,29 @@ mod tests {
             withdrawn: None,
             opened_at: archon_core::now(),
             decided_at: None,
+        }
+    }
+
+    #[test]
+    fn item_detail_strips_escapes_from_agent_text() {
+        let mut item = queue_item(None, "title\x1b]52;c;cm0gLXJm\x07", "direct");
+        item.brief = "line one\x1b[2J\nline two\r".into();
+        item.tags = vec!["t\x1b[8m".into()];
+        item.state = QueueState::Cancelled {
+            reason: Some("gone\u{9b}2J".into()),
         };
+        let run = pipeline_run(
+            &item,
+            RunState::Failed {
+                stage_id: "implement".into(),
+                error: "boom\x1b[1A\x1b[2K".into(),
+            },
+        );
+        let mut stage = stage_run(&run, "implement", "did it\x1b[2J\nrun x: succeeded\x07");
+        stage.structured = Some(serde_json::json!({"pr_url": "https://x\x1b[2K\n/1"}));
+        let gate = rejected_with_escapes(&run);
         let detail = ItemDetail {
+            steers: Vec::new(),
             waiting_on: None,
             waiting_reason: None,
             item,
@@ -614,6 +780,8 @@ mod tests {
             stages: vec![stage],
             spent_usd: 0.0,
             gates: vec![gate],
+            delegations: Default::default(),
+            switched_to: None,
         };
         let text = item_detail(&detail, &RepoNames::new(), true);
         assert_inert(&text);

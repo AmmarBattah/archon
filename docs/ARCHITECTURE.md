@@ -30,6 +30,7 @@ Contents:
 16. [Failure modes and recovery](#16-failure-modes-and-recovery)
 17. [Aether limitations and how Archon handles them](#17-aether-limitations-and-how-archon-handles-them)
 18. [Autonomy](#18-autonomy)
+19. [Learning](#19-learning)
 
 ---
 
@@ -47,9 +48,11 @@ Contents:
   outcomes and direct replies. Everything else stays in Aether's TUI and
   `archon log`.
 - **The orchestrator decides and the daemon enforces.** The orchestrator
-  picks the pipeline, model and effort for every stage. The daemon validates
-  those picks against the model policy, caps and budgets, and refuses anything
-  outside them with an error that names the allowed values.
+  picks the pipeline and its review level, and the model and effort of the
+  stages it has a reason to choose for; the daemon fills the rest with
+  defaults. The daemon validates every pick against the model policy, caps
+  and budgets, and refuses anything outside them with an error that names
+  the allowed values.
 - **Durable first.** SQLite is authoritative. Every Aether call that creates
   work carries an idempotency key derived from an Archon id, so a crash at any
   point can be retried without duplicating agents.
@@ -78,7 +81,7 @@ Contents:
 | `archond` (`archon daemon run`) | The Archon daemon: store, dispatcher, pipeline engine, Aether link, orchestrator supervisor, feed, lavish plugin. | Long-running; autostarted by any `archon` client. |
 | `archon` | The CLI, a client of `archond`. With no subcommand it opens the terminal UI (`archon tui`, §4.7); `archon chat` is the quiet operator chat (§12). | Per command. |
 | `archon mcp` | Stdio MCP server. Aether spawns it as the `archon` MCP server, and it proxies each tool call to `archond`. | Owned by `aetherd`. |
-| `aetherd` (Archon's own) | In dedicated mode (the default), an unmodified `aether daemon` with its config, store and socket under Archon's directories (§4.7). | Started by any `archon` command that needs `archond`; stopped by `archon daemon stop --aether`. |
+| `aetherd` (Archon's own) | In dedicated mode (the default), an unmodified `aether daemon` with its config, store and socket under Archon's directories (§4.7). | Started by any `archon` command that needs `archond`; stopped by `archon daemon stop` (not with `--keep-aether`). |
 | orchestrator | One long-lived root Aether agent (`role = "archon-orchestrator"`). Uses native tools plus `mcp__archon__*`. | Created once and supervised by `archond`. |
 | run node | One passive root Aether agent per pipeline run (`role = "archon-run:<pipeline>"`), never started. Its children are the run's stage agents, so Aether's tree shows one subtree per item. | Created with the run's first stage agent; cancelled when the run finishes. |
 | stage agents | One Aether agent per stage attempt and fan-out slot, a child of its run node. | Created and settled per stage. |
@@ -139,7 +142,7 @@ daemon also serves 14).
 
 ```json
 {"req":1,"cmd":"hello","protocol_version":17,"client_name":"archon",
- "client_version":"1.0.1","features":[]}
+ "client_version":"1.1.0","features":[]}
 ```
 
 The reply is `Welcome {protocol_version, daemon_version, instance_id,
@@ -194,16 +197,17 @@ or schedules, and never touches the GitHub watcher of an Aether it shares.
  "config":{"instructions":"<built-in orchestrator prompt + [orchestrator].instructions_file>",
            "effort":"high",
            "long_lived":true,
-           "tools":{"mode":"except","names":["delegate","integrate_workspace"]}},
+           "tools":{"mode":"except","names":["integrate_workspace"]}},
  "idempotency_key":"archon-orchestrator-<generation>",
  "start":true}
 ```
 
 - It is a **root** agent. Archon stores its id in `kv.orchestrator_agent`.
-  Stage work does not hang under it (§4.5): Aether's `cancel` and `restart`
-  cascade to live descendants, so recreating the orchestrator (a new
-  generation, §16) would cancel every in-flight stage; a child's scope must
-  sit inside its parent's, and the orchestrator's is a scratch directory; and
+  Stage work does not hang under it (§4.5): Aether's `cancel` cascades to
+  live descendants, and Archon cancels what a replaced orchestrator left
+  running (§16), so replacing the orchestrator would cancel every in-flight
+  stage; a child's scope must
+  sit inside its parent's, and the orchestrator's holds no worktree; and
   a child may not gate less than its parent, while stage agents gate nothing.
 - An explicit `scope` gets `network: denied` unless it says otherwise. Aether
   applies its `[network] default` only to roots created without a scope, so
@@ -214,15 +218,106 @@ or schedules, and never touches the GitHub watcher of an Aether it shares.
   `"approval":{"require_for":[]}` instead, from the next generation on
   (`archon orchestrator restart` applies it at once; §18.4).
 - It keeps Bash, file tools, web tools and Aether's `ask_user`, `wait_for`,
-  `remember`, `send_message`, `list_agents`, `read_task` and `read_artifact`.
-  It loses Aether's `delegate`: all worker creation goes through Archon so caps
-  and the model allowlist apply. Ad-hoc questions use the `ask` pipeline.
-- Its workspace is a scratch directory. It reads repositories by absolute path;
-  its native tools are not confined (an Aether limitation, §17).
-- `archon-daemon/prompts/orchestrator.md` is the built-in prompt. It explains
-  the MCP tools, the notify vocabulary, model selection within the allowlist
-  weighing pipeline nudges as advice, and quiet-chat rules ("final replies to
-  operator messages are shown; everything else must go through `notify`").
+  `remember`, `send_message`, `list_agents`, `read_task`, `read_artifact` and
+  `delegate`. It loses `integrate_workspace` (§18.4), and `delegate` too
+  while Aether does not name the agents that call Archon's tools (§11).
+- Its workspace holds `repos/<name>`, a mirror of each registered repository
+  (§13.3), and `scratch/` for work in no repository. It reads code in the
+  mirrors. Its native tools are not confined to the workspace (an Aether
+  limitation, §17).
+- `archon-daemon/prompts/orchestrator.md` is the built-in prompt, held to
+  12 KiB by a test. It gives the order in which to decide how a request is
+  done (answer, read the mirror, delegate, enqueue the cheapest pipeline that
+  fits), the review level and model plan of an item, what a helper is given,
+  the two operator views, which news wakes it (§5.4) and the GitHub policy.
+  What one tool does is said once, in that tool's description (§11), and the
+  prompt does not repeat it. Archon appends `## This installation` to it:
+  the orchestrator's workspace, where its mirrors and scratch directory are,
+  and the user pipelines directory, resolved for this machine.
+- Every Archon tool is the orchestrator's, and tests hold that the prompt
+  names each one. After the paths Archon appends `## Learned observations`,
+  the lessons chosen for this generation of the orchestrator (§19): quoted,
+  under their own heading, and said there to be advice that grants nothing.
+
+**What the orchestrator does without an item.** It answers what it knows or
+can look up, reads code in a mirror, and delegates what would flood its
+context or splits into parts: research on the web or in documents, a wide
+read of a subsystem, a comparison, a draft, a second look at a result. A
+question about a repository's code is answered in the turn that asks it,
+with no item, no worktree and no ship stage. `ask` is still a pipeline, for
+a question worth a recorded run and for a repository whose mirror is
+withheld (§13.3), but nothing requires it. Every change to a repository is
+an item (`enqueue`), so that Archon's worktrees, ship modes, gates, caps and
+budgets apply. The prompt says so, and the daemon stands behind it:
+
+- *A helper works in a mirror or in scratch, never in a repository.* Aether
+  accepts a child's `workspace_root` only under its parent's, and the
+  mirrors are under the orchestrator's, so a helper is given one mirror:
+  shared, to read it, or `workspace_mode: "isolated"`, which Aether makes a
+  git worktree of that mirror on a branch of the mirror's own, to build or
+  try something. Neither reaches the operator's checkout (§13.3). The
+  watchdog (§7.4) reads each helper's scope from Aether and cancels one whose
+  `workspace_root` or `allowed_paths` lead into a registered repository or
+  the worktrees root, resolving symlinks, since Aether compares scope paths
+  as written (`Scope::is_narrowing_of`). What stays inside the orchestrator's
+  own workspace, its mirrors included, passes. The check covers where a
+  helper was placed, not what a native engine's tools can open beyond it
+  (§17).
+- *No integration.* `integrate_workspace`, which copies an isolated child's
+  worktree back, stays hidden: the orchestrator ships nothing, and what a
+  helper commits in a mirror stays in the mirror.
+- *No delegation for an external request.* The prompt forbids `delegate` for
+  a GitHub request without operator standing; such a request is answered
+  directly, from that repository's mirror when it takes code. Only the
+  prompt holds this: the daemon
+  cannot tell which request a helper serves. It reads a trigger, and the
+  turn that takes it, on the orchestrator's event stream, and a helper's
+  creation on the fleet's, which has its own cursor; and one turn may take
+  an external request together with an operator message or a helper's
+  result. The rule sits in the prompt's
+  delegation section, and its `## GitHub requests` section is unchanged, so
+  an orchestrator started by an earlier release, which has no `delegate`,
+  still passes the GitHub policy check (`has_github_policy`).
+
+**What a delegated child is.** It inherits the orchestrator's `config`:
+its tool exposure and approval policy, though not its instructions. Aether
+gives a child only the `instructions` its parent passes to `delegate`, or
+none, so no rule of the prompt reaches a child by itself: the prompt has
+the orchestrator state in each child's `instructions` that it commits and
+pushes nothing, stays in the workspace given, overrides no git identity,
+asks the operator nothing, and passes the same rules to any agent it
+starts. So:
+
+- It sees Archon's MCP tools. `archond` lets a mutating one through only
+  for the current orchestrator, by the caller Aether names on the call
+  (§11), so a child reads the queue but cannot change it.
+- The stage-agent watchdog adopts it (§7.4). A helper is held to the global
+  `[models]` policy narrowed by the policy of each repository whose mirror
+  its scope reads: one given the mirror of `api` answers to `api`'s policy
+  and to no other repository's, and one given `scratch/` to the global
+  policy alone. A model or an effort that policy refuses gets the helper
+  cancelled, and the orchestrator hears `policy_violation`. Its spend counts
+  toward the daily and total budgets.
+- It may delegate once more. An agent a third delegation below the
+  orchestrator is cancelled for its depth (§7.4), whatever its model. That
+  is `[limits] max_delegation_depth = 2`, which the "This installation"
+  section of its prompt states.
+- It is outside `max_parallel_agents` and `max_stage_agents_per_item`, which
+  count stage agents (§7.1). The prompt holds the orchestrator to the
+  parallel-agent cap, counting its own children with Aether's `list_agents`,
+  and to no children while a budget holds dispatch; the daemon does not
+  enforce either.
+- Its result reaches the operator through the orchestrator. A turn that
+  ends waiting for a child leaves the operator's message open, so the reply
+  the orchestrator gives when the child reports is the one `archon chat`
+  shows (§12).
+- It is the orchestrator's child in Aether, so it ends when the orchestrator
+  is replaced. Aether's `cancel` takes an agent's live descendants along. A
+  failed orchestrator leaves them running, so when a new agent takes over
+  from one, Archon cancels the old agent's subtree, whose results would
+  otherwise reach nobody. Each retired generation is recorded before the new
+  one starts and swept in the background until Aether confirms, across
+  restarts of `archond` and along Aether's own restart chain (§16).
 
 ### 4.5 Stage agents and run nodes
 
@@ -234,11 +329,11 @@ In `archon tui` (Aether's TUI) an item therefore reads as
 
 ```
 Archon                                  archon-orchestrator
-add a greeting                          archon-run:default-pr-review
-  #q69g5fav implement · add a greeting            archon-stage:default-pr-review/implement
-  #q69g5fav review 1/2 · add a greeting           archon-stage:default-pr-review/review
-  #q69g5fav review 2/2 · add a greeting           archon-stage:default-pr-review/review
-  #q69g5fav ship · add a greeting                 archon-stage:default-pr-review/ship
+split the parser                        archon-run:refactor
+  #q69g5fav baseline · split the parser           archon-stage:refactor/baseline
+  #q69g5fav refactor · split the parser           archon-stage:refactor/refactor
+  #q69g5fav verify · split the parser             archon-stage:refactor/verify
+  #q69g5fav review · split the parser             archon-stage:refactor/review
 ```
 
 `archon aether agents` passes through to Aether's flat table, which shows
@@ -349,10 +444,12 @@ carries each agent's `parent`.
  "approval":{"require_for":[]},                       // headless: gate nothing
  "config":{"instructions":"<stage contract, §8.6>",
            "effort":"<effort>",
-           "leaf":true,                                // false only when tools = yolo
+           "leaf":true,                                // false when stage.allow_delegation or tools = yolo
+           "long_lived":false,                         // true for the agent kept through a fix loop (§6.7)
            "cost_budget":<remaining item budget, a team slot's share of it (§13.1), or omitted>,
            "deadline":"<now + stage.timeout_minutes>",
-           "tools":{"mode":"except","names":["mcp__archon__enqueue", "…every archon tool…"]}},  // yolo: only the mutating ones (§18.4)
+           "tools":{"mode":"except","names":["mcp__archon__enqueue", "…every archon tool…",  // yolo: only the mutating ones
+                                             "create_schedule", "update_schedule", "list_schedules"]}},  // §18.4
  "run":"<the run's Aether run id (its node's), if known when reserved>",
  "idempotency_key":"<stage run id>",
  "start":true}
@@ -408,8 +505,8 @@ at-least-once, so every handler is idempotent.
 
 | Subscription | Query | Handles |
 | --- | --- | --- |
-| `orchestrator` | `{agent: <orchestrator>, types:["agent.message","agent.turn_completed","agent.started","question.asked","agent.failed","agent.cancelled","agent.completed","agent.restarted","agent.usage_updated","inbox.delivered","inbox.consumed"]}` | Chat replies (§12), questions, supervisor, adopting an Aether restart (§16), orchestrator spend. |
-| `fleet` | `{types:["agent.created","task.completed","task.failed","task.cancelled","agent.failed","agent.cancelled","agent.usage_updated","question.asked","inbox.delivered"]}` | Stage completion, spend ledger, stage questions, model-policy watchdog, run-node inbox forwarding and authenticated relay provenance. |
+| `orchestrator` | `{agent: <orchestrator>, types:["agent.message","agent.turn_completed","agent.waiting","agent.started","question.asked","agent.failed","agent.cancelled","agent.completed","agent.restarted","agent.usage_updated","inbox.delivered","inbox.consumed","compaction.completed"]}` | Chat replies (§12), questions, supervisor, adopting an Aether restart (§16), orchestrator spend, restating the directives after a compaction (§18.5). |
+| `fleet` | `{types:["agent.created","task.completed","task.failed","task.cancelled","agent.failed","agent.cancelled","agent.completed","agent.usage_updated","question.asked","inbox.delivered"]}` | Stage completion, spend ledger, stage questions, model-policy watchdog, run-node inbox forwarding and authenticated relay provenance. An agent's end (`agent.completed`, `agent.failed`, `agent.cancelled`) also wakes the dispatcher, which stops what a settled stage agent delegated (§6.3). |
 
 The `fleet` subscription also forwards message inbox entries addressed to
 run nodes (§5.5). `agent.created` events whose `parent_agent_id` is
@@ -433,7 +530,11 @@ set, since it cannot be compared with the cap.
 A settling event (`task.*`, `agent.failed`, `agent.cancelled`) can arrive
 before the spawn reply that tells Archon the agent is a stage's. The stream
 is handled in order, so such an event waits (up to 5 s) only when it could
-be one: its agent is neither a stage agent, a run node
+be one. The wait is not a poll: the executor signals each spawn whose
+outcome it recorded (`DaemonContext::spawn_recorded`) and the waiting event
+looks again at once, with one more look a second as a net for a stage that
+stops spawning any other way. An event could be a spawning stage's when its
+agent is neither a stage agent, a run node
 (`kv.run_node_agent`, which covers every retired node's `agent.cancelled`
 for the 7-day retention of §16)
 nor a watched child, and some `spawning` stage whose request may have
@@ -517,9 +618,9 @@ the detached daemon listens. `archond` itself never starts Aether. In
 dedicated mode it connects only to the instance's socket, and config
 validation refuses `[aether] socket` or `address`.
 
-- `archon daemon stop` stops `archond`.
-- `archon daemon stop --aether` (alias `--all`) then also runs `aether stop`
-  against the instance.
+- `archon daemon stop` stops `archond`, then in dedicated mode runs `aether
+  stop` against the instance. `--keep-aether` stops only `archond`;
+  `--aether` (alias `--all`) is refused in shared mode.
 - `archon daemon status` shows both daemons.
 - `archon tui` connects/starts archond and the selected Aether instance, then
   sends operator-only `OrchestratorAttach`. The supervisor ensures a live
@@ -546,7 +647,43 @@ validation refuses `[aether] socket` or `address`.
   into the empty directory.
 
 Because the instance's config always declares the server before its daemon
-first starts, no restart is ever needed.
+first starts, a new install never needs a restart.
+
+**Keeping the registration current.** An upgrade can need something of the
+registration that an older `archon setup` did not write; today that is
+`send_caller_meta = true` (§11). The instance's config is Archon's own file,
+so Archon repairs it without the operator, on every path an upgrade takes
+(the installer, `archon update`, a source install): the repair is part of
+the start check every command runs, not of a migration step.
+
+- The check also asks whether the `archon` server entry lacks what this
+  binary needs. If so the command takes the start lock, writes
+  `<archon data>/aetherd-reload-owed`, and rewrites the entry in place
+  (`migrate_archon_server`: the field is set and missing tool classes are
+  added; the entry's other settings and every other section are kept, the
+  file's leading comment block too; other comments are lost, in a file
+  Archon generated). The result is parsed and checked before an atomic
+  write. A config that does not parse is left alone and reported by `archon
+  doctor`.
+- Aether reads MCP settings only as it starts, so an `aetherd` that already
+  answers still has the old registration. While the marker exists, a
+  listening `aetherd` is stopped (`aether stop`, waiting up to 15 s for the
+  socket to go quiet) and started again; the marker is removed once no
+  `aetherd` runs with the old registration. The marker is written before
+  the file changes, so a crash in between costs one restart too many, never
+  one too few. `archon setup` and `archon setup --resync` do the same.
+- An `aetherd` that has just stopped answering may hold its store a moment
+  longer, and the `aether daemon` that follows then exits with `another
+  aether daemon is already running`. On that one error the start is retried
+  every 250 ms for up to 15 s; any other failure is returned at once. This
+  also covers `archon daemon stop` followed directly by a command
+  that starts it again.
+
+Not covered: a config that was brought up to date by hand or by an older
+binary's `--resync` while `aetherd` kept running leaves no marker, so
+nothing tells Archon the daemon is stale. `archond` notices the unnamed
+calls (§11) and its notice names the restart: `archon daemon stop`,
+after which any command starts it again.
 
 **Shared mode.** `[aether] mode = "shared"` keeps the earlier behaviour.
 Archon uses the operator's `aetherd` (`[aether] socket`/`address`, else
@@ -573,21 +710,24 @@ classes = { list_pipelines = "read_only", list_repos = "read_only", model_policy
             set_directive = "mutation", clear_directive = "mutation" }
 ```
 
-Within one daemon, MCP servers are global, and Aether passes no caller
-identity to them, so every agent of the daemon that runs `archon mcp` can see
-`mcp__archon__*`. In dedicated mode those agents are all Archon's. Archon
+Within one daemon, MCP servers are global, so every agent of the daemon that
+runs `archon mcp` can see `mcp__archon__*`. In dedicated mode those agents are all Archon's. Archon
 narrows this in three ways:
 
 1. Stage agents get `tools: except [mcp__archon__…]`: every Archon tool, or
    only the mutating ones for an item with `tools = yolo` (§18.4).
 2. Tool calls are treated as orchestrator calls, except `message_orchestrator`,
-   which requires stage-agent caller metadata (§5.5).
+   which requires stage-agent caller metadata (§5.5). `archond` lets a
+   mutating tool through only for the current orchestrator, by the caller
+   Aether names (§11).
 3. Operator-only actions (raising an autonomy ceiling, caps, repo removal,
    chat messages, answers to questions, hard pause) are not exposed over MCP
    at all.
 
-In shared mode, a non-Archon Aether agent that calls these tools acts as the
-orchestrator (§17).
+In shared mode, a non-Archon Aether agent can read with these tools. Through
+a registration without `send_caller_meta`, which cannot tell callers apart,
+it can change Archon only while the orchestrator in charge cannot delegate
+(§11, §17).
 
 On the `claude-code` engine Aether serves its harness tools and every MCP
 server's tools through one `aether` MCP bridge, so claude names Archon's tools
@@ -605,8 +745,9 @@ orchestrator sees all of Archon's tools. Guarded stages now expose only
    Its `inbox.delivered` event makes the chat await the reply (§12).
 2. The orchestrator reads the catalog (`list_pipelines`, `model_policy`,
    `list_repos`, `autonomy_policy`), plans, and calls `enqueue` once per unit
-   of work with a full `model_plan`, optional per-stage `model_reasons`, and
-   the autonomy knobs it chose (§18.1).
+   of work with the autonomy knobs it chose (§18.1) and, for the stages
+   whose model it has a reason to choose, a `model_plan` entry with an
+   optional `model_reasons` line. Archon fills the stages left out (§7.4).
    It replies to the operator in its final turn text, which
    becomes `FeedEntry::Orchestrator`.
 3. The dispatcher (§7) selects the item and moves it to `Dispatching`. It
@@ -619,7 +760,8 @@ orchestrator sees all of Archon's tools. Guarded stages now expose only
    task makes the daemon read the outcome with `get_task`, persist it with its
    `Verdict`, and feed it to `RunDriver::on_stage_finished`. The driver returns
    the next actions: spawn the next stage, loop back with feedback, wait for
-   the operator at a gate (§18.3), or finish.
+   the operator at a gate (§18.3), have archond deliver the change (§8.7),
+   or finish.
 6. When the run finishes, the item reaches a terminal state. The daemon
    appends a feed `Blocker` when operator action is needed, otherwise an `Outcome`, triggers the orchestrator with `item_finished`,
    and releases capacity so the dispatcher runs again. The orchestrator may
@@ -723,12 +865,32 @@ gate, and the operator's `/answer` or `archon answer` closes what it cannot.
 `agent.usage_updated` carries **absolute** totals per agent. The ledger stores
 one `(agent, cost_usd, cost_basis, estimated_cost_usd, tokens)` row per agent
 with what has been charged for it, and splits each charge into the local days
-in which it grew. A charge never goes down: a lower total (a usage correction)
-keeps the cost and estimate already charged, so it cannot credit a day and
-undercut the daily budget. `GetItem` reports each
-stage's cost from its agent's ledger row and derives each run's `cost_usd`
+in which it grew. Aether prices a turn at list price while it streams and
+replaces that with the provider's figure when the turn ends, so a total may
+come down. A *settled* total (`cost_basis = provider_reported` with
+`cost_complete = true`) is the agent's charge, and all of it is billed. It
+never goes below the highest settled total before it (`spend.settled_cost_usd`,
+schema V9), so reporting less cannot evade a budget. What it takes back comes
+out of that agent's own days, newest first, so no day is credited with what
+another agent spent in it. Any other lower total keeps the cost already
+charged and is logged as a warning; the estimate is never settled and only
+grows. `GetItem` reports each
+stage's cost from its agent's ledger row plus the rows of the agents it
+delegated to, and derives each run's `cost_usd`
 from that run's stages and delegated descendants on every read, including terminal runs. Late usage
 therefore remains with its own stage and run across retries and restarts.
+A kept agent passing to a later attempt records what it and the agents
+beneath it had been charged (kv `agent-handoff/<agent>/<attempt>`), and
+each attempt is charged only what was spent between its hand-off and the
+next, so an item's attempts add up to what its agents cost.
+A stage that delegated also reports the split (`delegations` in `GetItem`,
+`delegation` in `GetStage`): its own agent's cost, the delegated agents'
+cost, and each delegated agent with its parent, model, effort and cost.
+Schema V8 (`delegated_agents`) records who delegated to whom as the watcher
+links each child, and the child's effort when the stage's owed stop is
+confirmed (§6.3); until then the effort reads as unknown. A run's and an
+item's totals sum each agent once, so the split adds nothing to them. Model
+evidence compares the same complete stage cost.
 The persisted finish-time run cost is retained for compatibility, but is not
 authoritative for item detail. Delegated children count toward item/global
 budgets and their own run totals, but have no stage rows. Schema V6 records
@@ -778,8 +940,10 @@ is billing, `list_price` is an estimate, and `unknown` or `mixed` is
 unclassified because no trustworthy split is supplied. Separate raw
 `estimated_cost_usd` always contributes to the estimate column. Schema V5
 labels existing agent rows `unknown`. Schema V7 records billed, list-price and
-unclassified growth separately in each daily row. Later usage, including a
-lower correction or a changed basis, cannot relabel amounts already charged.
+unclassified growth separately in each daily row. Later usage with a changed
+basis cannot relabel amounts already charged, with one exception: a settled
+total says every dollar of the agent's cost was provider-reported, so it
+moves that agent's days to billed.
 Mixed growth stays unclassified because Aether supplies no component amounts.
 Daily rows predating V7 migrate as unclassified: the mutable cumulative basis
 cannot recover their historical provenance. Raw costs and separate estimates
@@ -806,8 +970,61 @@ is saved in kv `trigger_outbox` when it is pushed, before any coalescing, so
 news waiting in the window survives an `archond` stop or crash. The outbox
 also keeps the keyed batch, so a restart resumes it under the same key.
 After a quiet spell, delivery waits the window from the first event. News
-pushed while a batch is delivered has waited already and goes out right
-after it.
+the operator waits on or must act on ends the window at once: an
+`operator_answer`, a `chat_answer`, a `gate_opened`, an `item_blocked`,
+`lavish_feedback`, a `budget` and a stage's escalation
+(`TriggerEvent::is_urgent`). News pushed while a batch is delivered has
+waited already and goes out right after it.
+
+**Which news wakes the orchestrator.** A wake is a whole turn of the
+orchestrator over its context, so the daemon spends one only on news the
+orchestrator has something to do about. Every finished item reaches the
+operator from the daemon itself, as an `Outcome` or `Blocker` feed entry
+(§5.1), and its `item_finished` news is then either *waking* or *quiet*
+(`executor::finish::announce`):
+
+| Outcome | News |
+| --- | --- |
+| Failed, or the operator must act (a `Blocker`, a `BLOCKED:` result) | wakes |
+| Succeeded with an `origin`: a GitHub thread is owed the result | wakes |
+| Succeeded and tagged `notify` by whoever queued it | wakes |
+| Succeeded otherwise, with no other item queued, dispatching or running | wakes unless `wake_on_success = false` |
+| Succeeded otherwise, while other items are queued, dispatching or running | deferred, then wakes |
+| Cancelled | quiet |
+
+A success wakes by default because Aether's terminal UI shows only what the
+orchestrator says, and Aether 1.0 has no way to add an entry to an agent's
+chat without starting its turn. A deferred success is held in the outbox
+with a `defer_until` at most five minutes ahead (`MAX_SUCCESS_DEFER`). It
+wakes nothing until that time, and it rides with any news that wakes before
+then, so the last item of a batch to finish reports all of them in one
+turn. The check for other unfinished items and the hold are made under one
+store lock, so the last success to finish always wakes.
+
+A waking failure also carries `lesson_hint` (§19). An initiative's member
+makes no `item_finished`: its initiative's `initiative_finished` wakes once
+it is done or failed (§8.9), carrying each finished member's state, summary
+and cost as `results`.
+
+Every other event wakes: `agent_message`, `item_blocked`, `gate_opened`,
+`operator_answer`, `chat_answer`, `lavish_feedback`, `budget`,
+`policy_violation`, `directives_restated`, `initiative_finished`. A mirror's change of state
+(§13.3) is quiet. Quiet news is saved in the outbox like any other and makes
+no trigger by itself. It leaves with the next trigger there is, and an
+operator message sends it at once, without the coalescing window
+(`triggers::flush_quiet`, called before the message is delivered), deferred
+news too. `flush_quiet` returns once Aether has the batch in flight and the
+flushed one, or after 10 seconds while Aether is unreachable, so the turn
+that answers the operator has read it. When it is keyed, the quiet
+outcomes become one `items_finished` event at the end of the batch: item,
+title, state, pull request and cost of the newest outcome of each item, at
+most 20, with `more` counting the rest, and without an outcome the item no
+longer shows (it was retried since).
+
+An `agent_message` is one feed entry the daemon writes with the news, in
+the same transaction (§5.5), so the orchestrator does not echo it: an
+escalation shows in the quiet chat as a `Blocker`, a relay or info with
+progress.
 
 While the orchestrator is down this news is held. A new, revived or
 adopted orchestrator gets a retry at once, and the held batches reach it in
@@ -834,6 +1051,9 @@ neither forces compaction. Compaction:
   and an `item_blocked` when the item is no longer blocked;
 - drops any other event older than an hour;
 - then keeps the newest of the rest, up to 10 events in all.
+
+Quiet outcomes are folded into their `items_finished` list before this and
+are not counted against the 10.
 
 What was dropped is counted by type in one `news_digest` event at the head
 of the batch, which points to `list_queue`, `get_item` and `archon log` for
@@ -863,21 +1083,53 @@ into its own, so one batch never carries two digests.
    "prompts": ["…"], "text": "…the poll output without its dom_snapshot…"},
   {"type": "budget", "scope": "daily", "spent_usd": 51.0, "limit_usd": 50.0},
   {"type": "policy_violation", "agent": "agt_…", "model": "…", "action": "cancelled"},
+  {"type": "mirror", "repo": "api", "state": "stale", "detail": "…git's error…"},
+  {"type": "directives_restated", "reason": "your context was compacted"},
   {"type": "news_digest", "dropped": {"item_finished": 12, "item_blocked": 3},
-   "note": "15 older or no longer actionable news events were left out. …"}
+   "note": "15 older or no longer actionable news events were left out. …"},
+  {"type": "items_finished", "more": 4, "items": [
+    {"item": "qi_…", "title": "…", "state": "succeeded", "pr_url": "…", "cost_usd": 0.41}]}
  ],
  "directives": [{"id": "dir_…", "text": "auto-merge docs fixes today", "source": "operator",
                  "set_at": "…", "expires_at": "…"}],
- "summary": "7 events: item finished: qi_… succeeded, item blocked: qi_…, …"}
+ "directive_changes": {"set": [{"id": "dir_…", "text": "…"}], "cleared": [{"id": "dir_…", "text": "…"}]},
+ "directives_in_force": 3,
+ "summary": "9 events: item finished: qi_… succeeded, item blocked: qi_…, …"}
 ```
+
+A payload carries `directives` or `directive_changes`, never both, and
+neither when nothing changed (below).
 
 The top-level `summary` is a derived display label, at most 160 characters,
 with whitespace collapsed and Unicode control/format characters removed.
 It names the single event or the count and labels of a batch. Full event
 bodies and directives remain authoritative and are retained unchanged.
 
-Every payload restates the operator directives in force (§18.5), so they
-survive an orchestrator restart or a compacted context.
+**Directives in a payload** (§18.5). Restating every directive in every
+trigger was most of a typical payload, so they are sent in full once per
+orchestrator generation and as changes after that. The first trigger of a
+generation carries `directives`, all in force. A later one carries
+`directive_changes` (`set`, `cleared`: withdrawn or expired) when something
+changed since the trigger before, and no directive field when nothing did.
+Every trigger carries `directives_in_force`, the count: an orchestrator
+that holds fewer reads them with `autonomy_policy`. What the current
+generation was told is kept in kv `trigger_directives_told` and decided when
+a batch is keyed, so a retry under the batch's key sends the same payload.
+
+Whenever the orchestrator may have lost them, the next trigger states them
+all again and says why in a `directives_restated` event, and when any
+directive is in force that trigger is sent at once, so no request is acted
+on without them:
+
+- a new generation (created, or replaced after a failure);
+- a revival of the same agent from its checkpoint, which may predate them;
+- Aether's `compaction.completed` on the orchestrator's stream: its older
+  context became a summary.
+
+An orchestrator an earlier Archon started has a prompt that expects every
+directive in every trigger, so it keeps getting them in full: kv
+`trigger_directive_changes_from` holds the first generation this build
+started, and only that one and later ones are sent changes.
 
 `gate_opened` is pushed when an operator gate's question is recorded
 (§18.3), under the same store lock, so the orchestrator can restate the gate
@@ -909,11 +1161,17 @@ can supply caller identity; the daemon checks it against recorded stage ownershi
 Caller identity is not an argument the model can supply; missing metadata,
 unknown callers and settled stage callers are refused visibly.
 
-Archond resolves the caller's stage and records a progress notification in
-the item's log, carrying item, pipeline run, stage run, stage, attempt,
-agent, kind, text and original sender. One SQLite transaction commits that
-log entry, the sender's count and an `agent_message` news event in the
-durable outbox. The receipt is the feed entry id. The tool does no Aether
+Archond resolves the caller's stage and records the message in the feed
+for the operator to read as it is: `From <stage> (<sender>; <kind>): <text>`,
+the whole text, as a `Blocker` for an escalation, which the quiet chat
+shows, and as `Progress` for a relay or info. The orchestrator therefore
+never repeats a message to the operator; it acts on it. The news event
+carries item, pipeline run, stage run, stage, attempt, agent, kind, text and
+original sender. One SQLite transaction commits the feed entry, the
+sender's count and the `agent_message` news event in the durable outbox.
+A sender's count is capped at `[limits] max_agent_messages` (20 by
+default), and so is each run node's count of external messages; the
+refusal names the key. The receipt is the feed entry id. The tool does no Aether
 I/O and does not settle the stage. Stage instructions and the receipt say
 to continue working: ending a turn would complete the stage, and sending
 a message is never a reason to wait or end it.
@@ -945,7 +1203,8 @@ operator and system inbox messages have a separate cap of 20 per run node.
 The tool returns a clear error above the cap. Invalid or excess run-node
 messages produce an idempotent refusal to the sending agent, or a notice
 in the operator feed. Accepted messages share the normal trigger coalescing
-window and remain pinned through compaction until delivery. Counts and
+window, which an escalation ends (§5.4), and remain pinned through
+compaction until delivery. Counts and
 routing tombstones are kept through the late-message window. Message counts
 remain durable so restarts or routing recovery cannot reset limits.
 
@@ -967,8 +1226,8 @@ remain durable so restarts or routing recovery cannot reset limits.
    │          │             │
    │   ┌──────┴──────┐      │ worktree/spawn error
    │   ▼             ▼      ▼
-   └ failed ◀──── (run failed)
-     succeeded (run succeeded)
+   ├ failed ◀──── (run failed)
+   └ succeeded (run succeeded)
 ```
 
 The legal edges are implemented in `QueueState::can_transition_to`:
@@ -977,8 +1236,14 @@ The legal edges are implemented in `QueueState::can_transition_to`:
 - `dispatching` can go to `running`, `failed` or `cancelled`.
 - `running` can go to `succeeded`, `failed` or `cancelled`.
 - `blocked` can go to `queued` or `cancelled`.
-- `failed` and `cancelled` can go back to `queued` (operator or orchestrator retry).
-- `succeeded` is final.
+- `failed`, `cancelled` and `succeeded` can go back to `queued` (operator or
+  orchestrator retry; the `retry` edge above). Until 1.1 `succeeded` was
+  final. A retried `succeeded` item runs again in its worktree and on its
+  branch (a fresh retry forks a new branch from the base), delivers into the
+  pull request it has, and the retry is a `retry_after_done` correction of
+  the run that had passed (§19), written with the transition. A dependent
+  still queued waits for it to succeed again; one that already started goes
+  on. Until it is retried, a `succeeded` item takes no steer or update.
 
 When a dependency fails or is cancelled, its dependents move to `blocked` and
 the orchestrator gets an `item_blocked` trigger. When a dependency is retried,
@@ -990,8 +1255,10 @@ its blocked dependents move back to `queued`.
 `failed{stage_id, error}` or `cancelled{reason}`. Between stages it may wait
 in `awaiting_operator{stage_id, attempt, subject}` for an operator gate
 (§18.3); it holds no agent slot there, and its item stays `running`. A run
-belongs to exactly one item and an item has at most one non-terminal run. A
-retry creates a new run: in the item's kept worktree, or, for a fresh retry,
+belongs to exactly one item and an item has at most one non-terminal run.
+A run stays `running` at its last stage while archond delivers its change,
+and one whose delivery is refused fails with the stage id `ship`, a step no
+agent runs (§8.7). A retry creates a new run: in the item's kept worktree, or, for a fresh retry,
 in a new worktree off the base branch (§13).
 
 ### 6.3 Stage run (`StageState`)
@@ -1042,6 +1309,36 @@ in a new worktree off the base branch (§13).
   engages the disk hold (§7.3), and the replacement is reserved at once but
   issued only when the hold ends. Each slot counts its infra and its
   disk-full retries apart, by the error of each run it replaced.
+- **What a delegating stage agent left running is stopped before the run
+  goes on.** Aether cancels an agent's children with the agent, but not
+  when its task completes or fails, so a lead that settled while a child
+  still ran would leave it writing beside the next stage, or beside its own
+  replacement. A stage run whose agent could delegate (its stored request
+  has `leaf: false`, or the request is gone) therefore owes a stop when it
+  settles, whatever the outcome: `kv.descendant_stop:<stage run id>`, with
+  the run, the agent and the settle time, is written under the same store
+  lock as the settle and before it, and before a replacement is reserved: a
+  crash in between leaves a stop too many, never one too few. While a run
+  has one, none of its `spawning` stages is issued.
+  The dispatcher pays it in two steps. Once the agent's own turn has ended
+  (it is left up to 60 s to end it, as a retiring run node leaves it,
+  §4.5), Archon sends `cancel` for the agent, once: Aether applies a
+  `cancel` of an agent that already ended to every live agent beneath it,
+  at any depth, and keeps it pending until they have ended. Aether's
+  answer (or `not_found`) is stored in the record as `cancelled_at`. The
+  cancel is cooperative, so the answer does not mean anything has stopped:
+  each later dispatcher pass lists the agent's Aether run once and keeps
+  the record while any agent beneath it is in a non-terminal state. An
+  agent's end wakes the dispatcher (§4.6), so the wait ends with the last
+  of them rather than with the next tick. Only then is the record deleted
+  and the stages that waited issued. No answer or a transport error, to
+  the `cancel` or to the listing, leaves it owed, for the next dispatcher
+  pass or the next `archond`. A stop still unconfirmed 120 s after the
+  cancel posts one `Blocker` naming the agents that still run; the run
+  keeps waiting and a `System` entry says when it goes on. Any other
+  refusal of the `cancel` fails the run with a `Blocker`, and the run
+  node's retirement then cancels the whole subtree. A leaf stage agent
+  owes nothing.
 
 ### 6.4 RunDriver (pipeline engine)
 
@@ -1053,6 +1350,7 @@ pub enum EngineAction {
     CancelStage { stage_run: StageRunId, reason: String },
     AwaitOperator(OperatorWait),      // a gated stage passed; §18.3
     MergeTeam(MergePlan),             // a team stage passed; §13.1
+    Ship(ShipPlan),                   // every stage passed; archond delivers, §8.7
     Finish { state: RunState },
 }
 ```
@@ -1066,8 +1364,12 @@ Per stage:
    are evaluated: `all_pass` needs every verdict to be `pass`, `majority`
    needs more than half, and `any` needs at least one. `unknown` counts as
    fail.
-3. On success, go to the next stage, or finish with `succeeded`. The summary is
-   the last stage's summaries joined. A stage the item's knobs gate
+3. On success, go to the next stage. After the last one, a pipeline with
+   `[pipeline.ship]` emits `Ship` and waits for `on_shipped(outcome)`:
+   `Shipped` finishes `succeeded`, `Failed` finishes
+   `failed{stage_id: "ship", error}`. Any other run finishes `succeeded` at
+   once. The summary is the last stage's summaries joined, then the
+   delivery's `SHIPPED:` line. A stage the item's knobs gate
    (`RunDriver::with_gates`) first waits for the operator's decision, which
    `on_operator_decision` applies: go on, re-enter a stage with the feedback,
    or finish `cancelled` (§18.3). A revision resets the `on_fail` loop counts
@@ -1102,13 +1404,211 @@ between the decision and the cancels loses neither. `respawn` returns
 
 `RunDriver::resume(spec, run, stage_runs)` rebuilds the driver after a
 restart. Every decision derives from persisted stage runs, recorded gate
-decisions (`record_decision`) and recorded team merge outcomes
-(`record_merge`), and the driver has no hidden state.
+decisions (`record_decision`), recorded team merge outcomes
+(`record_merge`) and the recorded delivery outcome (`record_ship`), and the
+driver has no hidden state.
 
 An infra retry (§6.3) is not a settle: `RunDriver::respawn(failed, all)`
 returns the slot's original `SpawnPlan` (or `None` if the run is already
 decided), and the executor persists the failure and the new stage run in one
 transaction. The newest stage run of a slot supersedes older ones.
+
+### 6.5 Stage hand-off
+
+A stage starts with what the stages before it reported, so it does not
+spend its first turns finding that out again. `sections::context` appends
+`## Handoff from earlier stages` to the rendered prompt: one entry per
+earlier stage with a summary, and one for the stage's own last attempt when
+it is re-entered. Stages the prompt already shows are left out: one its
+template names as `{{previous.<id>.summary}}`, the proposal (it has its own
+section, §18.3), and what the change report covers for a ship stage or
+lists itself.
+
+The digest is bounded: at most 1,200 characters per stage and 4,000 in all
+(`HANDOFF_STAGE_CHARS`, `HANDOFF_TOTAL_CHARS`). When the budget runs out the
+nearest stages are kept, and the entries stay in pipeline order. A stage a
+steer skipped (§6.6) has no entry. The digest is prompt text, appended
+after rendering, so a summary is never read as a template; the workspace is
+stated to be the truth where the two differ.
+
+### 6.6 Steering
+
+A steer changes an item without cancelling it (`Request::SteerItem`,
+`archon_core::steer::Steer`). The orchestrator steers through `steer_item`,
+the operator through `archon queue steer`; a helper or a stage agent is
+refused (§11). `Steer::check` refuses one that changes nothing.
+
+| Field | On a running item | On an item with no live run |
+| --- | --- | --- |
+| `note` | Amends the brief (`## Amendment (<UTC time>)`) and the run's `task.brief`, so every prompt rendered from then on has it. Every live stage agent is sent it, and so is every live agent beneath one. | Amends the brief. |
+| `model`, `effort` (+ `stage`) | Changes every choice of the stage in the item's plan, checked against the model policy (§7.4), and patches the stage's live agents. `stage` defaults to the running stage. | Changes the plan; `stage` is required. |
+| `budget_usd` | Sets the item's cap. A live agent that carries a cap of its own gets the difference, a team's roles each their share. | Sets the item's cap. |
+| `extend_minutes` | Moves the deadline of every stage run working now. | Refused. |
+| `abort` (`then`: `retry`, `skip`, `goto`) | Ends the running attempt of `stage` as cancelled without judging it; the run then retries the stage, goes past it, or goes to the named stage. On a stage that has not started, only `skip`: the run passes the stage over when it reaches it. | Refused. |
+| `insert_stage {stage, from?, after?}` | Puts a copy of stage `stage` of pipeline `from` (the item's own when left out) among the stages that have not started: after `after`, or before the first of them. | The same, for every later run. A failed item is queued again (below). |
+| `switch_pipeline` | Replaces the stages that have not started with what the named pipeline runs after the stages both share. | The same, for every later run. A failed item is queued again. |
+
+Refusals name the reason. A stage that already started keeps its shape: an
+insert lands after the last started stage, a switch keeps every started
+stage, and a stage that ran and is not running now can be neither aborted
+nor removed (abort the running stage with `goto` to run it again). A stage
+that passed and waits at an operator gate is decided at its gate, not
+aborted. A switch on a run under way leaves out the new pipeline's
+proposal stage, since the run is past it. A switch to a pipeline with
+another workspace mode, or one that leaves nothing to run, is refused; so
+is a team stage for a run that was started without team worktrees. A stage
+an insert or a switch carries in that wrote its own pipeline's ship record
+writes the run's when it runs after the stage the run shipped from so far
+(`reshape::ship_after`), and an insert that would commit after the ship
+record is refused. A switch drops the review and ship record the old
+pipeline declared on a stage it does not keep, even where a new stage has
+that id, so the new pipeline's own declarations apply. The result must
+pass the model policy and the autonomy ceiling: a steer cannot take out the
+review an enqueue could not leave out (§18.2). The item's review level follows the stages it keeps,
+and a steer that moves it says so in its record ("raised the review level
+from none to standard"). An item that is dispatching is refused with "steer
+it again in a moment", a succeeded one always, and a cancelled one for a
+shape change (retry it first).
+
+**How a live run takes a steer.** `executor::steer::steer_run` holds the
+run table. `plan::plan` works the steer out against the stored run with
+nothing written, and builds the driver the result would leave
+(`recover::driver_of`): a steer no driver can run is refused before
+anything changed. `apply` then stores, under one store lock, the item, the
+run's variables, the edits, the cancelled stage runs of an aborted group
+with the stop their agents are owed, what each live stage run's agents are
+owed, and the audit record. It rebuilds the driver from the store with
+`recover::resume_run`, which is the path a restart takes. So a steered run
+replays the same after a restart.
+
+**Run edits.** A change to a run's stages is a `RunEdit` appended to the
+`run_edits` table (`Store::append_run_edit`), numbered per run:
+`InsertStage`, `SwitchPipeline` and `AbortStage {stage, attempt, then}`.
+An insert or a switch carries the stages and the prompt texts it adds, so
+replay never reads the catalog. `frozen::thaw` applies the run's edits in
+order to its frozen pipeline (`reshape::apply_all`) before
+`RunDriver::resume`, and `record_abort` gives the driver each abort. An
+inserted stage whose id is taken gets a numbered one (`test-2`), and a
+prompt file name that already holds another text becomes
+`<id>-steered.md`. An aborted group is never judged: its `on_fail` is
+not consulted, `retry` re-enters the stage with the feedback it had,
+`skip` and `goto` clear the feedback, and `goto` back gives the stages it
+re-runs their full loop budget. A removed stage is `AbortStage` with
+attempt 0. It holds for this run; a later run of the item has the stage
+again.
+
+**What the live agents are owed.** Aether applies a patched model or effort
+at the agent's next turn, not inside the running one: `update_agent`
+(`aether-runtime` `commands/update.rs`) writes it to the agent, and a turn
+reads the agent's model when it starts. A move within one engine keeps the
+session and its history; a move between engines starts the next turn from
+Aether's checkpoint of the context. So a model or effort steer is three
+steps for the stage's own agent, in this order: `update_agent`, `interrupt`
+to end the running turn, then a message that starts the next turn on the
+new model and says so. A note, a budget and a deadline need no
+interrupt. Each step is stored in `kv.steer_owed:<stage run>` in the same lock as the steer, with a unique
+key that Aether dedupes the message by. A step Aether did not answer stays
+owed and the sweep repeats it; a step Aether refuses is dropped with a
+progress note on the item, and what the steer stored still applies to the
+stage's next agents. A stage run that settled is owed nothing more. A steer
+at an operator gate changes what the next stage starts with and leaves the
+gate and its question as they are.
+
+**An item with no live run.** The steer changes what the item runs next.
+A shape change is kept as the item's stage list in `kv.shape:<item>` (a
+`RunEdit` holding the whole list), which `start` and `get_item` apply over
+the catalog's pipeline; a switch back to the item's own pipeline forgets
+it. An item that already ran cannot change between a team layout and a
+single worktree.
+
+**Reviving a failed item.** A stage that fails with `ESCALATE:`, or fails
+any other way, ends its run. An `insert_stage` or `switch_pipeline` on the
+failed item says how it goes on: `executor::revived(failed_run, edit,
+item)` amends the brief with the stage that failed, its error and the
+branch the work is on, and the item is queued again as a plain retry is
+(§13). Its next run works in the same worktree and on the same branch, with
+the failed run's commits, and runs the reshaped stage list from its first
+stage. The item keeps its pipeline's name; `kv.shape:<item>` holds what it
+runs, and its `pipeline` names the catalog pipeline last switched to. Item
+views give that as `switched_to` when it is not the item's own, and `queue
+show`, `queue list` and `status` print `<queued> → <switched to>`.
+
+**`update_item` on a running item.** `brief_append` is steered in as a
+note. `model_plan` replaces the plan for the agents started from now, and
+each live stage run whose slot gets another model or effort is patched as
+above. While an item is dispatching both are refused.
+
+**Audit.** Every steer is a `SteerRecord {at, by, what, note}` kept with
+the item (`kv.steers:<item>`, the newest 100), a progress entry in the
+feed (`Steered <item> (<by>): <what>.`), and a line in `archon queue show`
+and `get_item`. A steer is no correction: learning blames no model for it
+(§19).
+
+### 6.7 One agent through a fix loop
+
+A fix attempt by a cold agent pays for reading the task, the repository and
+its own earlier work again. So the agent of a work stage that a later stage
+can send back is kept, and its next attempt is the same agent told what to
+fix.
+
+`RunDriver::keeps_agent(stage)` holds for a `work` stage with one agent that
+some stage names as its `on_fail.goto` and that does not hold the declared
+review (a resumed attempt hands in no checked result). Its `SpawnPlan` has
+`keep = true`, and the agent is created `long_lived`: Aether leaves it
+waiting on its inbox when its task completes. Reviewers and every other
+stage are created as before, a fresh agent per attempt.
+
+- **Parked.** When an attempt of a kept agent completes, its deadline is
+  moved 7 days out (`PARKED_DAYS`) and it waits. It is a child of the run's
+  node, so the node's cancel ends it with the run (§4.5); the node's
+  retirement does not wait for it to end a turn. An attempt that ends any
+  other way has its agent stopped.
+- **Resumed.** The next attempt of the slot, entered with feedback, takes
+  the agent over (`resume::takeover`). `update_agent` gives it the stage's
+  deadline and, when its creation set a cost cap, a cap of what its earlier
+  attempts spent plus the new attempt's grant (`resume::regranted_cap`).
+  `send_message`, keyed by the stage run, gives it
+  `sections::resume_message`: the findings, and how to hand in. The stage
+  run is `running` with the same agent and no task. Notes steered in while
+  the agent was parked are added to the message.
+- **Settled.** The agent's task settled with its first attempt, so a
+  resumed attempt settles on the turn in which the agent took the message.
+  `AgentBackend::resumed_outcome` reads the agent's own events: the
+  delivery of the message, the turn that consumed it, and the last thing
+  the agent said before going idle (`ports::resumed_reply_outcome`). A
+  message starting `FAILED:` fails the attempt; one starting `BLOCKED:` or
+  `ESCALATE:` ends the run as from a fresh agent (§8.6); anything else is
+  the attempt's summary, with the object of its last fenced `json` block
+  as its `structured`. That is how a kept agent of the stage `[pipeline.ship]`
+  names hands in a new ship record (§8.7) for its fix, which
+  `sections::resume_message` asks of it. A message without a valid record
+  gets one more message, keyed `<stage run>:record`, asking for the record
+  alone (`resume::recorded`); the attempt then settles on that answer's
+  record with the first message's summary, and a second miss fails the
+  stage at its gate. The pump checks when the agent's turn ends and the
+  sweep checks again, so a missed event only delays it. A resumed attempt
+  past its deadline has its agent cancelled and is `timed_out`.
+- **Replaced.** A fresh agent takes the attempt, with the findings under
+  `## Feedback to address` and the digest of the last attempt (§6.5), when
+  the kept one cannot go on: Aether no longer holds it live, Aether refuses
+  the deadline or the message, the attempt plans another model or effort
+  than the kept agent runs now (a live retune counts), the stage is
+  re-entered without findings (a steer's `goto`), or the resumed attempt
+  was lost to an infrastructure failure. The kept agent
+  is stopped before the fresh one is created, so the fresh one has the
+  worktree to itself: the agent to stop is stored with the reserved spawn
+  (`StoredSpawn.replaces`), and stopping one that already ended is done.
+
+The stage run rows keep this replayable. `stage_runs.aether_agent` is
+unique, and a kept agent passes from a finished attempt to the next attempt
+of the same slot (`claim_agent`); the finished row still names it in its
+data. After a restart a resumed attempt is found running with an agent and
+no task, and is read as above. Spend follows the agent to the attempt that
+holds it.
+
+A steer for a resumed attempt patches and messages the agent but does not
+interrupt it, since the attempt settles on its turn's last word; the
+attempt then settles on the turn that took the steer's message.
 
 ## 7. Scheduling, caps and budgets
 
@@ -1116,7 +1616,8 @@ transaction. The newest stage run of a slot supersedes older ones.
 
 The unit is **concurrently running stage agents**. A fan-out stage with 3
 reviewers occupies 3 slots. A pipeline run between stages occupies 0 slots.
-The orchestrator is not counted.
+The orchestrator is not counted, and neither are the agents it delegates to
+(§4.4): no cap bounds them, though their spend counts toward the budgets.
 
 ### 7.2 Caps (`Caps`)
 
@@ -1155,6 +1656,16 @@ repo and pipeline, pause state, spend) plus `Caps`, and returns a
    budget posts one `Blocker` to the feed and a `budget` trigger. The holds
    are checked in that order, and `held_by` names the first that applies
    (`GlobalPause`, `LowDisk`, `TotalBudget`, `DailyBudget`).
+
+**Carrying out a plan.** Independent work runs in parallel lanes
+(`executor::lanes`, at most 8 at once), and each lane runs its work in
+order. Starts are laned by repository, because `git worktree add` writes
+the repository's worktree list, and so are ships, so that one repository's
+remote and GitHub see one push or pull request at a time. Ships of different
+repositories share archond's shadow git directory (§13.4), whose making and
+sealing are serialised. Spawns are laned by pipeline run, because a run's
+first spawn creates its Aether run node. So one slow Aether call or
+`git push` holds back only its own lane.
 
 **Derived waiting reasons.** `dispatch::waiting_reasons` calls the same pure
 planner and uses its admissions to distinguish `capacity` from `next_in_line`.
@@ -1236,8 +1747,21 @@ anything waits for it. The pass stops after 30 seconds so it does not hold
 the dispatch pass up; the worktree it was collecting is finished off the
 dispatcher, which that sweep pokes as it ends, and a later pass goes on.
 
-The daemon re-plans on: enqueue, stage settled, run finished, caps or pause
-changed, and a `dispatcher.tick_secs` (default 15) timer.
+The daemon re-plans on: enqueue, update, cancel and retry of an item, a
+stage settled, a gate answered, a run finished, an agent's turn or life
+ended (§6.3), caps or pause changed, a gc mark gone, a (re)connect to
+Aether, and new spend while a total or daily budget is set. Each of these
+pokes the dispatcher itself, so the `dispatcher.tick_secs` (default 15)
+timer is a net and not a clock: nothing in the path from enqueue to shipped
+waits for it. What it does carry is time-based: stage deadlines, the retry
+of a `create_agent` Aether refused as unavailable, and the grace periods of
+§6.3.
+
+Spend changes a plan only by reaching `budget_usd_total` or
+`budget_usd_daily` (`admission_hold`), so with neither set a usage update is
+recorded, checked against its item's budget at once in the fleet pump
+(§5.3), and wakes no pass: a pass per usage update of every running agent
+bought nothing.
 
 Enqueue and retry refuse an item whose pipeline has a team stage with more
 roles than `effective_agent_cap` allows for the item's repository and
@@ -1255,7 +1779,7 @@ workers, before it takes the run table. Candidates then share those reads.
 `[models] allow = ["claude-code/claude-opus-5-5"]` (empty means any model
 Aether lists) and `deny = [...]`. A repo config may only **narrow** the
 allowlist: the effective list is the intersection. The policy is enforced in
-four places:
+five places:
 
 1. `enqueue`, `update_item` and `retry_item` validate every `ModelChoice` in
    the plan. The error lists the allowed models.
@@ -1265,8 +1789,24 @@ four places:
 3. At startup the orchestrator's own model must pass the policy, or `archond`
    refuses to start the orchestrator and reports why.
 4. Watchdog: an `agent.created` event under any Archon-owned agent (at any
-   depth below a stage agent, §4.6) whose model or effort violates the
-   policy gets `cancel` plus a `Blocker` and a `policy_violation` trigger.
+   depth below a stage agent or the orchestrator, §4.6) whose model or effort
+   violates the policy gets `cancel` plus a `Blocker` and a
+   `policy_violation` trigger. Below a stage agent the policy is the item's
+   repository's effective one. Below the orchestrator it is the global one
+   narrowed by each repository whose mirror the helper's scope reads
+   (`mirror::reach`): a `workspace_root` or allowed path inside
+   `repos/<name>`, or in a git worktree of it, which is what an isolated
+   child of a mirror gets, reads that mirror; one that holds the mirrors
+   directory reads them all, as does a scope that names no directory or an
+   agent Aether no longer knows. So a helper answers to the repository it
+   was pointed at, not to the intersection of every repository's policy. A
+   helper whose scope leads into a registered repository or the worktrees
+   root is cancelled the same way (§4.4).
+5. Depth: the watchdog records how many delegations each child is below
+   its stage agent or the orchestrator, and cancels one deeper than
+   `[limits] max_delegation_depth` (2: two down) with the same `Blocker`
+   and trigger. A delegating stage agent's contract states the configured
+   depth (§8.6); at 2, its child may delegate once more.
 
 Effort is not restricted by default. `[models] max_effort` optionally caps it.
 
@@ -1274,11 +1814,31 @@ The orchestrator chooses independently for each stage, following operator
 provider preferences and exact model requests first. Pipeline nudges are
 advice, not routing rules. Its prompt asks what reasoning and ambiguity remain,
 what a wrong result would break and how tests or review would catch it, and
-which available model and effort are the cheapest plausible choices. An easy
-stage does not inherit another stage's difficulty. Reviewers preferably use a
-different model from the implementer. Failures and loops prompt reconsideration
-through `retry_item`'s `model_plan`. The daemon validates policy; it never ranks
-or substitutes models or effort.
+which available model and effort are the cheapest plausible choices. The
+highest efforts (`x_high`, `max`) are for a reasoning problem it can name that
+inspecting the work left unresolved; that the operator prefers strong models is
+not one. Reviewers preferably use a different model from the implementer. A
+failed stage prompts reconsideration through `retry_item`'s `model_plan`. The
+daemon validates policy; it never ranks models, and never replaces a choice
+the orchestrator made.
+
+**Stages the plan leaves out.** A `model_plan` is optional, whole or per
+stage, so an enqueue that has nothing to say about a model says nothing.
+`knobs::fill_plan` completes the plan before it is stored, in this order:
+
+1. what `learned::default_plan` holds for the repository, pipeline and
+   stage;
+2. `knobs::default_choice`: the orchestrator's own model when the item's
+   policy permits it, else the first model the policy allows, at the effort
+   the pipeline's `[nudges] tier` suggests (`fast` low, `balanced` or none
+   medium, `strongest` high), lowered to `max_effort` where that caps it;
+3. for a stage a knob inserted (§18.1), the first choice of the pipeline's
+   first stage.
+
+The filled plan passes the same policy check as a chosen one, and the item
+stores it whole, so a run never depends on what the defaults are later. A
+policy that allows no model leaves nothing to default to, and the enqueue
+is refused naming the stage that has no choice.
 
 `model_evidence` (`archon model-evidence`) computes observations on demand from
 existing stage runs and the spend ledger, with optional repo, pipeline, stage
@@ -1329,11 +1889,18 @@ matter of dropping in a directory. The catalog is re-read at every
 
 ```toml
 [pipeline]
-name = "strict-pr-review"            # must equal the directory name
-description = "Implement, test, three independent reviews, ship"
+name = "triple-review"               # must equal the directory name
+description = "Implement, test, three independent reviews; archond ships"
 version = 1                          # schema version; only 1 exists
 workspace = "worktree"               # worktree | repo-readonly | scratch
 requires_repo = true                 # false: repo optional (e.g. ask)
+
+# [pipeline.review]                  # optional: one work stage holds the review (below)
+# level = "standard"                 # none | standard | strict: what an item gets unless it asks
+# stage = "build"                    # a work stage
+
+[pipeline.ship]                      # optional: archond ships, no agent does (§8.7)
+stage = "implement"                  # the stage whose result names the commits to ship
 
 [nudges]                             # advice to the orchestrator; never enforced
 tier = "strongest"                   # fast | balanced | strongest
@@ -1347,7 +1914,7 @@ prompt = "implement.md"              # file in this directory
 fan_out = 1                          # >1 only for review/test/report kinds; a team's is len(roles)
 gate = "none"                        # none | all_pass | majority | any
 timeout_minutes = 120
-allow_delegation = false             # grants nothing; only tools = yolo delegates (§18.4)
+allow_delegation = false             # true lets the stage agent delegate under tools = guarded too (§18.4)
 nudge = "Needs strong coding ability."
 
 [[stage]]
@@ -1392,6 +1959,96 @@ Validation rules (load-time errors):
   kinds.
 - Every template placeholder in a prompt is known (§8.4), and `team.*`
   appears only in a team stage's prompt.
+- `[pipeline.review]`, when present, names a `work` stage and a `level` of
+  `none`, `standard` or `strict`; unknown keys are refused.
+- `[pipeline.ship]`, when present, needs `workspace = "worktree"` and no
+  `ship` stage. Its `stage` is a `work`, `review` or `test` stage with one
+  agent, and no `work` or `team` stage follows it; unknown keys are refused.
+
+**A declared review.** A pipeline's review level is otherwise derived from
+its gates, not its reviewer count: gated review and test stages are
+`strict`, either one alone `standard`, neither `none`
+(`archon_pipeline::autonomy::review_level`, §18.1). A pipeline whose review happens inside a work stage, by
+agents that stage's agent delegates to, has no gate to derive it from, so
+it declares the stage that holds the review.
+
+Such a pipeline does not fix a level; the item chooses it. The `review`
+knob of an enqueue sets how many independent reviewers the stage owes:
+
+| Level | Reviewers (`archon_pipeline::spec::reviewers`) |
+| --- | --- |
+| `none` | 0 |
+| `standard` | 1 |
+| `strict` | 3 (`STRICT_REVIEWERS`), each working alone |
+
+An enqueue that names no level gets the declared `level`, raised to the
+ceiling's when the ceiling asks for more (§18.2), and one that names a level
+above the ceiling is refused like any other knob. The resolved level is
+stored with the item and frozen with the run. A pipeline with gated review
+stages keeps the level those stages run: `knobs::review_of` refuses another
+and names the pipelines that take one.
+
+The level binds the named stage. Its agent's contract gains a
+`## Review on record` section (§8.6), it may delegate whenever the level
+asks for a reviewer, and its `complete_task` must carry in `structured`
+
+```json
+{"review": {"verdict": "pass", "reviewers": ["<agent id>", "…"]}}
+```
+
+naming the agent of each reviewer the pass rests on, a failed one whose
+findings were fixed included. Each reviewer's own `complete_task` carries
+its verdict on the commits it read:
+
+```json
+{"verdict": "pass", "head": "<commit>", "base": "<commit>", "findings": []}
+```
+
+A completion without the record, with any other verdict, or with a pass
+that names fewer reviewers than the level asks for fails the run at that
+stage with what is missing: nothing loops, no later stage starts and
+nothing ships. At `none` nothing is owed and the contract says to delegate
+no reviewer.
+
+A pass is checked against Aether and the run branch, not taken from the
+lead (`executor/review.rs`). When the stage settles, `archond` lists the
+lead's descendants once (`list_agents`, the call the owed stop of §6.3
+makes) and reads the task result of each named agent (`get_task`). Each
+must be a different direct child that completed with a verdict: a
+cancelled, failed or running child, a grandchild, or a child that returned
+no verdict (a builder) is refused. The verdicts are then placed on the
+branch in the run's workspace (`executor/review/coverage.rs`): every `head`
+must be a commit the branch holds; a `base` at or before the fork from the
+base branch, or none, means the whole change was read; a delta's `base`
+must be a head another named reviewer read. A pass counts when it read the
+branch head, or when a counted pass read every commit after its head
+(`base` at or before it). A fail never counts and must be followed by such
+a pass, or by a later fail that read every commit after its head and was
+itself followed so (a fix of a fix, each reviewed as a delta). Counted
+passes below the level fail the run with the reasons. When
+the same result is the ship record (§8.7), the branch head must hold the
+record's `tree`, the tree delivery later checks: what ships is what was read.
+
+The counted agents and the models Aether ran them on are stored as
+`review.reviewer_agents` and `review.reviewer_models`; otherwise `archond`
+stores `review.unverified` with the reason, and the engine fails the run
+at that stage with it; learning counts such a stage as no pass. These keys, and the `reviewer_model(s)` and
+`reviewer_agent` a 1.0 record held, are Archon's: whatever an agent wrote
+under them is removed before the result is stored, so a lead cannot supply
+its own finding. Records stored by 1.0 still read as they were. While
+Aether cannot be asked the stage stays live and the pump's reconciliation
+settles it later. What a reviewer concluded is its own report; Archon binds
+that report to the commits it names.
+
+Archon then appends `REVIEW: pass, by <model> (agent <id>), …`, or at
+`none` `REVIEW: none, as this item's review level asks`, as the last line
+of the stage's summary, from the structured data, so a later stage and the
+pull request body carry the record rather than the lead's prose.
+
+A pipeline that still ends in a `ship` stage of its own may also record
+`{"review": {"verdict": "skipped", "reason": "…"}}` at `standard`, for that
+agent to judge (`REVIEW: skipped: <reason>`). Where archond ships, nothing
+judges a skip, so only a verified pass counts.
 
 ### 8.3 Stage prompt files
 
@@ -1422,16 +2079,10 @@ literal `{{`.
 
 | Name | Stages | Nudges |
 | --- | --- | --- |
-| `quick-pr` | implement → ship | tier = fast |
-| `default-pr-review` | implement → review (1, all_pass, goto implement ×2) → ship | tier = balanced |
-| `bugfix` | reproduce (failing test) → fix → review (1, all_pass, goto fix ×2) → ship | tier = balanced, independent_reviewers. For describable bugs; quick-pr for trivial one-liners, strict-pr-review for security/concurrency bugs. |
-| `docs` | write → verify (1, all_pass, goto write ×2) → ship | tier = balanced, independent_reviewers. For documentation: every claim, command and internal link checked against the code. Use `quick-pr` for a typo. |
-| `dependency-upgrade` | survey → upgrade → verify (test, all_pass, goto upgrade ×3) → ship | tier = balanced. Version bumps with changelog research and build/tests/audit; use `default-pr-review` for features that add dependencies. |
-| `refactor` | baseline/characterize → refactor → verify (test, all_pass, goto refactor ×3) → review (1, all_pass, goto refactor ×2) → ship | tier = balanced, independent_reviewers. Structure-only changes; use default-pr-review for behaviour changes. |
-| `strict-pr-review` | implement → test (gate) → review (3, all_pass, goto implement ×3) → ship | tier = strongest, independent_reviewers |
-| `team-pr` | plan → build (team: backend, frontend) → e2e (test, all_pass, goto build ×2) → review (1, all_pass, goto build ×2) → ship | tier = balanced, independent_reviewers. For changes that split cleanly into parts. |
-| `performance` | measure → optimize → verify (test, all_pass, goto optimize ×3) → review (1, all_pass, goto optimize ×2) → ship | tier = strongest, independent_reviewers. For a specific slow path with a measurable goal; use `default-pr-review` for ordinary changes. |
-| `test-coverage` | analyze (work) → write (work) → verify (test, all_pass, goto write ×2) → ship | tier = balanced. Risk-ranked coverage of existing code, at least three passing runs and per-test mutation checks. Bugs become follow-ups; use `bugfix` to fix one. |
+| `direct` | implement (work, holds the review) | tier = balanced. The pipeline an item that names none runs. One agent implements a change one author can make and check, whatever its size, runs the affected checks, commits and returns the ship record; the cheapest path to a shipped change. Review level `none` unless the item asks (§8.2); the agent escalates what turns out risky. |
+| `adaptive` | build (work, `allow_delegation`, holds the review) | tier = balanced, independent_reviewers. For a change where one lead that keeps its context through fixes, or integrates independent parts, saves restarts: it sizes the work, delegates the parts worth splitting, integrates them and has the integrated diff reviewed by as many reviewers as the item's review level asks. Review level `standard` unless the item asks (§8.2). |
+| `refactor` | baseline/characterize → refactor → verify (test, all_pass, goto refactor ×3) → review (1, all_pass, goto refactor ×2) | tier = balanced, independent_reviewers. Structure-only changes; use `direct` for behaviour changes. |
+| `performance` | measure → optimize → verify (test, all_pass, goto optimize ×3) → review (1, all_pass, goto optimize ×2) | tier = strongest, independent_reviewers. For a specific slow path with a measurable goal; use `direct` for ordinary changes. |
 | `agent-testing` | plan → exercise (fan_out 2, report) → report | Agents drive the product as a user would and report defects. workspace = worktree |
 | `code-audit` | scope (work) → audit (fan_out 3, report) → report | Security, reliability and maintainability lenses produce HTML with high/critical issue drafts. No code changes or ship. workspace = worktree, tier = strongest, independent_reviewers. Use `ask` for one question. |
 | `e2e-testing` | setup → e2e (test gate, goto setup ×1) → report | The report stage produces HTML and screenshots under `.archon/reports/` for Lavish. |
@@ -1439,18 +2090,41 @@ literal `{{`.
 | `errand` | errand (report) | workspace = scratch, requires_repo = false, tier = balanced. A small job answered in its summary and optionally as one self-contained Lavish page. No repository changes or outward side effects; read an attached checkout only, and run code on a throwaway copy in scratch. Other files are temporary and collected after `worktrees.gc_after` (default 7d; §13.2). |
 | `design-doc` | research → critique (1, all_pass, goto research ×2) → report (HTML design/RFC) | workspace = worktree, requires_repo = true, tier = strongest, independent_reviewers. Before a large or ambiguous change; no product-code changes or shipping. Use `proposal: lavish` for design and implementation in one item. |
 
-The `propose` and change-report stages the autonomy knobs insert (§18.1) use
-the shared prompts in `pipelines/_shared/`.
+The first four change a repository. Each declares `[pipeline.ship]`, so
+archond delivers its change once the last stage passed (§8.7) and none has
+a ship agent: each takes the ship record from its last committing stage.
+The `propose` and change-report stages the autonomy knobs insert (§18.1)
+use the shared prompts in `pipelines/_shared/`.
+
+1.1.0 removed the built-ins `quick-pr`, `default-pr-review`,
+`strict-pr-review`, `team-pr`, `bugfix`, `docs`, `dependency-upgrade` and
+`test-coverage`: `direct` and `adaptive` at a review level cover them.
+Naming one fails with its replacement unless a user or repository pipeline
+of that name exists, and a run already going keeps its frozen pipeline
+(§6.6). `team-pr` lives on as `docs/examples/pipelines/team-pr/`.
+
+`direct` and `adaptive` have no review stage: the stage agent delegates the
+review, and the item's review level decides how many reviewers that is
+(§8.2). An item that names no pipeline runs `direct` if it asks a review
+level, else its repository's `default_pipeline`, else the configured one,
+else `direct`; `adaptive` runs only by name or as a default. Either takes
+any level the ceiling allows (§18.2). At `none`
+under `tools = guarded`, `direct`'s agent is a leaf: it cannot delegate, and
+its contract carries no delegation section.
 
 ### 8.6 Stage contract (appended as instructions)
 
 > You are one stage of an Archon pipeline. Work only in `{{workspace}}`. Do
 > not ask the operator questions. If you cannot proceed, call `fail_task` with
-> an error starting `BLOCKED:`. When done, call `complete_task` with a concise
+> an error starting `BLOCKED:`; if the task does not fit this pipeline, with
+> one starting `ESCALATE:`. When done, call `complete_task` with a concise
 > `summary`. Review and test stages must include structured
 > `{"verdict":"pass"|"fail","findings":[{"severity":"…","title":"…","detail":"…","path":"…"}]}`
 > and must end the summary with `VERDICT: PASS` or `VERDICT: FAIL`. Ship
-> stages include `{"pr_url":"…"}` or `{"commit":"…"}` in structured data.
+> stages include `{"pr_url":"…"}` or `{"commit":"…"}` in structured data, and
+> never amend, rebase, squash or reset the commits they are given: only a
+> message that breaks a repository rule may be reworded, with
+> `git rev-parse HEAD^{tree}` unchanged and named in the summary.
 > Propose stages change nothing, write only
 > `.archon/reports/proposal/index.html`, and list it in `structured.reports`.
 
@@ -1458,24 +2132,303 @@ A team stage's contract names the agent's role and the other roles, keeps
 it to its own worktree and role, and asks it to commit on its branch
 without pushing: only commits are merged.
 
+A stage agent that can delegate also gets a `## Delegation` section. The
+daemon writes it when it builds the spawn request, from what the agent can
+actually do (`allow_delegation` on its stage, or the item's `tools = yolo`),
+so both routes carry the same rules, and appends it after the contract. It
+states:
+
+- a child may delegate once more, passing `leaf: true` for its own
+  children: two levels below the stage agent is the limit, and the watchdog
+  cancels an agent a third level down (§7.4). That is the default
+  `[limits] max_delegation_depth`; at 1 every child is a leaf, and deeper
+  limits tell each child its level;
+- how the workspace is shared: in a writable workspace a child that edits
+  gets `workspace_mode: "isolated"` and the lead brings accepted changes in
+  with `integrate_workspace`, while a child that only reads shares the
+  lead's workspace; in a `repo-readonly` workspace every child is read-only
+  and isolation and integration are not offered;
+- the item's effective model policy, in words: the allowed models (or "any
+  model Aether lists"), the denied ones and the effort cap. Aether's
+  `list_models` shows what is connected, not what is allowed, and the
+  watchdog cancels a child outside the policy (§7.4);
+- that every child is waited for or cancelled before the stage finishes,
+  because Archon cancels whatever still runs when the stage ends (§6.3),
+  and that a child that finished cannot be asked again, so a second look
+  after a change takes a new child;
+- what a child is handed: what the delegating agent already holds, in a
+  few lines, and never its conversation, because a child starts cold and
+  pays to read whatever it is not told; and for a reviewer the exact base
+  and head commits, the changed paths, the checks run with their results
+  and the commit they ran on, the known risks and the repository guidance;
+- the rules each child's `instructions` must carry. Aether copies nothing of
+  a parent's instructions to a delegated child (§17), so the contract does
+  not reach one: work only in the workspace it is given and never touch
+  other worktrees, other branches or the operator's checkout; do not push;
+  never override the git identity; ask the operator nothing; and read only,
+  for a reviewer always and for every child of a read-only stage.
+
+The stage a pipeline's declared review names (§8.2) gets a
+`## Review on record` section in its contract: how many reviewers the
+item's level asks for, the `structured.review` form that names them, that
+Archon fails the run without it, and that Archon writes the `REVIEW:` line
+itself. The stage `[pipeline.ship]` names gets `## Ship record` (§8.7).
+Like the contract, all of this binds by instruction only; what Archon
+enforces is named where it is enforced.
+
 `Verdict::extract` reads the structured `verdict` field first, then the last
-`VERDICT:` line. The `BLOCKED:` prefix is turned into an item-level `Blocker`
-feed entry and fails the stage without looping.
+`VERDICT:` line.
 
-### 8.7 Ship modes
+Two error prefixes end a run at once, with no loop, no infra retry and the
+stage's live siblings cancelled (`StageOutcome::ends_run`):
 
-The ship stage agent does the delivery with native tools (git, gh). Archon
-does not push.
+- `BLOCKED:` means a person must act. It becomes an item-level `Blocker`
+  feed entry.
+- `ESCALATE:` means the task does not fit the pipeline: larger or riskier
+  than the stage allows for, or better split. The item fails as
+  `stage <id>: ESCALATE: <why and what it recommends>` with an ordinary
+  `Outcome`, and `item_finished` carries that text to the orchestrator,
+  which decides what to do instead. Archon changes nothing itself: no
+  other pipeline is started and nothing ships. A `switch_pipeline` or
+  `insert_stage` steer queues the failed item again on its branch (§6.6).
+  Learning records the run with failure class `escalated` (§19).
 
-- `pr` (default): push the branch and open a PR against the base. Merge only if
-  `ship.auto_merge` is true (the item's `merge = auto`).
-- `local`: commit on the run branch and never push. The worktree is kept.
+### 8.7 Shipping
+
+How a change leaves a run is the repository's ship mode:
+
+- `pr` (default): the run branch is pushed and a pull request opened
+  against the base. It is merged only when `ship.auto_merge` is true (the
+  item's `merge = auto`), by GitHub once its checks allow.
+- `local`: the commits stay on the run branch and nothing is pushed. The
+  worktree is kept.
+
+**archond ships.** A pipeline that declares `[pipeline.ship]` has no ship
+agent. Its record stage returns, in `structured`, beside whatever else it
+returns:
+
+```json
+{"commit": "<git rev-parse HEAD>", "tree": "<git rev-parse HEAD^{tree}>",
+ "checks": ["…"], "pr": {"title": "…", "body": "…"}}
+```
+
+`ShipRecord::read` requires full object ids, a one-line title of at most
+256 characters and a non-empty body. The gate checks the record before the
+review: a pass without one fails the run at that stage, so no delivery is
+ever asked for without it. Stages after the record stage cannot commit
+(§8.2), so what they verified is that tree.
+
+When the last stage passes, the driver emits `Ship(ShipPlan)`: the record,
+its stage, the run summary, and the pull request body (the record's, then
+the `REVIEW:` line, the summaries of the stages that passed after the
+record stage under `## Review and verification`, the change report under
+`## Change report`, and `Archon item: <id>`; each part clipped so the whole
+stays under GitHub's limit). `executor::ship` queues the plan in the run
+table and delivers it off every lock:
+
+1. **Wait for the worktree to be quiet.** While the run owes a descendant
+   stop (§6.3), an agent a stage delegated to may still write; the delivery
+   waits, and the settled stop starts it.
+2. **Prove the worktree** (`ship::checks`). It is the worktree git
+   registered for the run, not a symlink or a redirected `.git` (§13.1); it
+   is on the run branch; no tracked file is modified or staged; `HEAD^{tree}`
+   equals the record's `tree`; the branch is ahead of its base; and every
+   commit that neither the base nor a remote holds has an author and a
+   committer e-mail of the repository's recorded identity or
+   `archon@localhost`, which archond's own merges use when git has none. The
+   identity is what `git var` yields in the repository under the
+   operator's config (`GIT_*` identity variables removed), recorded in
+   `kv` `repo_identity:<repo>` at `archon repo add` and again at `archon
+   repo set` (with no option, only that), which posts a feed line when it
+   changed; a repository
+   registered before this record existed has it taken at its first
+   delivery. A `user.email` an agent writes into the repository later
+   changes nothing. Any miss is a refusal that names the paths or commits.
+   A stacked run's branch must also hold every parent commit its stack
+   recorded and has not seen merged (§8.8), checked here so that a missing
+   parent pushes nothing and opens no pull request. The base is what
+   `restack::target_base` reads from the stack (§8.8): the branch of the
+   item's first unmerged parent, the repository's base once every parent
+   merged, and the run variable `base_branch` for an item that is not stacked.
+3. **Push**, `pr` mode only: `git push --porcelain <origin url>
+   <commit>:refs/heads/<branch>` of the checked commit, not the branch tip,
+   run from the repository's shadow (§13.4), so no hook, filter or ssh
+   command a run configured runs as the daemon. It is never forced. A
+   branch `origin` holds with other commits is a refusal that says so; a
+   rule or missing access on the remote is `BLOCKED:`. Pushing what
+   `origin` has already succeeds.
+4. **Find or open the pull request**: `gh pr list --head <branch> --state
+   open --limit 20`. One open pull request is reused, and moved onto the base with
+   `gh pr edit --base` when it is for another branch; none makes
+   `gh pr create`; several are a refusal. After creating, the list is read
+   again and only what GitHub lists counts, so a creation whose reply was
+   lost is found, not repeated.
+5. **Persist, then finish.** The `ShipOutcome` is written to `kv`
+   `ship:<run>`, and a pull request's URL to the record stage run's
+   `structured.pr_url`, before the driver acts. `on_shipped` then ends the
+   run: `succeeded` with a last summary line `SHIPPED: <url> (commit <sha>)`
+   or `SHIPPED: commit <sha> on the run branch`, or
+   `failed{stage_id: "ship", error}`.
+6. **Auto-merge**, when asked: it is owed, in `kv`
+   `ship_automerge:<run>` (item, repository, pull request, tries, next
+   try), written before the outcome. The coordination pass pays it with
+   `gh pr merge --auto` and the first method `gh repo view` says the
+   repository allows. A failure another try may pass waits 60 s, doubling
+   up to an hour, eight tries in all; a refusal, or the last failure, is
+   one blocker saying the pull request is delivered but will not merge by
+   itself. Success is an outcome saying auto-merge is on and the pull
+   request is not merged yet: delivered is never reported as merged.
+
+A refusal is exact and final: the orchestrator reads what to change in the
+item's failure and retries. A failure another try may pass (the network,
+GitHub, a timeout: 180 s for the push, 60 s per `gh` call) leaves the plan
+queued, and the sweep tries again after 15 s, doubling, five times in all
+before the run fails with the last error. The failures so far and the next
+try's time are kept in `kv` `ship_retry:<run>`, so a restart neither
+retries at once nor grants five more tries.
+
+While a run is delivering (its plan queued, a delivery in flight, or
+`ship:<run>` recorded) a steer that would change its stages (`--abort`,
+`--remove`, `--insert`, `--switch`) is refused; a note is not. A steer
+that removes or passes over the record stage is refused unless another
+stage that writes a ship record, or a `kind = "ship"` stage, remains:
+otherwise the run would deliver nothing.
+
+Delivery is safe to repeat. A daemon that restarts finds the run `running`
+at its last stage; the resumed driver emits the same `Ship`, or, when
+`ship:<run>` exists, replays that outcome (`record_ship`) and delivers
+nothing. Recovery only queues the plan and the sweep delivers it, so
+startup never waits on the network. A crash between the push and the
+record repeats steps 2 to 4, which push nothing new and find the pull
+request GitHub lists. `prune` deletes `ship:<run>` and `ship_retry:<run>`
+once their run is terminal.
+
+Delivered is not green. The item succeeds once its pull request is open;
+archond does not wait for the repository's CI and does not repair a failing
+check. `executor/pull_requests.rs` later reads only whether the pull request
+merged, closed or had changes requested, for learning (§19). A red check is
+the operator's to act on: a fix item, or `archon queue retry --append`,
+which delivers into the same pull request (§6.1).
+
+**A ship stage.** A pipeline may instead end in one `kind = "ship"` stage,
+as every built-in did before archond shipped. Its agent delivers with git
+and `gh` under the contract of §8.6, and in `pr` mode archond accepts its
+completion only once `gh pr list` shows one open pull request for the run
+branch, whose URL replaces the one the agent reported. Such a pipeline
+declares no `[pipeline.ship]`, and it pays for an agent that reads the run
+to do what archond does in seconds.
+
+### 8.8 Stacking
+
+An item queued after others (`depends_on`) starts after their successful
+pipeline runs, including delivery; it does not wait for a merge.
+`executor/start.rs` forks its branch from the first unmerged
+same-repository parent's branch and merges the other parents in. `stacks`
+persists each parent's item, branch, SHA and order, and
+`Store::stack_base(item)` returns the first unmerged parent's branch and
+SHA, or `None`. Cross-repository and scratch dependencies are no stack
+parents. The `## Dependencies` section of the contract (§8.6,
+`contract::dependency_rules`) names the base the branch was prepared from
+and each dependency's item, branch and pull request as bounded JSON.
+
+`restack::target_base` is the base a stacked change is for now: that first
+unmerged parent's branch, or the repository's base once every parent
+merged. Delivery (§8.7) proves the run against it and opens or moves the
+pull request onto it, so a child ships onto its parent's branch.
+
+`executor/restack.rs` reconciles persisted stacks in the coordination worker
+(`executor/coordination.rs`), woken when an item finishes or an initiative
+changes, and every 5 minutes for changes made outside Archon. GitHub and
+merge maintenance never delay the admission of unrelated items. Only a
+dependency that shipped is a stack parent: an `ask` or errand, or a run
+whose record stage a steer removed, has no branch to stack on.
+
+A pass asks GitHub once per repository, `gh pr list --state open --limit
+1000`, and looks up with `gh pr list --head <branch> --state all` only a
+branch the listing lacks. A pull request found merged or closed is kept in
+`kv` `pr_settled:<repo>:<branch>` and never asked about again, so a pass
+over settled stacks makes no GitHub call. The pull requests of finished
+runs, which learning watches, are read the same way every 10 minutes.
+
+A merged parent has the child's pull request moved with `gh pr edit
+--base` to the next unmerged parent or the repository's base. Commits a
+parent gains later are merged into the child's branch and pushed: never
+rebased or force-pushed. The merge is `git merge-tree --write-tree` and
+`commit-tree` in the repository's shadow (§13.4), made by the repository's
+recorded identity or `Archon <archon@localhost>`; the branch then moves
+with `update-ref`, and a worktree it is checked out in, which must be
+archond's and clean, moves with it (`read-tree -m -u`, undone if the
+branch moved meanwhile). A parent head another checkout pushed is fetched
+into the shadow, not the operator's repository. A conflict writes nothing
+and atomically queues one fix item on the child's branch and worktree,
+whose brief names the parent commit to `git merge` and the conflicting
+paths, under the child's validated pipeline and policy. The fix and its
+item never run at once: the fix waits while the item runs, the item is not
+started or retried while its fix is unfinished, and a dependency section
+asks an agent to merge only a parent commit its branch lacks.
+
+Each stack and each initiative is maintained on its own: one whose pass
+fails is recorded in `kv` `coordination_blocker:<stack|initiative>:<id>`
+and the pass goes on to the next. A failure is one blocker, told once; a
+GitHub or network failure only after three passes in a row. The record
+goes once the subject passes again.
+
+### 8.9 Initiatives
+
+An initiative groups 1 to 16 member items, one per change in a repository,
+under a shared contract of at most 2 KiB. `[limits] initiative_members`
+(up to 64) and `initiative_contract_bytes` (up to 16 KiB) raise these;
+`archon mcp` refuses only what exceeds those ceilings, and `archond` the
+configured limits. `enqueue_initiative` validates
+every member as an enqueue (`handlers/initiatives.rs::prepare_member`: its
+pipeline, model plan and `autonomy` knobs under the repository's ceiling)
+before one transaction inserts the initiative and all its items. A repeated
+idempotency key returns the original initiative, and different input under
+that key is refused. `after` holds indices of earlier members, so the
+dependency graph is acyclic; members in one repository stack (§8.8). The
+member agents see each sibling's repository, branch, pull request and state
+as JSON, with branch names and URLs filtered before they enter another
+contract. `update_initiative` appends to the contract (`contract_append`)
+or replaces it (`contract`), stores the result and sends the whole new
+contract to the members' running leads under durable message keys; the
+coordination worker retries what is undelivered. A replacement with the
+same text changes nothing.
+
+An initiative moves `open → shipping → done`, or to `failed` or
+`cancelled`. The first delivered pull request starts `shipping`, and every
+member passing completes it. A member that fails or is cancelled fails the
+initiative and holds the queued members. Cancelling stops the unfinished
+members and keeps successful work and pull requests. A retry needs a failed
+or cancelled initiative with no active member, queues its failed, cancelled
+and blocked members again together on their branches, keeps the successful
+ones and starts a new notification cycle. A member's own retry is held
+while its initiative is failed or cancelled.
+
+`executor/initiative_ship.rs::record` is called by delivery (§8.7) for a
+member. It stores the verified pull request URL and replaces a marked
+"Part of …" section in each member's pull request body with links to its
+siblings. An atomic initiative's members are forced to `merge = manual` (a
+member asking for `auto` is refused at enqueue), their pull requests are
+opened with `gh pr create --draft`, and once every member passed the
+coordination worker readies each with `gh pr ready`. Every write to GitHub
+is idempotent and replayed from stored state after a restart.
+
+A member's finish posts its outcome to the feed and wakes nobody (§5.4).
+A terminal initiative pushes one `initiative_finished` trigger per cycle,
+whose durable receipt is committed in the same transaction as the trigger
+outbox, so a failed member reaches the orchestrator through its
+initiative.
 
 ## 9. Configuration
 
 `$ARCHON_CONFIG_DIR|~/.config/archon/config.toml`. Every field is optional,
 and the example below shows the defaults. Unknown keys are an error, so typos
-cannot silently disable limits.
+cannot silently disable limits. `archon setup` writes the file with every
+key commented out when there is none, and never touches one that exists.
+No other file in that directory configures Archon: an `archon.toml` from
+before 1.0 is not read, `archon doctor` warns about it, and `archond` posts
+one notice for it as it starts (`kv.legacy_config_told`), naming the file
+that is read.
 
 ```toml
 [aether]
@@ -1491,6 +2444,7 @@ effort = "high"
 name = "Archon"
 # instructions_file = "~/.config/archon/orchestrator.md"  # appended to the built-in prompt
 trigger_coalesce_ms = 2000
+wake_on_success = true         # false: a routine success waits for its next turn (§5.4)
 
 [models]
 allow = []                     # e.g. ["claude-code/claude-opus-5-5"]; [] = any
@@ -1498,7 +2452,7 @@ deny = []
 # max_effort = "high"          # unset: no cap; else low|medium|high|x_high|max
 
 [limits]
-max_parallel_agents = 3
+max_parallel_agents = 8
 max_per_repo = 0
 max_active_runs = 0
 budget_usd_per_item = 0.0
@@ -1507,8 +2461,12 @@ budget_usd_total = 0.0
 count_estimated_cost = true
 infra_retries = 1
 min_free_gb = 10               # hold dispatch below this much free disk; 0 = off
+max_delegation_depth = 2       # delegations below a stage agent or the orchestrator; 1..=4
+max_agent_messages = 20        # message_orchestrator calls per agent, lifetime; 1..=200
+initiative_members = 16        # 1..=64
+initiative_contract_bytes = 2048  # 1..=16384
 [limits.per_pipeline]          # name = max running stage agents
-# strict-pr-review = 3
+# adaptive = 3
 
 [dispatcher]
 tick_secs = 15
@@ -1546,6 +2504,12 @@ proposal = "off"
 report = "off"
 merge = "manual"               # "auto" lets items merge their own PRs
 tools = "yolo"
+
+[learning]                     # §19
+enabled = true                 # false: no outcomes, learned defaults, lessons or distillation
+distill_every = 20             # new outcomes of a repository per distillation errand
+distill_daily_budget_usd = 3.0  # global UTC daily reservation
+explore_rate = 0.1             # share of items that try a cheaper choice; 0..0.1
 ```
 
 Per-repository `<repo>/.archon/config.toml`:
@@ -1554,7 +2518,7 @@ Per-repository `<repo>/.archon/config.toml`:
 [repo]
 ship = "pr"                    # default for `archon repo add` when --ship is omitted
 base_branch = "main"
-default_pipeline = "default-pr-review"
+default_pipeline = "adaptive"
 
 [limits]
 max_per_repo = 2               # may only lower the global value
@@ -1563,7 +2527,7 @@ max_per_repo = 2               # may only lower the global value
 allow = ["claude-code/claude-opus-5-5"]   # intersected with the global allowlist
 
 [pipelines]
-disabled = ["quick-pr"]
+disabled = ["performance"]
 
 [autonomy.max]                 # may only lower the ceiling; [autonomy.default] likewise
 tools = "guarded"
@@ -1600,7 +2564,7 @@ defined in `archon_core::protocol` and served by `archon-daemon`.
 
 - Unix socket at mode 0600, NDJSON, 16 MiB frame cap.
 - Client frame: `{"req":N, "cmd":"<snake_case>", ...}`. The first frame must
-  be `hello {protocol_version: 5, client: "archon-cli"|"archon-mcp"|"archon-bench"}`.
+  be `hello {protocol_version: 6, client: "archon-cli"|"archon-mcp"|"archon-bench"}`.
 - Server frames: `{"frame":"reply","id":N,"result":{"Ok":{"reply":…,"data":…}}|{"Err":{"code":…,"message":…}}}`
   and `{"frame":"feed","sub":S,"item":FeedItem}`.
 - `ClientKind` is recorded per connection. The socket's file mode is the
@@ -1609,6 +2573,11 @@ defined in `archon_core::protocol` and served by `archon-daemon`.
   `RepoUpdate`, a `RepoAdd` with `auto_merge`, a hard pause, ...) is refused
   for `archon-mcp`. `RecordChatAnswer` is not one of them: it is the
   orchestrator's, checked by caller identity, and cannot answer a gate (§5.2).
+- `ForAgent {caller, request}` carries a tool call `archon mcp` forwards
+  for the agent Aether named as making it. `archond` authorizes the caller
+  and applies the inner request as one step (§11). A request from
+  `archon-mcp` that changes Archon and comes without this wrapper is an
+  unnamed call. It wraps no operator-only request and no second `ForAgent`.
 - The CLI takes an item id or its start. A whole id is sent as it is; a
   start goes to `ResolveItem {prefix}` first, which `archond` answers from
   one indexed range query: the one item, `not_found`, or `invalid_argument`
@@ -1656,17 +2625,77 @@ tool result that would not fit becomes a tool error suggesting `limit`, and
 any other response that would not fit becomes error `-32603` under the same
 id.
 
+Every tool that changes Archon acts for the orchestrator, and the agents it
+delegates to inherit its tool exposure (§4.4). So a mutating tool other than
+`message_orchestrator` answers only the current orchestrator, and `archond`
+is the one that decides:
+
+- `archon mcp` wraps such a call as `ForAgent { caller, request }` (§10),
+  with the agent Aether named on the call (`send_caller_meta = true`, §5.5),
+  and sends it bare when Aether named none. It asks nobody first: there is
+  one request, inside the call's 15 s.
+- `archond` compares the caller with `kv.orchestrator_agent` while it holds
+  the supervisor's authority lock for reading, and keeps holding it until
+  the request has been applied. Every path that puts another agent in charge
+  takes that lock for writing, so the orchestrator is not replaced between
+  the check and the change, and a call does not land for an agent that has
+  just stopped being the orchestrator. The answer comes from the store; no
+  Aether round trip is made.
+- Anyone else is refused with what Archon's records say it is and what to
+  do instead: a replaced orchestrator (stop), a stage agent
+  (`message_orchestrator`), a delegated agent of an item or of the
+  orchestrator (finish and report to its parent), or an agent Archon does
+  not know. That last one covers the moment after Aether restarted the
+  orchestrator into a new agent and before `archond` adopted it: the text
+  says to call once more in a few seconds.
+- Read-only tools answer any caller.
+
+**When Aether names no caller.** A registration written before Archon
+required `send_caller_meta`, or an `aetherd` that started before the line
+was added, sends calls without it. Refusing them all would lock an operator
+out of an orchestrator that an upgrade had just broken; forwarding them all
+would let a delegated agent change Archon. So `archond` forwards an unnamed
+mutating call only when the orchestrator in charge is one it has seen to be
+unable to delegate natively (`kv.orchestrator_sole_caller`, recorded from the
+agent's own config when it takes charge): then no agent of Archon's can
+be the caller but that orchestrator. In shared mode another agent of the
+operator's own daemon also sees these tools and is not told apart until
+callers are named, as before this check existed. Otherwise the call is
+refused with the fix. The first unnamed call
+sets `kv.mcp_callers_unnamed` and posts one `Blocker`; while it is set,
+every new orchestrator generation is created without `delegate`, with a
+note in its instructions saying why. A named call from the orchestrator,
+a read as much as a change, clears it, says so in the feed, and the next
+generation delegates again: only a registration that names callers sends
+one, so the key follows the registration in force and not the last change
+the orchestrator happened to make. An unnamed call after that is judged as
+the first was and sets the key again.
+An orchestrator created by a release before delegation has no `delegate`
+either, so an upgraded install keeps working before anything is repaired.
+
+In dedicated mode the registration is Archon's own file and is repaired
+without the operator (§4.7). In shared mode Archon never edits the
+operator's Aether config: `archon doctor` fails the registration check with
+the line to add, and the notice above says to restart that `aetherd`.
+
+This guards against an agent queueing or cancelling work it was not asked
+to; it is not a security boundary, since any process of the operator's user
+can reach the socket (§5.5).
+
 | Tool | Arguments | Request |
 | --- | --- | --- |
-| `list_pipelines` | `{repo?}` | `ListPipelines` |
+| `list_pipelines` | `{repo?, pipeline?}`: a line per pipeline, or the one named in full | `ListPipelines` |
 | `list_repos` | `{}` | `RepoList` |
 | `model_policy` | `{repo?}` | `ModelPolicy` |
 | `register_repo` | `{path, name?, ship?, base_branch?, default_pipeline?}` | `RepoAdd` (never raises a ceiling) |
-| `enqueue` | `{repo?, pipeline?, title, brief, priority?, depends_on?, tags?, model_plan, model_reasons?, budget_usd?, idempotency_key?, autonomy?, origin?}` | `Enqueue` |
+| `enqueue` | `{repo?, pipeline?, title, brief, priority?, depends_on?, tags?, model_plan?, model_reasons?, budget_usd?, idempotency_key?, autonomy?, origin?}` | `Enqueue` |
 | `list_queue` | `{states?, repo?, pipeline?, tag?, limit?}` | `ListItems` |
 | `get_item` | `{item}` | `GetItem` (stage summaries and errors clipped at 1500 characters, naming `get_stage`, and the run unless it is the latest) |
 | `get_stage` | `{item, run?, stage?, attempt?, slot?, offset?, limit?}` | `GetStage` |
-| `update_item` | `{item, priority?, model_plan?, model_reasons?, tags?, add_depends_on?, budget_usd?, brief_append?}` | `UpdateItem` (not after success; `model_plan` and `brief_append` not while dispatching or running) |
+| `update_item` | `{item, priority?, model_plan?, model_reasons?, tags?, add_depends_on?, budget_usd?, brief_append?}` | `UpdateItem` (not after success; on a running item `model_plan` and `brief_append` are steered into its run, §6.6; neither while dispatching) |
+| `steer_item` | `{item, note?, stage?, model?, effort?, budget_usd?, extend_minutes?, abort_stage?, then?: retry\|skip\|goto, goto?, insert_stage?: {stage, from?, after?}, switch_pipeline?}` | `SteerItem` (§6.6; at least one change) |
+| `enqueue_initiative` | `{title, contract, atomic?, members: [{repo, brief, title?, pipeline?, model_plan?, autonomy?, after?}], idempotency_key?}` | `EnqueueInitiative` (§8.9; members validated as enqueues, created together) |
+| `update_initiative` | `{initiative, contract_append \| contract}` | `UpdateInitiative` (§8.9) |
 | `cancel_item` | `{item, reason?}` | `CancelItem` |
 | `retry_item` | `{item, model_plan?, model_reasons?, fresh?, brief_append?}` | `RetryItem` (§13: `fresh` starts again from the base branch) |
 | `queue_status` | `{}` | `Status` |
@@ -1681,6 +2710,7 @@ id.
 | `set_directive` | `{text, expires_in_hours?}` | `SetDirective` |
 | `clear_directive` | `{directive?, all?}` | `ClearDirective` |
 | `github_reply` | `{repository, number, body}` | `GithubReply` (Archon's watched repositories only; see `docs/github-watcher.md`) |
+| `record_lesson` | `{kind: routing\|practice\|pitfall\|pipeline, text, repo?, pipeline?, item?}` | `RecordLesson` (§19; active at once, advice only) |
 
 `get_stage` reads the item's latest run, or the one `run` names; attempts
 restart at 1 in each run. Without `stage` it lists every
@@ -1697,6 +2727,8 @@ over the MCP message limit is refused with a hint for the tool called: for
 `get_stage`, a smaller `limit`, `offset` and `slot`.
 
 `model_plan` is `{"<stage-id>": [{"model":"provider/model","effort":"high"}, …]}`.
+It is optional at `enqueue`, whole or per stage: Archon fills the stages it
+leaves out (§7.4), and the item shows the filled plan.
 `model_reasons` is an optional `{"<stage-id>": "one-line reason"}` object,
 with at most 300 Unicode characters per reason. Unknown stage ids are Invalid
 and list valid ids. It belongs to the item, not `ModelChoice` or executed stage
@@ -1753,10 +2785,17 @@ it cannot race `Say` or a lagging pump. An `inbox.delivered` message from the
 `user` actor is pending until an `inbox.consumed` (at turn start or steered
 mid-turn) covers its inbox seq. From then on `archond` keeps the last
 assistant text, and on `agent.turn_completed` it emits that text. A turn that
-ends `failed` or `cancelled` emits nothing; the revived agent answers. The
+ends `failed` or `cancelled` emits nothing; the revived agent answers. A
+turn that ends waiting for something other than its inbox (`agent.waiting`
+with a condition, as when the orchestrator waits for an agent it delegated
+to) emits what it said and leaves the answer open: the last text of the
+turn that the wait's end wakes is emitted too, so a delegated result is
+shown as the reply. The answer closes at the first turn that ends any other
+way. While it is open, a turn woken by Archon news is shown as well, which
+is the price of not dropping the answer. The
 tracker is persisted in kv `chat_reply_state` with the last event seq it
 applied, so neither a restart nor a replay loses or repeats a reply.
-Assistant text from trigger-woken turns is never shown. Tool calls, thinking
+Assistant text from other trigger-woken turns is never shown. Tool calls, thinking
 and intermediate text are never shown. `archon log` and Aether's TUI show
 everything. `archon log --item <id>` keeps the entries about one item (its
 notices, questions and their answers, reports), `--kind` keeps some kinds
@@ -1777,7 +2816,8 @@ object per line under `--json`).
 - Worktree per pipeline run:
   `<worktrees.root>/<repo>/<item-id>` on branch
   `<branch_prefix><item-short>-<slug(title)>`, created with
-  `git -C <repo> worktree add -b <branch> <path> <base>`. The base is
+  `git -C <repo> worktree add -b <branch> <path> <base>`, checked out
+  through the shadow (§13.4). The base is
   `repo.base_branch`, or the repo's current `HEAD` commit.
   **Uncommitted changes in the operator's checkout are not included**, unlike
   Aether's isolated-delegation snapshot.
@@ -1811,7 +2851,7 @@ object per line under `--json`).
   run forks a new branch, `<old branch>-fresh<n>`, where `n` counts the
   item's fresh retries (`QueueItem.fresh_retries`); the old branch, its
   commits, the remote and any pull request open from it are left as they
-  are. Ship pushes without force, so the fresh run opens a new pull request
+  are. Shipping never forces a push, so the fresh run opens a new pull request
   and the old one should be closed by the orchestrator or the operator. A
   plain retry after a fresh one stays on the fresh branch. The retry is
   refused, and nothing moves, when the new branch already exists or the
@@ -1824,11 +2864,12 @@ object per line under `--json`).
   `worktrees.gc_after` (default 7d) after the item's last run, with no check
   for uncommitted changes, which `archon queue retry --fresh`, `retry_item`
   and the progress note say.
-- A brief amendment (`brief_append` on `retry_item` or `update_item`, the
-  latter refused while the item is dispatching or running; `archon queue
-  retry --append`) is appended to the brief under a dated `## Amendment
-  (<UTC time>)` heading, so every later stage prompt carries it, and a
-  progress note records it against the item.
+- A brief amendment (`brief_append` on `retry_item` or `update_item`, a
+  `note` on `steer_item`, `archon queue retry --append`) is appended to the
+  brief under a dated `## Amendment (<UTC time>)` heading, so every later
+  stage prompt carries it, and a progress note records it against the item.
+  A running item's live agents are sent it (§6.6); only an item that is
+  dispatching is refused.
 - Cleanup: after `succeeded` with a completed ship-kind stage in the run's
   frozen pipeline, repository ship mode `pr`, and when
   `keep_on_success = false`, the worktree's build caches are deleted
@@ -1962,10 +3003,12 @@ a tag or another ref counts as a branch not the role's. Roles fork from
 `refs/heads/<run branch>`, never from a tag of that name.
 
 Every git the daemon runs has
-`core.fsmonitor=false`, and in a team's worktrees also
-`core.hooksPath=/dev/null`: `worktree add`, `switch`, `update-ref`, the
-`--quit`s and the daemon's commits and merges run no repository hook,
-which a role could have committed where `core.hooksPath` looks. Paths are
+`core.fsmonitor=false`, `core.hooksPath=/dev/null` and every
+`hook.<event>.enabled=false` (§13.4): `worktree add`, `switch`,
+`update-ref`, the `--quit`s and the daemon's commits and merges run no
+repository hook, which a role could have committed where `core.hooksPath`
+looks. A team's merges and status still read the repository's config, so
+a filter or merge driver it names runs there (§13.4). Paths are
 read NUL-terminated (`-z`), so names with spaces at either end or a
 newline are listed exactly; a name that is not UTF-8 is shown lossily
 and never fails the merge.
@@ -2053,9 +3096,8 @@ and never fails the merge.
   `Refused` too. Then it runs
   `git merge --no-ff` of each role's branch in `roles` order, skipping any branch already an ancestor of `HEAD`
   (`merge-base --is-ancestor`). The daemon commits these merges itself:
-  with `core.hooksPath=/dev/null`, so no repository hook runs in the
-  daemon, and as `Archon <archon@localhost>` only when git has no identity
-  configured.
+  with no hook enabled, so no repository hook runs in the daemon, and as
+  `Archon <archon@localhost>` only when git has no identity configured.
 - **Conflict.** A conflicting merge is aborted with `git merge --abort` and
   recorded as `Conflict { role, files }`; the driver fails the stage with
   the files as `{{feedback}}` for its `on_fail` target, or fails the run.
@@ -2193,6 +3235,147 @@ registered repository that is no longer a git repository, an unreadable
 set-aside directory), makes `archon gc` exit non-zero. Each is reported
 against its path while gc still collects everything else; `archond` logs
 them for its own passes, which a store error stops like any worker (§16).
+
+### 13.3 The orchestrator's mirrors
+
+The orchestrator answers a question about code by reading the code, so it
+needs every registered repository at hand, and it must not hold the
+operator's checkout. `archon_daemon::mirror` keeps
+`<data>/orchestrator/repos/<name>` for each registered repository: a work
+tree checked out detached at the base branch (`repo.base_branch`, else the
+repository's `HEAD` commit, as for a worktree), whose git directory is
+`<data>/mirror-git/<name>`, outside the orchestrator's workspace. The
+mirror's `.git` is a file naming that directory. Like a worktree it holds
+committed work only.
+
+**What a mirror cannot do.**
+
+- It has no remote. The daemon fetches by path, so `git push`, `git pull`
+  and `git fetch` have nowhere to go, and the repository's own remotes and
+  credentials are not in its config.
+- It has no branch of the repository's. The repository's branches are
+  fetched to `refs/mirror/*`, a namespace no push or checkout names by
+  default, and a base that is not a branch to `refs/archon/base`.
+- Nothing a helper writes runs as the daemon. The git directory is made by
+  `git init --bare --template=`, and before every command the daemon
+  rewrites its `config` to exactly its own and removes `config.worktree`,
+  `info/attributes`, `commondir`, `objects/info/alternates` and
+  `info/grafts`. Each refresh rewrites the `.git` file, which the daemon's
+  git never reads: it names the git directory and work tree itself.
+- A push is refused anyway. Every mirror's `core.hooksPath` is
+  `<data>/mirror-hooks`, outside the orchestrator's workspace, whose
+  `pre-push` hook exits 1, so a helper that adds a remote still cannot push
+  through it. A worktree of the mirror shares that config. `--no-verify`
+  skips a hook, so this guards against a mistake and is no boundary: an
+  agent runs as the operator's user, and what its tools can reach beyond
+  its workspace is Aether's limit (§17). What a mirror guarantees is that
+  nothing in it points at the repository or its remotes.
+- No hook of the repository runs. `--template=` copies none, the
+  repository's hooks are never fetched, and the daemon's own git in a
+  mirror runs as §13.4 describes, without the operator's global and system
+  config, and with `--git-dir` and `--work-tree` naming the mirror itself,
+  so a `core.worktree` written anywhere cannot aim a checkout elsewhere.
+- A symbolic link is never followed. A link where the mirrors directory, a
+  mirror or its git directory belongs, or a `.git` that is a directory or
+  a link, is removed and made again. A link inside a mirror is a file of
+  the repository like any other.
+
+The mirror's objects are its own, fetched from the repository, so a mirror
+costs about one more copy of the repository; nothing git does in a mirror
+writes to the repository.
+
+**Refresh.** One worker (`mirror::run`) brings every mirror up to date at
+start and when the operator sends a message. It refreshes one repository's
+mirror when that repository is registered or changed and when one of its
+items finishes (its pull request may have moved the base). Every pass also
+retries a mirror that has a problem or was never made. Requests made
+during a pass share the next one, and a request never waits for the
+refresh. A pass resolves the base in the repository, skips
+the fetch when the mirror is already there, fetches only what it lacks
+otherwise, and checks out with `--force --detach`: tracked files a helper
+changed are reset, untracked ones are left. A git directory is made beside
+its place and renamed, so a crash leaves no half-made one, and the pass
+removes whatever else lies in the mirrors directory and under
+`<data>/mirror-git`, an unregistered repository's mirror included.
+
+**A refresh that fails** leaves the mirror where it was and is never
+silent: one `System` feed entry names the repository and git's error, and
+a quiet `mirror` event with `state: "stale"` joins the orchestrator's next
+trigger (§5.4), so it knows the code it reads may be behind. The state is
+kept in kv `mirror_<repo id>`, so the problem is told once, and once more
+(`current`) when a later refresh succeeds. A repository whose `[models]`
+refuses the orchestrator's own model gets no mirror at all (`withheld`):
+the orchestrator may not read it, and a question about it is an `ask` item
+under that repository's policy.
+
+**Helpers.** A helper's `workspace_root` may be a mirror. Aether accepts it,
+since it is under the orchestrator's workspace, and an isolated child gets
+a git worktree of the mirror on a new branch of the mirror
+(`aether-runtime`'s `workspace.rs`), which shares the mirror's config:
+still no remote, still the push guard. The watchdog allows a helper there,
+holds it to that repository's model policy, and cancels one placed in the
+registered repository itself or under the worktrees root (§7.4).
+
+### 13.4 The daemon's own git
+
+An agent can write a repository's `.git/config`, its worktree's files and
+often its local `origin`; git runs programs those name. Every git command
+`archond` runs therefore goes through `worktree::daemon_git::DaemonGit`:
+
+- No `GIT_*` variable or `EMAIL` of the daemon's environment is passed on.
+  `GIT_TERMINAL_PROMPT=0`, an empty askpass, `GIT_ATTR_NOSYSTEM`,
+  `GIT_NO_REPLACE_OBJECTS` and `GIT_NO_LAZY_FETCH` are set.
+- `-c` settings outrank every config file: `core.hooksPath=/dev/null`,
+  `hook.<event>.enabled=false` for every event (recent git also runs hooks
+  named in config), `core.fsmonitor=false`, `core.attributesFile=/dev/null`,
+  no signing or signature check, no auto gc, no submodule recursion, and
+  every transport but `file` refused.
+- A command is killed with all it started after 120 s, a fetch or push
+  after 180 s, and fails as unavailable.
+- `Sealed` git, on a repository or worktree an agent may write, reads no
+  system or global config and has no credential helper. It runs only
+  commands that read refs and config as data: `rev-parse`, `for-each-ref`,
+  `update-ref`, `worktree list`, `worktree remove --force`, `ls-files`.
+
+What reads file contents (a merge, a checkout, a clean check, a push or a
+fetch) runs in the repository's **shadow**: `<data>/daemon-git/<sha1 or
+sha256>`, a bare git directory `archond` made with `--template=`, whose
+config it rewrites before every command and from which it removes
+`config.worktree`, `info/attributes`, `commondir`, `objects/info/alternates`
+and `info/grafts`. It reads and writes the repository's objects through
+`GIT_OBJECT_DIRECTORY`, and a worktree's files with `--work-tree` and
+`GIT_INDEX_FILE`. The repository's config is never read there, so no
+filter, merge driver, `core.sshCommand` or `credential.helper` it names
+runs, and a `.gitattributes` naming one is inert. The shadow holds no refs:
+a merge is `merge-tree --write-tree` (git 2.38 or later) and `commit-tree`,
+and the branch moves with a `Sealed` `update-ref`.
+
+Shadow git reads the operator's system and global config, which an agent
+does not write: a filter such as Git LFS installed there, `url.<base>.
+insteadOf`, `http.*` and `credential.helper` apply, and a push or fetch
+keeps `GIT_SSH_COMMAND`, `GIT_SSH` and `GIT_SSH_VARIANT` from the daemon's
+environment. Only https, ssh and local `origin` URLs are used; a local
+remote's `receive-pack` and `upload-pack` run with no hook. A fetch writes
+no ref and no `FETCH_HEAD` in the repository, only the objects it lacks.
+
+Removing a worktree asks the shadow what `git worktree remove` would: a
+populated submodule or the worktree's own `modules`, a tracked change
+(`update-index --refresh`, `diff-files`, `diff-index --cached`), or an
+untracked file not ignored by the tree's `.gitignore`, the repository's
+`info/exclude` or the operator's, nor a cache: `__pycache__`, `*.pyc`,
+`*.pyo`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.hypothesis`,
+`.tox`, `.coverage` and `node_modules` at any depth, a top-level `target`,
+and `worktrees.cache_dirs`. Any of them keeps the worktree; else it
+goes with `worktree remove --force`, so git's own `status`, which reads the
+repository's filters, never runs. A repository-only `core.excludesFile` or
+`core.autocrlf` is not read, which can only keep a worktree that was clean.
+
+A new worktree or snapshot is added with a sealed `git worktree add
+--no-checkout`, then checked out with `read-tree -m -u` through a shadow at
+`<worktrees.root>/.archon/daemon-git/<format>`: the repository's hooks and
+filters never run, the operator's do. Not yet through the shadow: a team's
+worker worktrees, merges and status (§13.1), which run no hook but the
+repository's filters.
 
 ## 14. Lavish plugin
 
@@ -2413,15 +3596,25 @@ rubric), and a review task (seeded bug must be reported).
 | Stage agent still ending its turn when its run finishes | `get_agent` at retirement reports it live. | The node is left for the next sweep, up to 60 s after that stage settled; then it is cancelled regardless (§4.5). Only agents settled within the last 60 s are asked, newest first. |
 | Aether's `[network] default` changes mid-run | `status.network_default`, read each time a stage is bound to its node. | A stage bound afterwards states the narrower of its node's network and the new default: a tightened default is honoured at once, and a loosened one never widens the node, which Aether would refuse. A stage bound before the change is replayed exactly as stored (§4.5). |
 | Archon's own `aetherd` cannot start (dedicated mode) | `aether daemon` exits non-zero, or nothing listens within 10 s. | The command fails with Aether's own stderr. `archond` is not started by that command. `archon doctor` shows the instance's state. |
-| Aether unreachable at start | Connect error. | Serve the Archon socket anyway. `Status` shows `aether: disconnected`. Reconnect with backoff from 1s to 30s. No dispatch while disconnected. |
+| Aether unreachable at start | Connect error. | Serve the Archon socket anyway. `Status` shows `aether: disconnected`. Reconnect with backoff from 1s to 30s; while nothing listens on a local socket (it is missing, or refuses) every second instead, logged once, so an aetherd that starts is found at once. No dispatch while disconnected. An `archon` command that started or restarted Archon's own aetherd, or waited while another did, waits up to 5 s for `archond` to report the link before it runs, and says so when that runs out. |
 | Aether connection drops | Reader EOF or id-0 notice. | Same backoff. On reconnect, a changed `instance_id` means Aether restarted: run reconciliation (`get_agent` and `get_task` for every live stage agent and the orchestrator). |
 | Aether restart kills native processes | `agent.failed` or an interrupted task. | Stage: infra retry (§6.3). Orchestrator: the supervisor path below. |
 | Orchestrator failed or cancelled | Orchestrator subscription, or `get_agent` at start. | `wake` in place. If refused, `restart` (new agent from checkpoint), store the new id, and write a `System` feed entry. The first revival of a streak runs at once; each later one waits 10s, 30s, 2m, 5m, then every 10m (`supervisor::REVIVAL_BACKOFF`). A turn that ends `ready` or `waiting` closes the streak. After 3 revivals in a row, post one `Blocker`; revival never stops for good, and `archon orchestrator restart` starts a fresh agent at once. Dispatch continues, because the queue does not depend on the orchestrator. |
-| Orchestrator restarted in Aether (`aether restart`) | `agent.restarted` on the orchestrator's subscription, or `restarted_as` at start and on reconnect. | Adopt the successor if its role is `archon-orchestrator`: store its id, close the failure streak, move the subscription to it, and write a `System` feed entry. Its held news follows (§5.4). A successor with another role is not adopted. |
+| Orchestrator restarted in Aether (`aether restart`) | `agent.restarted` on the orchestrator's subscription, or `restarted_as` at start and on reconnect. | Adopt the successor if its role is `archon-orchestrator`: store its id, close the failure streak, move the subscription to it, and write a `System` feed entry. Its held news follows (§5.4). A successor with another role is not adopted. A chain of restarts is followed to its newest orchestrator, and every agent left behind on the way is retired (next row). |
 | `archon` MCP server died in Aether (after a redeploy, say) | `mcp_servers` reports it `failed`: at every connect to Aether and every 60 s (`supervisor::MCP_CHECK_INTERVAL`). | `refresh` it, then restart the orchestrator so it gets the tools back. Both back off like revivals, and 3 failures in a row post one `Blocker` (below). |
+| Orchestrator replaced while its delegated children run | Any path above that puts a new agent in charge. | The children end. Aether's `cancel` takes an agent's live descendants along; a failure does not, and neither does Aether's `restart`. So every agent that stops being the orchestrator is written to `kv.orchestrator_retired`, with the sweep it is owed, before its successor is stored, and Archon sends `cancel` for it, which Aether applies to the subtree of an agent already stopped. An adoption retires every agent between the stored orchestrator and the adopted one, each with children of its own; a manual restart and a relink follow the same chain first, so they act on the agent in charge rather than on one Aether already replaced. A background task makes the owed sweeps from `archond`'s start on: at once when one becomes owed or Aether reconnects, then with the revival backoff while it fails. A sweep is done only when Aether answers its `cancel`, no longer knows the agent, or reports it ended. Its first failure and its later success are each a `System` entry. A sweep holds no lifecycle lock, so it never delays the orchestrator in charge, which is never swept. A record that cannot be read is reset with a `Blocker` that quotes it, rather than stopping the orchestrator. Records stay through the 7-day event retention, so a retired agent's late events and its children's spend are still Archon's, and are then pruned unless a sweep is still owed. The new agent does not know what was delegated. A `wake` in place keeps the children. |
+| archond's delivery of a run fails | `git push` or `gh` exits non-zero or times out, or a check of the run worktree does not hold (§8.7). | A check that does not hold, a remote branch with other commits, or several open pull requests fail the item as `stage ship: <what to change>`; missing access, a missing `origin` or a branch rule as `stage ship: BLOCKED: …`, which is a `Blocker`. Anything else is tried again by the sweep after 15 s, doubling, five times in all, then fails the item with the last error. A retry of the item delivers the same branch: nothing is forced, and the open pull request is reused. |
+| `archond` stops while it delivers a run | Startup: the run is `running` at its last stage and every stage passed. | The resumed driver asks for the delivery again and the sweep makes it. With `kv.ship:<run>` written, the outcome is replayed and nothing is delivered; without it the checks, the push and the pull request lookup run again, which push nothing `origin` has and find the pull request GitHub lists, so no second one is opened. |
+| A delegating stage agent settles while its children run | The stage's settle: its stored request has `leaf: false`. | `kv.descendant_stop:<stage run>` is written with the settle. No agent of that run is created (next stage or replacement), and archond does not deliver the run (§8.7), until Archon has cancelled the settled agent and Aether holds no agent beneath it in a non-terminal state; the agent is first left to end its own turn, up to 60 s. The cancel is sent once; the check is repeated each dispatcher pass and after a restart. Agents still running 120 s after the cancel are named in one `Blocker` and the run keeps waiting; a refused cancel fails the run with a `Blocker` (§6.3). |
+| Aether names no caller on Archon's tools | An unnamed call that changes Archon reaches `archond`. | One `Blocker` with the fix; such calls are accepted only from an orchestrator that cannot delegate, and new generations start without `delegate`, until the orchestrator makes a named call of any kind (§11). In dedicated mode the registration is repaired and Archon's `aetherd` restarted by the next command (§4.7). |
 | Orchestrator missing (first start) | No `kv.orchestrator_agent`. | Create it (§4.4). |
-| `archon mcp` cannot reach `archond` | Connect error in the proxy. | `connect_or_start` autostarts `archond` (`archon daemon run --detach`, which waits until the daemon listens and fails as soon as it exits). If that fails, return a tool error with the launcher's stderr and the startup log. |
+| `archon mcp` cannot reach `archond` | Connect error in the proxy. | `connect_or_start` autostarts `archond` (`archon daemon run --detach`, which waits until the daemon listens and fails as soon as it exits). If that fails, return a tool error with the launcher's stderr and the startup log since the last start mark (each detached start appends to `archond.log`, moving it to `archond.log.1` past 16 MiB). |
 | Stage exceeds deadline | Timer. | `cancel` the agent, mark the stage `timed_out`, and let the driver treat it as a failed verdict or failed work. |
+| A steer is stored but Aether does not take what the live agents are owed | `update_agent`, `interrupt` or `send_message` unanswered, or a crash after the store. | The steps stay in `kv.steer_owed:<stage run>` and every sweep repeats them in order, each message under its own key so it is delivered once. A step Aether refuses is dropped with a progress note; what the steer stored reaches the stage's next agents (§6.6). |
+| `archond` restarts on a steered run | Startup reconcile. | `frozen::thaw` applies the run's `run_edits` to its frozen pipeline and the driver takes its recorded aborts before `RunDriver::resume`, so the run has the stages and decisions the steers left (§6.6). |
+| A kept agent cannot take its fix attempt | `get_agent` reports it not live, or Aether refuses the deadline or the message. | The agent is cancelled and a fresh one takes the attempt with the findings and the digest of the last attempt (§6.7). An unanswered call is repeated under the same key instead. |
+| A resumed attempt's agent dies or ends its turn saying nothing | `resumed_outcome` at the agent's turn end and at every sweep. | Infra retry (§6.3): the kept agent is stopped and a fresh agent takes the slot. |
+| A resumed attempt's final message leaves out the ship record it owes | `ShipRecord::read` of its `structured` as it settles. | The agent is asked once for the record alone (§6.7); a second miss fails the stage, saying what is wrong with the record. |
 | Worktree creation fails | git exit status. | Item `failed` with git's stderr. The feed gets a `Blocker`. |
 | Disk low or full | Free space below `limits.min_free_gb` at a dispatch pass, or a stage or `create_agent` failed with `database or disk is full`, `No space left on device` or `ENOSPC`. | The disk hold (§7.3): no dispatch, and one `Blocker` with the free space, the path and `archon gc`. With `worktrees.auto_gc` on, a worktree gc pass (§13.2) runs before the held dispatch. When `archond` cannot start, `archon gc --offline` collects without it. A stage that failed on a full disk is retried once space is back, without using an infra retry (§6.3); a `create_agent` that keeps failing so fails its run after 5 tries. |
 | Archon's store on a full disk | SQLite `SQLITE_FULL`, mapped to `ArchonError::DiskFull` (`store: disk full: ...`). | Standby: the pump, dispatcher, trigger delivery, pruning and `archond`'s own gc passes stop, since memory may no longer match a store whose write failed. The socket keeps serving reads (`status`, items, repos, pipelines, questions, the feed, reports, the spend report), so `archon status` and `archon gc` work, and refuses everything else with the `DiskFull` error. Staying up also keeps clients that autostart `archond` from restarting it in a loop. Once free space ends the disk hold, `archond` exits cleanly, and the next command starts it, which recovers as after a crash. A store that fails to open on a full disk ends the start with the same error. |
@@ -2491,13 +3684,17 @@ so a pass costs what is still stored.
 
 | Entry | Deleted when |
 | --- | --- |
-| `spawn_request:<stage run>` | Its stage run is terminal (or was never recorded). |
+| `spawn_request:<stage run>` | Its stage run is terminal (or was never recorded); a kept agent's (§6.7) once its run's node retired as well. |
 | `run_vars:<run>` | Its run is terminal (or was never inserted); only a live run's driver is rebuilt from it. |
 | `team_merge:<run>:<stage>:<attempt>` | Its run is terminal (or was never inserted); like `run_vars`, only a live run's driver replays it. |
+| `ship:<run>` | Its run is terminal (or was never inserted); only a live run's driver replays the delivery outcome (§8.7). |
 | `run_node_agent:<agent>` | Its run finished more than 7 days ago and its node was retired (`run_node:<run>` is gone). A later event of that node at most waits the 5 s spawn grace (§4.6). |
 | `link_child_<agent>`, `link_unchecked_<agent>`, `link_cancelled_<agent>` | The child's item is terminal and last changed more than 7 days ago. For the orchestrator's children, which have no item, the pass asks `get_agent` (at most 32 a pass). The first pass that finds the child ended records when, in `link_ended_<agent>`, and all its entries go 7 days after that. |
 | `link_stage_agent_<agent>` | Its item is terminal and last changed more than 7 days ago (or is gone). A recorded stage agent is also found through its stage run (§4.6). |
 | `report:<id>` | The report is settled and last changed more than 7 days ago (§14). An ended or disconnected report is kept while its HTML file exists. |
+| An entry of `orchestrator_retired` | The orchestrator was replaced more than 7 days ago and the sweep of what it left running is no longer owed (§16). |
+| `descendant_stop:<stage run>` | Not by this pass: the dispatcher deletes it once Aether has confirmed the stop (§6.3). |
+| `steer_owed:<stage run>` | Not by this pass: the sweep deletes each step once Aether took it, and the rest when the stage run settled (§6.6). |
 | `orchestrator_gave_up`, `orchestrator_failures` | At once: the give-up rule that wrote them was replaced by the revival backoff, and nothing reads them. |
 
 The retention keeps what late events still need: a watched child's entry
@@ -2506,9 +3703,14 @@ and a pending `link_unchecked_` marker makes a replayed `agent.created`
 check the child again. Entries that live state needs are never pruned:
 `run_node:<run>` (deleted when the node is retired, §4.5), the held news in
 `trigger_outbox` and its key counter `trigger_seq` (§5.4), the revival
-streak in `orchestrator_backoff`, and the other single keys (cursors, the
-orchestrator's id and generation, the hard pause, the budget and disk holds), which do
-not grow with work. Questions are rows, not `kv`, so an answer not yet
+streak in `orchestrator_backoff`, a replaced orchestrator whose sweep is
+still owed in `orchestrator_retired`, an owed `descendant_stop:`, and the
+other single keys (cursors, the orchestrator's id and
+generation, the hard pause, the budget and disk holds), which do not grow
+with work. An item's steer history and steered stage list
+(`steers:<item>`, `shape:<item>`, §6.6) are the item's own data and stay
+with it: at most 100 records and one stage list per steered item.
+Questions are rows, not `kv`, so an answer not yet
 delivered is never pruned, nor is a report whose reopen question waits.
 
 ## 17. Aether limitations and how Archon handles them
@@ -2517,16 +3719,22 @@ delivered is never pruned, nor is a report whose reopen question waits.
    Aether can supply caller identity when a server opts into
    `send_caller_meta`; Archon requires it for stage messaging (§5.5).
    `ToolExposure::Except` hides orchestrator mutations from stage agents;
-   the other exposed calls are still treated as the orchestrator's.
+   the other exposed calls are still treated as the orchestrator's, and
+   `archond` lets a mutating one through only for the current orchestrator,
+   by the caller Aether names (§11).
    In the default dedicated mode, the only daemon that loads `archon mcp` is
    Archon's own (§4.7), so the operator's plain Aether agents never see
    `mcp__archon__*`. Only in shared mode can any other Aether agent that the
-   operator runs see and call them.
+   operator runs see them; it can read, and change Archon only through a
+   registration that sends no caller identity, while the orchestrator in
+   charge cannot delegate (§11).
 2. **MCP servers load at Aether start.** Aether reads `[[mcp.servers]]` only
    when `aetherd` starts, and no command reloads them. In dedicated mode,
    `archon setup` writes the instance's config before its daemon first
-   starts, so no restart is needed. After `archon setup --resync`, restart
-   the instance with `archon daemon stop --aether`. In shared mode, the
+   starts, so no restart is needed. When Archon changes the instance's
+   registration later (a repair after an upgrade, or `archon setup
+   --resync` replacing the entry), it restarts the instance's `aetherd`
+   itself (§4.7). In shared mode, the
    operator must restart their own `aetherd` after the first `archon setup`,
    and `archon doctor` reports "aetherd has not loaded the archon server"
    until then. `archond` calls `mcp_servers{refresh:true}` to reconnect a
@@ -2544,9 +3752,32 @@ delivered is never pruned, nor is a report whose reopen question waits.
    (§13), so a build or test they run writes there rather than into the
    operator's checkout, and cannot see or disturb its uncommitted work,
    but nothing stops an agent from writing outside its workspace.
-5. **Hiding `delegate` relies on `ToolExposure` covering harness tools on the
-   native MCP bridge** (Aether documents that tool exposure applies to native
-   agents). The §7.4 watchdog is the backstop.
+   An agent the orchestrator delegates to is given a mirror (§13.3) or the
+   scratch directory, never a repository: one whose scope leads into a
+   registered repository or the worktrees root is cancelled (§4.4). That
+   check reads the scope Aether holds for the agent; it cannot see a path a
+   native tool opens outside that scope, so a helper stays out of
+   repositories by its placement and its instructions, not by a sandbox.
+   The same holds for a stage agent's delegated children: an editing child
+   gets an isolated worktree of its own, a reading child shares the lead's
+   worktree and is read-only by instruction only. For a pipeline's declared
+   review (§8.2) Archon checks that a child of the lead completed on the
+   reviewer's model, which Aether records. What that child read and what
+   it found are not in that record: they remain the lead's report.
+5. **`delegate` takes no tool exposure or approval policy for the child,
+   and copies none of its parent's instructions.** A child inherits its
+   parent's `config`, so the orchestrator's children see what it sees, but
+   its instructions are replaced by the ones `delegate` was passed, or by
+   none. A rule therefore reaches a child only when its parent writes it
+   there: the orchestrator's prompt (§4.4), the stage contract (§8.6) and
+   the `adaptive` build prompt each require that, by instruction only.
+   Hiding `integrate_workspace` relies on
+   `ToolExposure` covering harness tools on the native MCP bridge (Aether
+   documents that it does), Archon's mutating tools are refused to children
+   by `archond` (§11), and the §7.4 watchdog is the backstop for models.
+   Under the operator's `[approval] default`, a child's gated call waits for
+   an approval in Aether like the orchestrator's own (item 9). A child also
+   inherits the orchestrator's memory scope, not its repository's.
 6. **Costs are reported or estimated, not billed**, and unknown cost is not
    zero. Budgets are best-effort floors, and Aether's `cost_budget` does not
    stop a turn already running.
@@ -2573,6 +3804,46 @@ delivered is never pruned, nor is a report whose reopen question waits.
 11. **Pausing an agent in Aether stops it at a turn boundary.** A turn that
     is already running completes, so `archon pause --hard` does not stop a
     stage mid-turn.
+12. **A delegated child's workspace must lie under its parent's.** Aether
+    compares the two paths as written for a shared workspace, and resolves
+    links only for an isolated one. A symlink inside the parent's workspace
+    therefore passes Aether's check for a shared child while leading
+    anywhere on disk. Archon keeps no such link and resolves the paths
+    itself: the watchdog cancels a helper of the orchestrator whose scope
+    leads into a registered repository or the worktrees root (§4.4). A
+    mirror is a directory of real files under the orchestrator's workspace,
+    so a helper placed in one passes both checks; a change to a repository
+    is an item.
+13. **Aether cancels an agent's children with it, but not when its task
+    completes or fails.** A stage agent that settles while a child still
+    runs would leave the child working beside the next stage. Archon owes a
+    `cancel` of every settled stage agent that could delegate and starts
+    nothing else in that run before Aether holds no agent beneath it in a
+    non-terminal state (§6.3). Aether's `cancel` is cooperative: its answer
+    means the request was taken, not that an agent has stopped, so Archon
+    reads the subtree back instead of trusting the answer. It relies on
+    Aether applying a `cancel` of an already ended agent to its live
+    descendants. Aether's cancellation is written to do so, but its protocol
+    does not state it as a contract; if a later Aether refuses such a
+    `cancel`, the run fails with a `Blocker` rather than going on, and if it
+    takes the `cancel` without stopping them, the run waits and a `Blocker`
+    names them.
+    A replaced orchestrator's children are cancelled the same way (§16) but
+    its successor does not wait for them to end. They hold no repository or
+    worktree (item 4), `archond` refuses them every tool that changes Archon
+    (§11), and their results go to the retired agent's inbox, so the worst
+    overlap is a cancelled helper finishing a write in the scratch directory
+    or in a mirror, which the next refresh checks out again (§13.3). Holding
+    the operator's only interface on a helper that does not end would cost
+    more than that.
+14. **Aether's own limits apply to the orchestrator's children.**
+    `[scheduler] max_concurrent_turns` is shared with stage agents, so many
+    children slow stages down. `[scheduler] run_budget_usd`, if set in the
+    Aether config Archon uses, is cumulative for a run and never ages out:
+    the long-lived orchestrator's run eventually crosses it, and every
+    `delegate` is then refused until `archon orchestrator restart` starts a
+    new run. The dedicated instance's config is seeded from the operator's
+    (§4.7), so the budget is set there whenever the operator set one.
 
 ## 18. Autonomy
 
@@ -2585,28 +3856,29 @@ can raise. The types are in `archon_core::autonomy`.
 
 | Knob | Values, least to most autonomous | Effect |
 | --- | --- | --- |
-| `review` | `strict`, `standard`, `none` | With no pipeline named, picks `strict-pr-review`, `default-pr-review` or `quick-pr`. A named pipeline fixes the level from its gated review and test stages, and a `review` that contradicts it is refused. |
+| `review` | `strict`, `standard`, `none` | With no pipeline named, the item runs `direct` at that level. A pipeline that holds its own review (`adaptive`, `direct`; §8.2) runs at the level asked: three, one or no independent reviewers, verified. One with gated review and test stages fixes the level from them, and a `review` that contradicts it is refused. |
 | `proposal` | `lavish`, `off` | `lavish`: a `propose` stage first writes `.archon/reports/proposal/index.html`, and the run waits for the operator (§18.3). The approved proposal, with the operator's note, goes into every later stage's prompt. |
-| `report` | `before-pr`, `with-pr`, `off` | `with-pr`: a report stage before ship writes `.archon/reports/change/index.html`. The page is published, the ship stage puts the report in the PR body, and nothing waits. `before-pr` also waits for the operator before shipping (§18.3). |
-| `merge` | `manual`, `auto` | `auto` sets `{{ship.auto_merge}}`, so the ship stage merges its own PR. |
+| `report` | `before-pr`, `with-pr`, `off` | `with-pr`: a report stage before shipping writes `.archon/reports/change/index.html`. The page is published, the report goes into the PR body, and nothing waits. `before-pr` also waits for the operator before shipping (§18.3). |
+| `merge` | `manual`, `auto` | `auto` sets `{{ship.auto_merge}}`: archond asks GitHub to merge the PR once its checks allow (§8.7), and a ship stage of a pipeline that has one merges its own. |
 | `tools` | `guarded`, `yolo` | What the item's agents may use (§18.4). |
 
 The defaults are `review = standard`, `proposal = off`, `report = off`,
 `merge = manual` and `tools = guarded`. `[autonomy] default` in either
 config file changes them (§9). The enqueue resolves the knobs once and
 stores them on the item (`QueueItem.autonomy`), and a retry keeps them.
-`proposal`, `report` and `merge` mean something only for a pipeline with a
-ship stage. Other pipelines run with `off`, `off` and `manual`, and they
-refuse anything else. `tools` applies to every pipeline.
+`proposal`, `report` and `merge` mean something only for a pipeline that
+ships (`[pipeline.ship]` or a ship stage). Other pipelines run with `off`,
+`off` and `manual`, and they refuse anything else. `tools` applies to every pipeline.
 
 **Inserted stages.** When a knob needs a `propose` stage or a change report
 and the pipeline declares none, `archon_pipeline::autonomy::augment` inserts
-one: `propose` first, `report` right before `ship`. Each inserted stage has
+one: `propose` first, `report` last, right before the change ships (before
+the ship stage of a pipeline that has one). Each inserted stage has
 `fan_out = 1`, no gate, a 45-minute timeout and the shared prompt from
 `pipelines/_shared/`. If `model_plan` leaves it out, it gets the first
 choice of the pipeline's first stage. A pipeline that declares a `propose`
-stage, or a `report` stage before its ship stage, gets no duplicate, and the
-knobs gate the declared stage. The run's frozen snapshot holds the
+stage, or a `report` stage before the change ships, gets no duplicate, and
+the knobs gate the declared stage. The run's frozen snapshot holds the
 augmented pipeline, so a restart replays the same stages.
 
 ### 18.2 The ceiling
@@ -2711,9 +3983,10 @@ closes with the gate, right after the decision or the finish (§14).
 
 | Agent | `tools = guarded` | `tools = yolo` |
 | --- | --- | --- |
-| Orchestrator | The operator's `[approval] default`. Hides `delegate` and `integrate_workspace`. | `approval: {"require_for": []}`. Hides the same two tools. |
-| Stage agents | Approval gates nothing (they are headless, §4.5). Always a leaf, whatever the stage's `allow_delegation`. Exposes `message_orchestrator`, hides the other Archon tools. | Approval gates nothing. May delegate (`leaf = false`). Exposes `message_orchestrator` and Archon's read-only tools. |
-| Their subagents | Inherit their parent's approval policy. | The same, so nothing waits. |
+| Orchestrator | The operator's `[approval] default`. Hides `integrate_workspace`, and `delegate` while Aether names no callers (§11). | `approval: {"require_for": []}`. Hides the same tools. |
+| Its delegated children | Inherit its approval policy and tool exposure. `archond` refuses them Archon's mutating tools (§11). | The same, so nothing waits. |
+| Stage agents | Approval gates nothing (they are headless, §4.5). A leaf, unless the stage sets `allow_delegation` (`leaf = false`). Exposes `message_orchestrator`, hides the other Archon tools and Aether's schedule tools. | Approval gates nothing. May delegate (`leaf = false`). Exposes `message_orchestrator` and Archon's read-only tools; hides Aether's schedule tools. |
+| Their subagents | Inherit their parent's approval policy and tool exposure. | The same, so nothing waits. |
 
 A stage agent's `tools` knob is the item's. The orchestrator serves every
 item, so its knob is the global `[autonomy] default` `tools`. A change
@@ -2722,23 +3995,54 @@ applies from the orchestrator's next generation, and
 
 What stays hidden, and why:
 
-- **`delegate` and `integrate_workspace`, from the orchestrator.** Every
-  worker goes through Archon so that caps, budgets, the model allowlist and
-  the autonomy ceiling apply. An Aether `delegate` would bypass all four.
-  `integrate_workspace` only merges `delegate`'s isolated worktrees.
+- **`integrate_workspace`, from the orchestrator.** It copies a delegated
+  child's edits into the parent's workspace. A change to a repository must
+  be an item, so that the worktree, the pipeline's gates, the ship mode, the
+  caps and the autonomy ceiling apply; a child's edits would bypass all of
+  them.
+  `delegate` itself is exposed: the orchestrator uses it for work that
+  changes no repository (§4.4). Of the limits an item has, the model policy
+  and the daily and total budgets reach such a child; the caps and the
+  autonomy knobs do not.
 - **Archon's mutating tools, from stage agents.** `enqueue`, `cancel_item`,
   `pause`, `notify`, `set_directive` and the rest act for the orchestrator.
   A stage could otherwise queue work, cancel its own item or change
   directives outside the orchestrator's decisions and the operator's chat.
+  The orchestrator's children are not hidden from them, because `delegate`
+  cannot narrow tools; `archond` refuses their calls instead (§11).
   Under `yolo`, the read-only tools (`get_item`, `list_queue`,
   `list_pipelines`, …) are exposed. `message_orchestrator` is the mutation
   exception in every mode: it records attributed news without changing
   queue decisions (§5.5).
-- **Aether's `delegate`, from `guarded` stage agents.** They are created as
-  leaves. Each delegate works in its own copy of the workspace, and one
-  such fan-out once used about 77 GB of disk. Only `tools = yolo` lets
-  a stage agent delegate. A stage's `allow_delegation` no longer grants it,
-  and is kept only so pipelines that set it still load.
+- **Aether's `delegate`, from `guarded` stage agents whose stage does not
+  set `allow_delegation`.** They are created as leaves. A stage that sets
+  `allow_delegation = true` gets `leaf = false` under `guarded` too, and
+  `tools = yolo` lets every stage agent delegate. The flag changes nothing
+  else: which Archon tools the agent sees still follows the item's `tools`.
+  Aether's isolated delegated workspaces are managed Git worktrees that
+  share the repository's Git objects. They materialise the tracked files
+  and the untracked files that are not ignored; ignored caches and build
+  outputs are left out. What a child builds in its worktree still costs
+  disk.
+- **Aether's own tools, from a stage agent that can delegate.** `leaf =
+  false` also brings Aether's orchestration tools, to guarded stage agents
+  for the first time. The same list applies under `guarded` and `yolo`, and
+  a child inherits it:
+  - Hidden: `create_schedule`, `update_schedule` and `list_schedules`. A
+    stage is bounded work that Archon settles and stops; a schedule would
+    wake an agent after its stage ended, outside every cap and budget of
+    the item.
+  - Hidden where the pipeline's workspace is `repo-readonly`:
+    `integrate_workspace`. Nothing is integrated into a read-only workspace,
+    and its delegation rules offer no isolated children (§8.6).
+  - Kept: `delegate`; `integrate_workspace` in a writable workspace, which
+    is how an isolated child's accepted edits reach the lead's worktree;
+    `list_agents`, `list_tasks`, `read_task` and `cancel_agent`, with which
+    a lead follows, reads and stops its own children; and `list_models`,
+    which shows what is connected, while the delegation rules state what is
+    allowed and the watchdog enforces it (§7.4). Aether lets `cancel_agent`
+    act only on the caller's own delegated descendants; the read tools are
+    Aether's listings, which Archon does not narrow.
 
 ### 18.5 Operator directives
 
@@ -2752,8 +4056,11 @@ auth/".
   orchestrator records it with `set_directive`. Each directive gets a `dir_…` id and may expire after 1 to
   720 hours. A directive is at most 500 characters, and at most 20 are in
   force at once.
-- Every trigger payload carries the directives in force (§5.4), and
-  `autonomy_policy` lists them, so they survive an orchestrator restart.
+- The first trigger of an orchestrator generation carries the directives
+  in force, later ones what changed, and all of them again after a
+  restart, a revival or a compacted context (§5.4). `autonomy_policy`
+  lists them at any time, so they survive whatever the orchestrator's
+  context loses.
 - Directives steer the orchestrator's choice of knobs within the ceiling and
   never raise it. "Auto-merge everything" under a `merge = manual` ceiling
   gets the refusal, and the orchestrator tells the operator which setting to
@@ -2767,3 +4074,94 @@ directives. `archon status` adds the global policy and the gates that are
 waiting, and `archon queue show` shows an item's knobs and gates. The
 orchestrator states the knobs it chose, with a reason, in the `decision` it
 notifies for each item.
+
+
+## 19. Learning
+
+Learning records observations without model calls; only distillation spends through
+an ordinary budgeted errand. Explicit model plans and operator instructions take
+precedence over learned advice.
+
+**Outcomes and settlement.** A terminal run commits before optional capture.
+`learned::finished` logs capture failures and emits a deduplicated feed report;
+learning never prevents announce, follow-up agent stops or cleanup. Agent-supplied
+`diff_stat` is optional and malformed forms are ignored. Git's measured diff takes
+precedence. The maintenance worker uses recurring keyset scans of at most 20 rows,
+including after initial import, to recover missing outcomes. Bad records get
+`learning/backfill/skipped/<run>` diagnostics and the cursor advances. Repairing a
+record and removing its marker permits another attempt. Distillation runs do not
+produce outcomes. Late-correction input excludes imported and pre-upgrade runs
+and takes at most 100 recent observations.
+
+Costs captured at finish are provisional. Outcome reads, routing, statistics and
+pending `items_finished` delivery consult the current spend ledger, so late final
+billing can raise or lower the reported amount. Delegated agents are included and
+reused leads are charged once. `cost_provisional` reports whether observed charges
+have settled. Model steers append idempotent `StageRun.model_segments` in the JSON
+data column, keeping the initial `choice` immutable. Segment boundaries retain the
+choice, time, delivery key and known spend checkpoint. Queue display uses the
+current segment; quality is credited only to completed segments, and earlier
+segments retain cost without being labeled failures. Late corrections to estimates
+can make segment cost allocation approximate; the run's ledger total remains current.
+
+**Attribution.** Structured operator feedback is explicit:
+`correction {"item":"qi_…","stage":"implement","cause":"quality","reason":"…"}`.
+`cause` is `quality`, `scope`, `infrastructure` or `budget`. The store verifies the
+item and stage, deduplicates events, and preserves the reason. Ordinary chat wording
+is never classified as a correction. Scope and effort steers do not imply failures.
+Run-level events such as gate rejection, retry, PR closure and changes requested
+remain audit observations and can revoke lesson wins, but without attributed
+quality feedback they do not blame every model. A completed reviewer reporting
+FAIL performed its review; a builder's defect does not penalize that reviewer.
+Infrastructure, timeout, budget, blocked, escalation and shipping failures are
+excluded from model quality samples.
+
+**Routing.** Evidence is keyed by repository, pipeline and content revision,
+review level, task class (`task:<class>`, otherwise `general`), stage, and known diff
+size. Without a size hint, the same context pools sizes. Each query is capped at
+500 recent matching runs. Repository evidence falls
+back to matching global evidence when it has no five-sample candidate. Exploitation
+uses the lower Wilson 95% quality bound with a small logarithmic cost penalty.
+At most `explore_rate` (0..0.1) of item IDs explore uncertainty; ready models from
+Aether's catalog seed cold starts within model policy. Candidates with at least five
+samples whose upper bound is below the incumbent's lower bound are excluded. The
+catalog is refreshed outside the store lock at most every five minutes. Choice and
+reasons are frozen per item, and `lessons why` includes sample counts, intervals and
+context. Five wins are not claimed to establish model equivalence.
+
+**Configuration and lessons.** Configuration lives in daemon/store memory; it is
+not serialized and re-read from `kv` on each operation. Restart after config edits.
+Disabling learning stops capture, routing and advice, and cancels queued distillation
+errands. Recorded evidence stays readable. Read-only lessons commands use an
+existing daemon or open the store read-only, without starting dedicated Aether.
+
+Lessons must be one plain sentence of at most 300 characters, using allowed text
+characters without markup, URLs, paths or authority-override wording. Rendering
+returns an error for invalid stored text instead of panicking. All rendered advice
+retains the explicit untrusted, never-authority framing. Operator lessons are active
+and confirmed. Orchestrator lessons require a source item, inherit its repository,
+and start Proposed with at most 0.15 weight; a confirming clean win or operator
+acceptance activates them. Distilled lessons await acceptance. Six lessons at most
+fit a 1,200-byte stage section, frozen per run. Operator text and pins take precedence.
+
+Confidence decays with a 30-day half-life since last use. Retraction requires at
+least five scored uses and a raw Wilson lower bound below 0.3, never merely age.
+Pins prevent automatic decay and retraction. Maintenance writes only changed rows,
+outside the run-start and list paths. Orchestrator advice is frozen per generation;
+retention keeps the current generation and nine recent snapshots.
+
+**Distillation.** Each repository has at most one queued or running distillation.
+Every `distill_every` new outcomes (1..100) may queue a $1 low-priority errand.
+The global UTC daily budget defaults to $3, reserving full budgets at enqueue;
+0 disables new errands. Imported history is never distilled, so an upgrade has no
+paid catch-up burst. It remains available as outcome evidence.
+
+A distillation validates all lessons and its optional proposal before mutation;
+absent or null `pipeline_proposal` means no proposal. One database transaction writes
+lessons, rewrites, an applied marker and a durable proposal outbox. Publication is
+idempotent and retried from that outbox after failures or restart. Validation errors
+leave no partial lessons, and a crash cannot apply the lessons twice. Proposed
+pipelines are inactive under `<name>.proposed`, obey normal pipeline validation and
+daemon delivery rules, and are listed or shown with `archon pipelines proposals`.
+`archon pipelines accept <name>` revalidates and activates without replacing an
+existing pipeline; a missing proposal reports `not_found` with its path.

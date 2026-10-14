@@ -39,8 +39,13 @@ name, as a whole directory**:
 
   ```toml
   [pipelines]
-  disabled = ["quick-pr"]
+  disabled = ["performance"]
   ```
+- A pipeline that learning proposes is written to the user directory as
+  `<name>.proposed/`, which the catalog ignores. It was checked like any
+  pipeline of yours; read it, then `archon pipelines accept <name>` renames
+  it to `<name>/`, after checking it again. A pipeline of that name already
+  there is never replaced.
 
 ## Quick start: add a pipeline
 
@@ -59,11 +64,18 @@ To make it available to a single repository only, copy it to
 `<repo>/.archon/pipelines/bugfix-tdd/` instead. That copy wins over a user
 pipeline of the same name.
 
-The orchestrator now sees `bugfix-tdd` in `list_pipelines`, with its stages,
-gates and nudges, and can enqueue items with it. A test in
+The orchestrator now sees `bugfix-tdd` in `list_pipelines`, and its stages,
+gates and nudges when it names it there, and can enqueue items with it. A test in
 `crates/archon-pipeline/tests/catalog.rs` copies this exact directory into a
 temporary user directory and runs it through the engine, so the example
 cannot rot.
+
+The orchestrator may also write a pipeline itself when you keep asking for
+the same shape of work. It saves one to the user pipelines directory only
+after `archon pipelines check` passes, tells you its name, and never
+overwrites a pipeline it did not write. A repository pipeline
+(`<repo>/.archon/pipelines/`) it only proposes, and adds as an item once
+you agree.
 
 ## `pipeline.toml`
 
@@ -74,6 +86,13 @@ description = "Reproduce, fix, review twice, ship"   # required; shown to the or
 version = 1                  # required; the schema version, only 1 exists
 workspace = "worktree"       # worktree (default) | repo-readonly | scratch
 requires_repo = true         # default true; false lets items run without a repository
+
+[pipeline.review]            # optional; see "A declared review"
+level = "standard"           # none | standard | strict: the level an item gets unless it asks
+stage = "build"              # the work stage that holds the review
+
+[pipeline.ship]              # optional; see "Shipping": archond ships, no agent does
+stage = "build"              # the stage whose result names the commits to ship
 
 [nudges]                     # optional advice to the orchestrator; never enforced
 tier = "balanced"            # fast | balanced | strongest
@@ -87,7 +106,7 @@ prompt = "review.md"         # required; a file directly in this directory
 fan_out = 2                  # default 1; parallel agents, 1..=16 (a team's is its roles)
 gate = "all_pass"            # default none; none | all_pass | majority | any
 timeout_minutes = 60         # default 120, 1..=43200 (30 days); Archon cancels the agent after this
-allow_delegation = false     # grants nothing: only an item with tools = "yolo" delegates
+allow_delegation = false     # true lets the stage agent delegate, whatever the item's tools
 nudge = "Advice for this stage's model choice."
 on_fail = { goto = "fix", max_loops = 2 }   # optional fix loop
 
@@ -132,18 +151,258 @@ the field:
   or `any`): their agents return a verdict, and `gate = "none"` would ignore
   it.
 - `on_fail.goto` names an **earlier** stage, and `max_loops` is at most 10.
+
+These bounds (32 stages, `fan_out` 16, `max_loops` 10) belong to the file
+format and are the same on every installation, unlike `[limits]`: a
+pipeline that loads on one machine loads on every other, and a run's frozen
+copy loads again after any configuration change. How many agents run at
+once is set by `[limits]` instead.
+
 - There is at most one `ship` stage, it is the last stage, and the pipeline
   uses `workspace = "worktree"`.
+- `[pipeline.ship]`, when present, needs `workspace = "worktree"` and no
+  `ship` stage beside it. Its `stage` is a `work`, `review` or `test` stage
+  with one agent, and no `work` or `team` stage follows it, because the
+  record names the commits that ship.
 - There is at most one `propose` stage, and it is the first stage.
 - `propose` and `report` stages need `workspace = "worktree"` or
   `"scratch"`: they write their pages under `.archon/reports/` in the
   workspace.
 - `workspace = "worktree"` requires `requires_repo = true`.
+- `[pipeline.review]`, when present, names a `work` stage. Its `level` is
+  `none`, `standard` or `strict`.
 - `timeout_minutes` is between 1 and 43200 (30 days). The stage agent's
   deadline is exactly that long after it starts: a larger value is refused,
   never shortened.
 - Every `{{placeholder}}` in a prompt is a known variable (see below). The
   `team.*` variables are only allowed in a team stage's prompt.
+
+### Delegation
+
+A stage agent can delegate when its stage sets `allow_delegation = true`
+or its item runs with `tools = "yolo"`. Otherwise it is a leaf and has no
+`delegate` tool. Delegation changes nothing about Archon's own tools: a
+guarded stage still sees only messaging, and no stage agent ever sees the
+tools that change the queue.
+
+An agent that can delegate also gets the rest of Aether's tools, with
+three exceptions that Archon hides from every stage agent:
+`create_schedule`, `update_schedule` and `list_schedules`. A schedule
+would start agents after the stage has ended, outside the run. In a
+`repo-readonly` workspace `integrate_workspace` is hidden too.
+
+A child inherits none of its parent's instructions: Aether gives it only
+the `objective` and `instructions` passed to `delegate`. Neither the stage
+contract nor your stage prompt reaches it. Archon therefore adds a
+`## Delegation` section to the contract of every agent that can delegate,
+by either route. It says to:
+
+- let a child delegate once more when its part splits further, telling it
+  to pass `leaf: true` for its own children, and pass `leaf: true` for a
+  child that should not. The watchdog cancels an agent a third level down.
+  That is the default depth of 2; `[limits] max_delegation_depth` (1 to 4)
+  changes it, and the section says what the configured depth allows;
+- give a child that edits its own copy (`workspace_mode: "isolated"`) and
+  bring back only accepted changes with `integrate_workspace`, while a
+  child that only reads shares the stage's workspace. In a read-only
+  workspace every child shares it and only reads;
+- choose each child's model and effort within the model policy that
+  applies to the item, which the section states in words. The watchdog
+  cancels a child outside it;
+- wait for every child or cancel it before finishing;
+- delegate a new child for a second look, because a finished one cannot
+  be asked again;
+- hand a child what the stage agent already holds instead of having it read
+  again, never the conversation, and hand a reviewer the exact base and head
+  commits, the changed paths, the checks run with their results and the
+  commit they ran on, the known risks and the repository guidance;
+- state, in every child's `instructions`, the rules for its role: stay in
+  the workspace it is given and keep off other worktrees and the
+  operator's checkout, do not push, never override the git identity, ask
+  the operator nothing, and read only for a reviewer and for every child
+  of a read-only stage.
+
+A stage prompt that delegates should name any further constraint its
+children must be given, as `adaptive`'s `build.md` does.
+
+**When the stage ends.** Aether does not stop an agent's children when
+the agent completes or fails its task. Archon does: once a stage agent
+that could delegate has settled and its own turn has ended (or 60 seconds
+have passed), Archon cancels it, which asks every agent still running
+beneath it to stop. Aether stops them cooperatively, so Archon then waits
+until Aether holds none of them as running. The run's next stage, the
+delivery archond makes, or the replacement of a failed agent, starts only
+after that. The stop is stored
+before the stage settles, so it survives a daemon restart, and it stays
+owed while Aether is unreachable. If the agents have not ended two
+minutes after the cancel, a blocker names them; the item keeps waiting
+and goes on by itself once they end.
+
+Aether's isolated workspaces are Git worktrees sharing the repository's
+object store. Their snapshot includes tracked and non-ignored untracked
+files; ignored build outputs and caches are not copied. Large source
+trees, unignored artifacts and child builds still consume disk, so keep
+outputs ignored and size concurrency to the work and the machine.
+Aether's daemon keeps these worktrees beside its database, outside the
+source repository; Archon has no setting for it.
+
+### A declared review
+
+The `review` autonomy knob normally follows a pipeline's gates, not its
+reviewer count: a gated `review` or `test` stage makes it `standard`, both
+make it `strict` (`refactor` is `strict` with one reviewer), and a pipeline
+with neither runs at `none`. A pipeline whose review happens inside one
+agent's stage has no such gate, so it declares the review instead:
+
+```toml
+[pipeline.review]
+level = "standard"
+stage = "build"
+```
+
+Such a pipeline takes its review level from the item, not from its
+manifest. An item's `review` knob chooses `none`, `standard` or `strict`,
+and the stage delegates that many independent reviewers:
+
+| Level | Reviewers the stage delegates to |
+| --- | --- |
+| `none` | 0 |
+| `standard` | 1 |
+| `strict` | 3, each working alone |
+
+An item that leaves `review` out gets the declared `level`, raised to the
+operator's ceiling when the ceiling asks for more. The ceiling still bounds
+what an item may ask for ([Autonomy levels](guide.md#autonomy-levels)).
+`adaptive` declares `standard` and `direct` declares `none`. A pipeline that
+reviews in gated stages of its own keeps the level those stages run, and an
+item that asks it for another is refused with the pipelines that take one.
+
+`stage` must be a `work` stage. When the level asks for reviewers the stage
+agent may delegate, whatever `allow_delegation` says, because its reviewers
+are agents it delegates to. At `none` it delegates only if the stage allows
+it otherwise.
+
+Archon holds the stage to the level. Its contract gains a
+`## Review on record` section. Each reviewer finishes with its own verdict
+on the commits it read, where `base` is the commit its diff starts from
+(the merge base for the whole change, an earlier reviewer's head for a
+re-review of a fix):
+
+```json
+{"verdict": "pass", "head": "<commit>", "base": "<commit>", "findings": []}
+```
+
+and the stage agent's `complete_task` names the agent id `delegate`
+returned for each reviewer the pass rests on, including a failed one whose
+findings it fixed:
+
+```json
+{"review": {"verdict": "pass", "reviewers": ["<agent id>", "…"]}}
+```
+
+When the object is missing, the verdict is anything else, or the pass names
+fewer reviewers than the level asks for, Archon fails the run at that stage
+and nothing ships. At `none` the contract tells the agent to delegate no
+reviewer and record no review.
+
+A pass is not taken on the agent's word. As the stage ends, Archon lists
+the agents it delegated to (one Aether call) and reads the task result of
+each one named. Every named agent must be a different direct child that
+completed with a verdict; a builder or researcher that returned none is not
+a reviewer. Archon then holds the verdicts to the run branch: a pass counts
+when its reviewer read the branch head, or an earlier head whose later
+commits a passing reviewer read as a delta. A fail never counts, and it
+stands until such a pass read past it, or a later reviewer read past it and
+failed in turn, and that fail was answered: a fix of a fix is reviewed as a
+delta too. A verdict on a commit the branch no
+longer holds (the agent amended or rebased it away) is superseded: it is
+left out rather than failing the run, and a superseded fail stands until
+the counted passes read the whole change. When the stage also writes the ship
+record, the branch head must hold the record's `tree`. With fewer counted
+passes than the level asks for, the run fails at that stage with each reason. Archon
+records the counted reviewers as `review.reviewer_agents` and the models
+Aether ran them on as `review.reviewer_models`, replacing anything the
+agent wrote there.
+
+On a pass Archon appends `REVIEW: pass, by <model> (agent <id>), …` as the
+last line of the stage summary, and at `none`
+`REVIEW: none, as this item's review level asks`. Later stages receive that
+line, and it goes into the pull request body.
+
+A pipeline of your own that still ends in a `ship` stage may also record
+`{"review": {"verdict": "skipped", "reason": "…"}}` at `standard`, for its
+ship agent to judge. Where archond ships there is no agent to judge a skip,
+so only a pass counts: set the item's review level to `none` instead.
+
+### Shipping
+
+A pipeline that changes a repository ends by shipping: in ship mode `pr`
+the run branch is pushed and a pull request opened, and in `local` the
+commits stay on the run branch. No agent does this. The pipeline names the
+stage whose result says what to ship, and archond delivers it:
+
+```toml
+[pipeline.ship]
+stage = "fix"
+```
+
+That stage's contract gains a `## Ship record` section, and its
+`complete_task` carries the record beside anything else it returns:
+
+```json
+{"commit": "<git rev-parse HEAD>",
+ "tree": "<git rev-parse HEAD^{tree}>",
+ "checks": ["cargo test", "cargo clippy"],
+ "pr": {"title": "<one line>", "body": "<what changed, why, how it was verified>"}}
+```
+
+A pass without a readable record fails the run at that stage. Stages after
+it (reviews, tests) verify that tree and commit nothing more.
+
+Once every stage has passed, archond checks the run worktree and refuses
+the delivery when any of this does not hold:
+
+- the worktree is the one git registered for the run, on the run branch;
+- no tracked file has an uncommitted change;
+- `HEAD^{tree}` is the recorded `tree`, so nothing changed after the stage
+  verified it and its reviewers read it;
+- the branch has a commit beyond its base;
+- every commit the run adds was made under the repository's git identity,
+  as `archon repo add` or `archon repo set` last recorded it.
+
+The base is the repository's base branch, or the branch of the item this
+one is stacked on when its start recorded one. In `pr` mode archond then
+pushes the branch to `origin`, never forced and with no repository hook,
+and looks up the open pull request of the branch with `gh`. It opens one
+only when GitHub lists none, and an open one is reused, and moved onto the
+base when it is for another branch. The body is the record's, then the
+`REVIEW:` line, the summaries of the stages that passed after the record
+stage under `## Review and verification`, the change report's summary under
+`## Change report`, and the item's id. With `merge = auto` archond asks
+GitHub to merge when the checks allow; a refusal of that is reported and
+fails nothing. A member of an atomic initiative is opened as a draft and is
+never handed to auto-merge: archond readies the drafts together once every
+member passed, and you merge them.
+
+The run's summary ends `SHIPPED: <url> (commit <sha>)`, or
+`SHIPPED: commit <sha> on the run branch` in `local` mode. A refused
+delivery fails the item as `stage ship: <why>`, and names what to change:
+the dirty paths, the commits under another identity, the remote branch that
+holds other commits. What only a person can fix (no `origin`, a lapsed
+`gh` login, a protected branch) fails as `stage ship: BLOCKED: …`. A
+failure another try may pass, such as the network or GitHub, is tried five
+times, 15 seconds apart at first and doubling.
+
+Delivery survives a daemon restart. Its outcome is stored before the run
+finishes, and one that was interrupted is repeated: pushing what `origin`
+has pushes nothing, and the pull request GitHub lists is found again, so
+there is never a second one.
+
+**A `ship` stage of your own.** A pipeline may still end in one
+`kind = "ship"` stage instead, whose agent pushes and opens the pull
+request; archond then only verifies the pull request it names. Such a
+pipeline declares no `[pipeline.ship]`. Every built-in pipeline ships
+through archond: it costs no agent, no tokens and a few seconds.
 
 ## How a run moves
 
@@ -152,8 +411,9 @@ The run state machine is `RunDriver` in `crates/archon-pipeline`:
 1. **Spawn.** Entering a stage starts `fan_out` agents. Each gets the rendered
    stage prompt as its task, plus the stage contract (below) as its
    instructions. The model and effort for each agent come from the item's
-   `model_plan`. When the plan lists fewer choices than slots, Archon cycles
-   through them.
+   `model_plan`: what the orchestrator chose, and Archon's default for every
+   stage it left out (see the worked example). When the plan lists fewer
+   choices than slots, Archon cycles through them.
 2. **Wait.** Nothing is decided until every agent of the stage has finished.
 3. **Gate.**
    - `none`: the stage passes when every agent completed. A failed, timed-out
@@ -166,7 +426,10 @@ The run state machine is `RunDriver` in `crates/archon-pipeline`:
    A missing or unreadable verdict counts as `fail`, and so does an agent
    that failed, timed out or was cancelled.
 4. **Advance.** When a stage passes, the next stage starts. After the last
-   stage, the run succeeds, and its summary is that stage's summaries joined.
+   stage, a pipeline with `[pipeline.ship]` is delivered by archond (see
+   "Shipping") and succeeds once that is done; any other run succeeds at
+   once. Its summary is the last stage's summaries joined, and for a
+   delivered run a final `SHIPPED:` line with the pull request or commit.
 5. **Loop.** When a stage fails and has `on_fail`, and that stage has looped
    fewer than `max_loops` times, the run goes back to the `goto` stage. That
    stage's next attempt receives the failing agents' summaries and findings
@@ -178,7 +441,14 @@ The run state machine is `RunDriver` in `crates/archon-pipeline`:
    the run immediately. There is no loop, its live siblings are cancelled, and
    the operator gets a blocker in chat. Use `BLOCKED:` for "a human must act",
    such as a missing credential or an ambiguous requirement.
-7. **Operator gate.** When the item's knobs make a passed `propose` or
+7. **Escalated.** An agent that fails with an error starting `ESCALATE:`
+   also ends the run immediately, with no loop and its siblings cancelled.
+   It means "this task does not fit this pipeline": far larger or riskier
+   than the stage allows for, or better split. The item fails with
+   `stage <id>: ESCALATE: <why, and the pipeline or split it recommends>`,
+   and the orchestrator reads that in the item's failure and decides what
+   to enqueue instead. Nothing is retried and nothing ships.
+8. **Operator gate.** When the item's knobs make a passed `propose` or
    change-report stage wait for the operator, the run holds there. No agent
    runs while it waits. Approving moves on. Feedback re-runs the proposal, or
    for a change report every stage from the first `work` stage, with the
@@ -189,11 +459,67 @@ The run state machine is `RunDriver` in `crates/archon-pipeline`:
 
 `attempt` counts how often a stage has been entered: 1 the first time, 2
 after the first loop back to it, and so on. Each stage has its own count. In
-`strict-pr-review`, for example, the test stage's third attempt can lead to
-the review stage's second.
+`refactor`, for example, the verify stage's third attempt can lead to the
+review stage's second.
 
 Every decision is derived from the stage runs Archon has persisted, so a
 daemon restart resumes a run exactly where it was.
+
+### One agent through the fix loop
+
+A fix attempt by a new agent starts cold: it reads the task, the
+repository and its own earlier work again before it changes a line. So
+Archon keeps the agent of a stage that a later stage can send back, and
+resumes it.
+
+A stage's agent is kept when the stage is `kind = "work"` with one agent
+(`fan_out = 1`), some stage names it in `on_fail.goto`, and it does not
+hold a [declared review](#a-declared-review). In `refactor` that is its
+`refactor` stage. You declare nothing for it.
+
+When a gate loops back (step 5), the same agent gets a message with the
+findings and fixes its own work, with everything it learned still in its
+context. Reviewers are never kept: each review attempt is a fresh,
+independent agent. `archon queue show` shows the same agent id on every
+attempt of the stage.
+
+A resumed agent's task is already recorded, so it does not call
+`complete_task` again: it ends its turn with its summary, or with a
+message that starts `FAILED:` or `BLOCKED:`. Your stage prompt is not
+rendered again for a resumed attempt, so the agent is told only the
+findings and how to hand in. `{{attempt}}` and `{{feedback}}` in the
+prompt matter for the fallback below.
+
+A fresh agent takes the attempt instead, with the rendered prompt, the
+findings as `{{feedback}}` and a digest of the last attempt, when the kept
+one cannot go on: it is gone or Aether refuses it the message, a steer
+changed the stage's model or effort, or the stage is re-entered without
+findings. The kept agent is stopped first, so two agents never share the
+worktree.
+
+### Steering a run
+
+The operator (`archon queue steer`) and the orchestrator (`steer_item`) can
+change an item while it runs, without cancelling it: add a note to the
+brief, change a stage's model, effort, budget or deadline, abort the
+running stage and retry it, skip it or go to another stage, and change the
+stages that have not started by inserting one from any pipeline, removing
+one, or switching to another pipeline's remaining stages. A stage that
+started keeps its shape. The [user guide](guide.md#steering-an-item) lists
+every option.
+
+What this means for a pipeline you write:
+
+- An aborted stage is not judged, so its `gate` and `on_fail` do not apply
+  to that attempt. `goto` back gives the stages it re-runs their full
+  `max_loops` again.
+- A later stage whose prompt reads `{{previous.<id>.summary}}` of a skipped
+  or removed stage gets a line saying the stage was skipped by a steer.
+- An inserted stage keeps its own `kind`, `gate`, `fan_out` and `on_fail`;
+  when its id is taken in the run, it gets a numbered one (`test-2`). Its
+  `on_fail.goto` must name a stage of the run.
+- A switch needs the same `workspace`, and a team stage needs a run that
+  was started with team worktrees.
 
 ## Team stages
 
@@ -384,6 +710,16 @@ Values are inserted as-is and never scanned again, so a brief that contains
 An unknown placeholder, a `previous.*` reference to the same or a later
 stage, and an unterminated `{{` are all load-time errors.
 
+Every stage also gets a **hand-off**: Archon appends
+`## Handoff from earlier stages` to the rendered prompt, with what each
+earlier stage reported and, on a later attempt, what this stage's own last
+attempt reported. It is a digest of at most 1,200 characters per stage and
+4,000 in all, nearest stages first when that runs out. A stage your prompt
+already shows through `{{previous.<id>.summary}}` is not repeated there.
+So a prompt needs `{{previous.*}}` only where the full summary matters;
+the next stage is not left to rediscover what changed, where, how it was
+verified and what is still open. That is what a stage summary should say.
+
 ### The stage contract
 
 Archon adds a **stage contract** to every agent as its instructions, so
@@ -391,13 +727,21 @@ pipeline authors cannot forget it. The contract depends on the stage kind:
 
 - **Every stage.** Work only in the workspace, and never ask the operator
   anything. Finish with Aether's `complete_task` and a concise summary. Fail
-  with `fail_task`, starting the error with `BLOCKED:` when a human must act.
+  with `fail_task`, starting the error with `BLOCKED:` when a human must act
+  and with `ESCALATE:` when the task does not fit the pipeline.
 - **Review and test stages, and any gated stage.** The result carries
   `structured` data `{"verdict": "pass"|"fail", "findings": [{"severity",
   "title", "detail", "path"}]}`, and the summary ends with `VERDICT: PASS` or
   `VERDICT: FAIL`. Archon reads the structured verdict first, then the last
   `VERDICT:` line.
-- **Ship stages.** `structured` includes `{"pr_url": …}` or `{"commit": …}`.
+- **The stage `[pipeline.ship]` names.** `## Ship record`: commit with the
+  repository's git identity, leave a clean tree, do not push, and return
+  `commit`, `tree`, `checks` and `pr` in `structured` (see "Shipping").
+- **Ship stages**, in a pipeline of your own that has one. `structured`
+  includes `{"pr_url": …}` or `{"commit": …}`. The commits a ship stage is
+  given are delivered as they are: it does not amend, rebase, squash or
+  reset them. It may reword a commit message that breaks a repository rule,
+  and then shows that `git rev-parse HEAD^{tree}` did not change.
 - **Propose stages.** Read, but change nothing. The proposal goes to
   `<workspace>/.archon/reports/proposal/index.html`, `structured.reports`
   lists it, and the summary states the approach on its own, because the
@@ -417,6 +761,21 @@ pipeline authors cannot forget it. The contract depends on the stage kind:
   `role_prompts` entry is appended to its prompt under `## Your role`.
 - **Read-only workspaces** and **fan-out stages** get an explicit "do not
   modify files" rule.
+- **An agent that can delegate** gets the `## Delegation` section (see
+  "Delegation"), and **the stage a declared review names** gets
+  `## Review on record` (see "A declared review").
+- **Every agent of a worktree item queued after others** (`depends_on`)
+  gets a `## Dependencies` section with each dependency's branch and PR.
+  An unmerged dependency in the same repository becomes the real
+  `{{base_branch}}`: Archon forks from the first parent's branch, merges
+  other parents, and targets the parent branch when opening the PR.
+  Review and diff against this base. Dependencies in other repositories
+  give context without contributing a Git branch.
+- **Initiative members** get the shared contract (2 KiB at most by default,
+  `[limits] initiative_contract_bytes`) and every
+  sibling's repository, branch, PR and state. For `atomic=true`, the ship
+  stage keeps its PR a draft and does not enable auto-merge. The daemon
+  links sibling PRs and marks them ready after every member passes.
 
 Your prompt therefore says *what* to do. It does not need to repeat how to
 finish.
@@ -455,17 +814,18 @@ pipeline:
 | Knob | Inserted stage | Where |
 | --- | --- | --- |
 | `proposal = lavish` | `propose`, kind `propose`, prompt `pipelines/_shared/propose.md` | First. The run then waits for the operator to approve the direction. |
-| `report = with-pr` or `before-pr` | `report`, kind `report`, prompt `pipelines/_shared/report.md` | Right before `ship`. With `before-pr` the run waits for the operator before shipping. |
+| `report = with-pr` or `before-pr` | `report`, kind `report`, prompt `pipelines/_shared/report.md` | Last, right before the change ships (before the `ship` stage of a pipeline that has one). With `before-pr` the run waits for the operator before shipping. |
 
-Both knobs apply only to pipelines with a `ship` stage. An inserted stage has
-`fan_out = 1`, no gate, a 45-minute timeout and no delegation. If the item's
+Both knobs apply only to pipelines that ship, through `[pipeline.ship]` or
+a `ship` stage. An inserted stage has
+`fan_out = 1`, no gate, a 45-minute timeout and `allow_delegation = false`. If the item's
 `model_plan` does not name it, it gets the first choice of the pipeline's
 first stage.
 
 **Declaring your own.** A pipeline that declares a `propose` stage, or a
-`report` stage before its `ship` stage, gets no duplicate. The knobs gate
-your stage instead, and when several report stages come before `ship`, the
-last one is the change report. Your propose stage must be first, and it
+`report` stage before the change ships, gets no duplicate. The knobs gate
+your stage instead, and when several report stages come before shipping,
+the last one is the change report. Your propose stage must be first, and it
 should write the page and summary its stage contract asks for. Without
 `proposal = lavish`, a declared propose stage still runs, but nothing waits
 for the operator. The stage ids `propose` and `report`, and the prompt file
@@ -477,8 +837,9 @@ Later stages get extra context in their prompts:
 - Every stage after `propose` gets the proposal's summary, whether the
   operator approved it, and the operator's note.
 - The inserted report stage gets every earlier stage's summary.
-- The ship stage gets the change report's summary, and puts it in the pull
-  request body under `## Change report`.
+- The change report's summary goes into the pull request body under
+  `## Change report`: archond puts it there, and a `ship` stage of your own
+  gets it in its prompt.
 
 **Proposal and change-report pages.** The shared prompts scale page detail to
 the task. Both pages always state the goal, approach or decision, risk,
@@ -490,11 +851,10 @@ findings. Page paths, gate behavior and report metadata do not change.
 
 ## Worked example: `bugfix-tdd`
 
-The built-in `bugfix` uses this reproduce → fix → review → ship pattern
-with one independent reviewer and up to two fix loops; no installation is
-needed. This `bugfix-tdd` tutorial keeps two reviewers to demonstrate fan-out.
-Use `quick-pr` for trivial obvious one-liners and `strict-pr-review` for
-security or concurrency bugs.
+This tutorial splits a bug fix into reproduce → fix → review stages, with
+two reviewers to demonstrate fan-out. For an ordinary bug, `direct` is
+enough: its one agent reproduces, fixes and checks it. Raise its review
+level for security or concurrency bugs.
 
 [`docs/examples/pipelines/bugfix-tdd/pipeline.toml`](examples/pipelines/bugfix-tdd/pipeline.toml):
 
@@ -505,6 +865,9 @@ description = "Reproduce a bug with a failing test, fix it, two independent revi
 version = 1
 workspace = "worktree"
 requires_repo = true
+
+[pipeline.ship]
+stage = "fix"
 
 [nudges]
 tier = "balanced"
@@ -534,13 +897,6 @@ gate = "all_pass"
 timeout_minutes = 60
 nudge = "Two reviewers on different models when the allowlist permits."
 on_fail = { goto = "fix", max_loops = 2 }
-
-[[stage]]
-id = "ship"
-kind = "ship"
-prompt = "ship.md"
-timeout_minutes = 90
-nudge = "A fast model at low effort."
 ```
 
 What happens for one item:
@@ -548,38 +904,46 @@ What happens for one item:
 1. `reproduce` (attempt 1) commits a failing test. Its summary names the test
    and the failure.
 2. `fix` (attempt 1) sees that summary through
-   `{{previous.reproduce.summary}}`, fixes the root cause and commits.
+   `{{previous.reproduce.summary}}`, fixes the root cause, commits, and
+   returns the ship record for that commit.
 3. `review` starts two agents. They may run on different models, because
    the orchestrator follows `independent_reviewers`. Both must pass.
 4. If a reviewer fails the change, `fix` runs again (attempt 2), and
    `{{feedback}}` holds that reviewer's summary and findings. Then `review`
    runs again (attempt 2). After two fix loops, a third failing review fails
    the run.
-5. `ship` pushes and opens the PR or commits locally, depending on the
-   repository's ship mode.
+5. Once both reviewers pass, archond checks that the worktree still holds
+   the tree the last `fix` recorded, then pushes and opens the PR, or
+   leaves the commits on the run branch, depending on the repository's
+   ship mode.
 
-A matching `model_plan` for `enqueue` names every stage. Each fan-out stage
-may list one choice per agent:
+A `model_plan` for `enqueue` is optional. It names the stages whose model
+the orchestrator wants to choose, and each fan-out stage may list one
+choice per agent:
 
 ```json
-{"reproduce": [{"model": "claude-code/claude-opus-5-5", "effort": "medium"}],
- "fix":       [{"model": "claude-code/claude-opus-5-5", "effort": "high"}],
- "review":    [{"model": "claude-code/claude-opus-5-5", "effort": "high"},
-               {"model": "codex/astra", "effort": "high"}],
- "ship":      [{"model": "claude-code/claude-opus-5-5", "effort": "low"}]}
+{"fix":    [{"model": "claude-code/claude-opus-5-5", "effort": "high"}],
+ "review": [{"model": "claude-code/claude-opus-5-5", "effort": "high"},
+            {"model": "codex/gpt-6-astra", "effort": "high"}]}
 ```
 
-Archon refuses a plan that leaves a stage out, that names a stage the
-pipeline does not have, or that lists more choices than a stage has agents.
+A stage the plan leaves out, here `reproduce`, gets Archon's default: the
+choice learned for that pipeline and stage where there is one, else the
+orchestrator's own model when the model policy allows it (the first allowed
+model otherwise), at the effort the pipeline's `[nudges] tier` suggests:
+`fast` low, `balanced` medium, `strongest` high, never above the policy's
+`max_effort`. Archon refuses a plan that names a stage the pipeline does
+not have, lists more choices than a stage has agents, or picks a model the
+policy does not allow.
 
 ## Overriding a built-in
 
-To change a built-in pipeline, for example to give `default-pr-review` two
+To change a built-in pipeline, for example to give `refactor` two
 reviewers:
 
 ```sh
-cp -r pipelines/default-pr-review ~/.config/archon/pipelines/
-$EDITOR ~/.config/archon/pipelines/default-pr-review/pipeline.toml   # fan_out = 2
+cp -r pipelines/refactor ~/.config/archon/pipelines/
+$EDITOR ~/.config/archon/pipelines/refactor/pipeline.toml   # review: fan_out = 2
 archon pipelines check
 ```
 
@@ -590,16 +954,10 @@ back to the built-in.
 
 | Name | Stages | Nudges |
 | --- | --- | --- |
-| `quick-pr` | implement → ship | fast tier. For small, low-risk changes. The implement stage refuses risky work. |
-| `default-pr-review` | implement → review (1, `all_pass`, back to implement ×2) → ship | balanced tier, independent reviewer |
-| `bugfix` | reproduce (failing test) → fix → review (1, `all_pass`, back to fix ×2) → ship | balanced tier, independent reviewer. For bugs with a describable symptom; `quick-pr` for trivial one-liners, `strict-pr-review` for security/concurrency bugs. |
-| `docs` | write → verify (1, `all_pass`, back to write ×2) → ship | fast/balanced tier, independent reviewer. For README, guides, API/reference docs, changelogs and docstrings; verifies every claim, command and internal link against the code. Use `quick-pr` for a typo. |
-| `dependency-upgrade` | survey → upgrade → verify (`all_pass`, back to upgrade ×3) → ship | balanced tier. Research changelogs, bump libraries/toolchains/base images, verify build/tests/audit. Use `default-pr-review` for features that add dependencies. |
-| `refactor` | baseline/characterize → refactor → verify (`all_pass`, back to refactor ×3) → review (1, `all_pass`, back to refactor ×2) → ship | balanced tier, independent reviewer. Structure-only changes; use `default-pr-review` for behaviour changes. |
-| `strict-pr-review` | implement → test (`all_pass`, back to implement ×3) → review (3 lenses, `all_pass`, back to implement ×3) → ship | strongest tier, independent reviewers |
-| `team-pr` | plan → build (team: `backend`, `frontend`) → e2e (`all_pass`, back to build ×2) → review (1, `all_pass`, back to build ×2) → ship | balanced tier, independent reviewer. For a change that spans cleanly separable parts. See below. |
-| `performance` | measure → optimize → verify (`all_pass`, back to optimize ×3) → review (1, `all_pass`, back to optimize ×2) → ship | strongest tier, independent reviewer. For a specific slow path with a measurable goal, not speculative micro-optimization; use `default-pr-review` for ordinary changes. |
-| `test-coverage` | analyze → write → verify (test, `all_pass`, back to write ×2) → ship | balanced tier. Raise coverage of existing code with risk-ranked tests, at least three passing runs and per-test mutation checks. Bugs become follow-ups; use `bugfix` to fix one. |
+| `direct` | implement | balanced tier; review level `none` unless the item asks. The pipeline an item runs when it names none. One agent implements, runs the affected tests, commits and returns the ship record. The cheapest path for a change one author can make and check, whatever its size; the agent escalates risky work. |
+| `adaptive` | build (work, delegation enabled, holds the review) | balanced tier; review level `standard` unless the item asks. One lead chooses workers at runtime and has the integrated change reviewed by as many independent reviewers as the item's review level asks for. |
+| `refactor` | baseline/characterize → refactor → verify (`all_pass`, back to refactor ×3) → review (1, `all_pass`, back to refactor ×2) | balanced tier, independent reviewer. Structure-only changes; use `direct` for behaviour changes. |
+| `performance` | measure → optimize → verify (`all_pass`, back to optimize ×3) → review (1, `all_pass`, back to optimize ×2) | strongest tier, independent reviewer. For a specific slow path with a measurable goal, not speculative micro-optimization; use `direct` for ordinary changes. |
 | `agent-testing` | plan → exercise (2 exploratory testers) → report (HTML) | balanced tier, independent testers |
 | `code-audit` | scope → audit (3 lenses, report) → report (HTML with issue drafts) | strongest tier, independent auditors. Read-and-report only; findings become follow-up items. Use `ask` for a single question or `agent-testing` to exercise the product. |
 | `e2e-testing` | setup → e2e (`all_pass`, back to setup ×1) → report (HTML with screenshots) | balanced tier |
@@ -607,13 +965,89 @@ back to the built-in.
 | `errand` | errand (report) | balanced tier. A small job answered in text or as a Lavish page, with no repository changes or outward side effects. Scratch workspace, repository optional. Use `ask` for repository questions in text, and a shipping pipeline for changes. |
 | `design-doc` | research → critique (`all_pass`, back to research ×2) → report (HTML design/RFC) | strongest tier, independent critic. Before a large or ambiguous change; no product-code changes or shipping. Use `proposal: lavish` for design and implementation in one item. |
 
-Their prompts, in [`pipelines/`](../pipelines/), are a good starting point
-for your own. Each pipeline directory stays self-contained, so the
-shipping pipelines carry their own copy of `ship.md`. Everything from
-`## Mode \`pr\`` to the end (the delivery rules for each ship mode) must be
-identical in all shipping pipelines, and a test in
-`crates/archon-pipeline/tests/validate.rs` fails when the copies drift. Edit all
-copies together.
+The first four change a repository, and archond ships each of them once
+its last stage has passed (see "Shipping"); none has a ship agent. Their
+prompts, in [`pipelines/`](../pipelines/), are a good starting point for
+your own. Each pipeline directory stays self-contained.
+
+### `direct`
+
+Use `direct` for any change one author can make and check, whatever its
+size: a fix, a feature in familiar code, tests, docs, a dependency upgrade,
+a mechanical sweep. An item that names no pipeline runs it. One agent does
+all of it. It
+implements the change, runs the tests the change affects, commits, and
+returns the ship record; archond ships. There is no other stage, and the
+stage contract and prompt are the shortest of any pipeline that ships.
+
+Review is the item's choice. `direct` declares
+`[pipeline.review] level = "none"`, so an item that says nothing runs with
+no reviewer and the agent is a leaf that cannot delegate. An item enqueued
+with `review = standard` or `strict` makes the agent delegate one or three
+independent reviewers of its committed change, and Archon verifies them
+(see "A declared review"). Under an operator ceiling of `standard` or
+`strict`, every `direct` item is reviewed at least at that level.
+
+The agent does not stretch the pipeline. A task that turns out risky
+(security, concurrency, a data migration, a public API break) or reaches
+beyond the task into code it depends on fails with `ESCALATE:` and what it
+needs instead, before anything is committed. Size alone is no risk.
+
+### `adaptive`
+
+Use `adaptive` for a repository change where one lead that keeps its
+context through fixes, or integrates parts that split, saves restarts. A
+change one author can make and check is cheaper in `direct`, with the
+review level its risk calls for. The lead sizes, implements, integrates,
+verifies and fixes the change. Its prompt has it spend where spending pays:
+
+- **Workers.** A leaf child in an isolated workspace gets an independent
+  deliverable with its own paths, and only when running it in parallel
+  saves more than briefing it, integrating it and the reading it repeats.
+  Often that is no worker at all, and a bounded local read is never
+  delegated.
+- **Commits first.** The lead commits the settled change under the
+  repository's commit rules (Conventional Commits with a lowercase
+  imperative subject where the repository states none), with the configured
+  Git identity and no model or tool attribution. Archon delivers those
+  commits as they are.
+- **Review, beside the checks.** It delegates the reviewers the item's
+  review level asks for (none, one, or three working alone) on the
+  committed change: each a fresh read-only child, preferably on a different
+  allowed model. It runs the full build, lint and test suite once while
+  they read. A reviewer is handed the acceptance criteria, the exact base
+  and head commits, the changed paths, the checks with their results and
+  the known risks, not the conversation. Its effort is the lead's choice:
+  medium for ordinary risk, high where security or an invariant is at
+  stake.
+- **Fixes.** Blocking findings are fixed in new commits and the affected
+  checks rerun; the full suite runs again only for a fix with broad impact
+  or where the project's policy demands it. A second look, by a new child
+  that reads the delta and the callers it affects, is owed after a failed
+  verdict, and after a pass only when a later commit changes production
+  behaviour, security or an invariant, or adds scope. Advisory findings
+  are listed and left. Two fix and re-review rounds are allowed before the
+  lead must fail visibly; only an unresolved blocking finding, a failed
+  check or a review that did not run fails the stage.
+
+That review is the pipeline's: `adaptive` declares
+`[pipeline.review] level = "standard"` on `build` (see "A declared
+review"), so Archon fails an item whose `build` put fewer verified
+reviewers on record than its review level asks for. The lead ends with the
+ship record, and archond ships it (see "Shipping"): an uncommitted change
+refuses the delivery, and so does a head tree other than the one the lead
+recorded. Both ship modes work.
+
+Select it with `pipeline = "adaptive"` or as a repository's
+`default_pipeline`. The `review` knob alone never selects it: without a
+named pipeline, an item runs `direct` at the level it asks. With
+`adaptive` named, `review` sets how much review the lead owes: leave it out
+for one reviewer, say `strict` for three, or `none` for a change that needs
+no second reader, where the operator's ceiling allows it. Proposal and
+report knobs work normally: `proposal = lavish` inserts `propose` before
+`build`, `report = with-pr` inserts `report` after it, and `report =
+before-pr` also requires operator approval before archond ships. A
+requested report revision returns to `build`.
 
 ### `errand`
 
@@ -628,7 +1062,7 @@ operator checkout is read-only by instruction; commands against its code
 run only on an independent throwaway copy inside scratch. No outward side
 effects are allowed: pushes, PR or issue comments, merges, messages,
 purchases and paid API calls stay with the orchestrator. Use `ask` for a
-repository question answered in text, and `quick-pr` or another shipping
+repository question answered in text, and `direct` or another shipping
 pipeline for a repository change.
 
 Published pages and their relative assets normally have durable copies outside
@@ -641,13 +1075,14 @@ run, once the item also passes gc's age checks. `--older-than` overrides
 the age cutoff. With `worktrees.auto_gc` on, passes run at startup and
 every 30 minutes. See [workspace retention](ARCHITECTURE.md#132-worktree-gc).
 
-### `team-pr`
+### The `team-pr` example
 
-`team-pr` builds one change as a team and ships it as one pull request.
-Use it when the change spans parts that can be built side by side with
-little overlap, such as an API and the UI that calls it. For small or
-tightly coupled changes, the split costs more than it saves: use
-`default-pr-review`.
+[`docs/examples/pipelines/team-pr/`](examples/pipelines/team-pr/) builds one
+change as a team and ships it as one pull request; it was a built-in until
+1.1.0. Use it when the change spans parts that can be built side by side
+with little overlap, such as an API and the UI that calls it. For small or
+tightly coupled changes, the split costs more than it saves: use `direct`
+or `adaptive`.
 
 1. `plan` (work) writes `.archon/plan.md` and commits it on the run branch:
    the brief split per role, the files each role owns, and the interface
@@ -657,14 +1092,16 @@ tightly coupled changes, the split costs more than it saves: use
 3. `e2e` (test, `all_pass`) sets up and runs the product end to end across
    both parts. Defects go back to `build` as `{{feedback}}`, at most twice.
 4. `review` (one reviewer, `all_pass`) reviews the merged change, and
-   loops back to `build` the same way, at most twice.
-5. `ship` delivers the run branch as for the other shipping pipelines.
+   loops back to `build` the same way, at most twice. Its pass carries the
+   ship record: the reviewer names the commit and tree it read, and writes
+   the pull request's title and body.
+5. archond delivers the run branch as for the other shipping pipelines.
 
 A balanced tier suits `plan`, `e2e` and `review`; give the `build` roles a
-strong coding model. The roles are fixed in the pipeline file, so a
-repository with other parts overrides the whole pipeline by name in
-`<repo>/.archon/pipelines/team-pr/`: copy `pipelines/team-pr/` there and
-change `roles`, and optionally `role_prompts`:
+strong coding model. The roles are fixed in the pipeline file: copy
+`docs/examples/pipelines/team-pr/` to `~/.config/archon/pipelines/team-pr/`,
+or to `<repo>/.archon/pipelines/team-pr/` for one repository, and change
+`roles`, and optionally `role_prompts`:
 
 ```toml
 [[stage]]
@@ -676,6 +1113,6 @@ role_prompts = { mobile = "Own apps/mobile/ only; call the API as the plan speci
 timeout_minutes = 150
 ```
 
-`archon pipelines check` in the repository then lists the override. Keep
+`archon pipelines check` in the repository then lists it. Keep
 `plan.md` naming your roles, since the plan stage splits the brief for
 them. A team of more roles than the caps allow is refused at enqueue.

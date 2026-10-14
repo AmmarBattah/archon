@@ -7,10 +7,13 @@ use archon_core::catalog::{StageKind, is_snapshot_of};
 use archon_core::error::ArchonError;
 use archon_core::id::{NotificationId, PipelineRunId, QueueItemId};
 use archon_core::notify::{FeedEntry, Notification, NotificationKind};
+use archon_core::protocol::ItemQuery;
 use archon_core::protocol::gib;
 use archon_core::queue::{QueueItem, QueueState};
 use archon_core::repo::ShipMode;
 use archon_core::run::{PipelineRun, RunState, StageOutcome, StageRun, StageState, Verdict};
+use archon_queue::Store;
+use chrono::TimeDelta;
 
 use super::{Cleanup, FollowUp, RunTable, clip, frozen};
 use crate::context::DaemonContext;
@@ -23,6 +26,9 @@ const MAX_NOTICE_CHARS: usize = 2_000;
 /// An `item_finished` summary is clipped to this. A batch holds at most
 /// `compact::MAX_BATCH_EVENTS` news events, besides pinned ones.
 const MAX_FINISHED_CHARS: usize = 4_000;
+/// Longest a routine success waits for the rest of the work in flight before
+/// it wakes the orchestrator; the feed shows the outcome at once.
+const MAX_SUCCESS_DEFER: TimeDelta = TimeDelta::minutes(5);
 
 /// Finish a live run and settle its item in one store transaction, close
 /// the reopen questions of its withdrawn gates' pages, then announce it.
@@ -35,21 +41,9 @@ pub(super) async fn finish_run(
     blocker: bool,
 ) -> Result<FollowUp, ArchonError> {
     assert!(state.is_terminal(), "finish_run needs a terminal state");
-    let ship_stage = if matches!(state, RunState::Succeeded { .. }) {
-        match frozen::thaw(&ctx.paths.data_dir, &run.id, &run.pipeline).await {
-            Ok(spec) => spec
-                .file
-                .stages
-                .iter()
-                .find(|s| s.kind == StageKind::Ship)
-                .map(|s| s.id.clone()),
-            Err(error) => {
-                tracing::warn!(%error, run = %run.id, "shipping proof unavailable; retaining workspace");
-                None
-            }
-        }
-    } else {
-        None
+    let proof = match &state {
+        RunState::Succeeded { .. } => shipping_proof(ctx, &run).await,
+        _ => ShippingProof::None,
     };
     let now = archon_core::now();
     let finished = {
@@ -57,20 +51,25 @@ pub(super) async fn finish_run(
         let estimates = ctx.config.limits.count_estimated_cost;
         let stages = store.stage_runs(&run.id)?;
         run.cost_usd = store.spend_for_run(&run.id, estimates)?;
-        run.shipped = ship_stage.is_some_and(|id| {
-            stages
+        run.shipped = match &proof {
+            ShippingProof::Daemon => true,
+            ShippingProof::Stage(id) => stages
                 .iter()
-                .any(|s| s.stage_id == id && s.state == StageState::Completed)
-        });
+                .any(|s| &s.stage_id == id && s.state == StageState::Completed),
+            ShippingProof::None => false,
+        };
         run.finish(state, now)?;
         store.finish_run(&run, item_state(&run), now)?
     };
+    crate::learned::finished(ctx, &run).await;
     let item = finished.item;
     assert!(item.state.is_terminal(), "finish_run settles the item");
     frozen::discard(&ctx.paths.data_dir, &run.id);
     table.drivers.remove(&run.id);
     table.pending.remove(&run.id);
     table.merges.remove(&run.id);
+    table.ships.remove(&run.id);
+    table.ship_retries.remove(&run.id);
     crate::feed::publish(ctx, finished.answers);
     crate::reports::close_stale_questions(ctx).await?;
     let pr_url = pr_url(ctx, &run).await?;
@@ -79,6 +78,31 @@ pub(super) async fn finish_run(
     follow.stop.push(run.id.clone());
     follow.cleanup.extend(cleanup_for(ctx, &item, &run).await?);
     Ok(follow)
+}
+
+/// What shows that a succeeded run shipped.
+enum ShippingProof {
+    /// archond delivered it: such a run succeeds only once it has.
+    Daemon,
+    /// Its pipeline's ship agent, whose stage must have completed.
+    Stage(String),
+    /// The pipeline ships nothing, or no longer loads.
+    None,
+}
+
+async fn shipping_proof(ctx: &DaemonContext, run: &PipelineRun) -> ShippingProof {
+    let spec = match frozen::thaw(ctx, &run.id, &run.pipeline).await {
+        Ok(spec) => spec,
+        Err(error) => {
+            tracing::warn!(%error, run = %run.id, "shipping proof unavailable; retaining workspace");
+            return ShippingProof::None;
+        }
+    };
+    if spec.ship_record_stage().is_some() {
+        return ShippingProof::Daemon;
+    }
+    let agent = spec.file.stages.iter().find(|s| s.kind == StageKind::Ship);
+    agent.map_or(ShippingProof::None, |s| ShippingProof::Stage(s.id.clone()))
 }
 
 /// Fail a live run outright (policy refusal, exhausted budget, a pipeline
@@ -147,6 +171,12 @@ async fn cleanup_for(
         return Ok(None);
     }
     Ok(Some(Cleanup {
+        item: ctx
+            .store
+            .lock()
+            .await
+            .stack_fix(&item.id)?
+            .map_or_else(|| item.id.clone(), |fix| fix.owner),
         repo_path: repo.path,
         worktree: run.workspace.clone(),
         snapshot,
@@ -156,20 +186,24 @@ async fn cleanup_for(
 /// A failed removal is reported, not fatal: the run already succeeded (or,
 /// for a snapshot, ended), or its start was abandoned (`when` says which).
 /// The worktree's build caches go first, so a stray untracked file that
-/// keeps the worktree (`git worktree remove` is never forced) keeps only
-/// its source. A snapshot is removed with `--force` instead.
+/// keeps the worktree (a change is never discarded) keeps only its source.
+/// A snapshot is removed with `--force` instead.
 pub(super) async fn remove_worktree(
     ctx: &DaemonContext,
     cleanup: Cleanup,
     when: &str,
+    mark: Option<crate::gc::Mark>,
 ) -> Result<(), ArchonError> {
+    let cache_dirs = ctx.config.worktrees.cache_dirs.clone();
     let manager = WorktreeManager::new(
         ctx.paths.worktrees.clone(),
         ctx.config.worktrees.branch_prefix.clone(),
-    );
-    let cache_dirs = ctx.config.worktrees.cache_dirs.clone();
+    )
+    .with_cache_dirs(cache_dirs.clone());
+    let data_dir = ctx.paths.data_dir.clone();
     let target = cleanup.worktree.clone();
     let (reclaimed, removed) = tokio::task::spawn_blocking(move || {
+        let _mark = mark;
         // A snapshot goes whole with `--force`, so its caches need no cleaning.
         if cleanup.snapshot {
             let removed = manager.remove_snapshot(&cleanup.repo_path, &cleanup.worktree);
@@ -178,7 +212,7 @@ pub(super) async fn remove_worktree(
         let reclaimed = crate::gc::cache::reclaim_worktree(&cleanup.worktree, &cache_dirs);
         (
             reclaimed,
-            manager.remove(&cleanup.repo_path, &cleanup.worktree),
+            manager.remove(&data_dir, &cleanup.repo_path, &cleanup.worktree),
         )
     })
     .await
@@ -205,7 +239,8 @@ pub(super) async fn remove_worktree(
 }
 
 /// One `Blocker` when the operator must act, otherwise an `Outcome`, and the
-/// orchestrator's `item_finished` trigger.
+/// orchestrator's `item_finished` news: a trigger when it has something to
+/// do about it, otherwise a line of its next trigger (ARCHITECTURE §5.4).
 pub(super) async fn announce(
     ctx: &DaemonContext,
     item: &QueueItem,
@@ -235,6 +270,11 @@ pub(super) async fn announce(
         NotificationKind::Outcome
     };
     notify(ctx, kind, &notice, Some(&item.id), run).await?;
+    ctx.coordination.changed.notify_one();
+    if item.initiative.is_some() {
+        ctx.dispatch.notify_one();
+        return Ok(());
+    }
     let cost_usd = ctx
         .store
         .lock()
@@ -248,8 +288,81 @@ pub(super) async fn announce(
         pr_url,
         cost_usd,
         origin: item.origin.clone(),
+        lesson_hint: crate::learned::lesson_hint(&*ctx.store.lock().await, item)?,
     };
-    triggers::push(ctx, finished).await
+    // Its base branch may have moved, and the operator may ask about it next.
+    if let Some(repo) = &item.repo {
+        ctx.mirrors.request_repo(repo);
+    }
+    tell_orchestrator(ctx, item, finished, needs_operator).await
+}
+
+/// Hand `finished` to the orchestrator: quiet when it need not wake, and a
+/// routine success while other work runs waits up to [`MAX_SUCCESS_DEFER`]
+/// for that work, so one turn reports them together.
+async fn tell_orchestrator(
+    ctx: &DaemonContext,
+    item: &QueueItem,
+    finished: TriggerEvent,
+    needs_operator: bool,
+) -> Result<(), ArchonError> {
+    assert!(
+        matches!(&finished, TriggerEvent::ItemFinished { item: id, .. } if *id == item.id),
+        "the news is of this item"
+    );
+    if !needs_operator && !wakes_orchestrator(item, ctx.config.orchestrator.wake_on_success) {
+        return triggers::push_quiet(ctx, finished).await;
+    }
+    if needs_operator || !is_routine_success(item) {
+        return triggers::push(ctx, finished).await;
+    }
+    let mut store = ctx.store.lock().await;
+    // Checked under the lock that settles items, so the last to finish wakes it.
+    if others_unfinished(&store)? {
+        let until = archon_core::now() + MAX_SUCCESS_DEFER;
+        triggers::hold_deferred(&mut store, finished, until)?;
+    } else {
+        triggers::hold(&mut store, finished)?;
+    }
+    drop(store);
+    triggers::wake(ctx);
+    Ok(())
+}
+
+/// A success no one asked to hear of at once: no GitHub thread to answer and
+/// no `notify` tag.
+fn is_routine_success(item: &QueueItem) -> bool {
+    matches!(item.state, QueueState::Succeeded { .. })
+        && item.origin.is_none()
+        && !item.wants_notice()
+}
+
+/// Whether any item is still queued or running; blocked ones wait for the
+/// operator, not for this news.
+fn others_unfinished(store: &Store) -> Result<bool, ArchonError> {
+    let query = ItemQuery {
+        states: ["queued", "dispatching", "running"]
+            .map(String::from)
+            .to_vec(),
+        limit: Some(1),
+        ..ItemQuery::default()
+    };
+    let unfinished = store.items(&query)?;
+    assert!(unfinished.len() <= 1, "the query is limited to one");
+    assert!(
+        unfinished.iter().all(|item| !item.state.is_terminal()),
+        "a finished item is no other work"
+    );
+    Ok(!unfinished.is_empty())
+}
+
+/// Whether the finished `item` wakes the orchestrator: a failure, a GitHub
+/// thread to answer, a `notify` tag, or a success with `wake_on_success`.
+fn wakes_orchestrator(item: &QueueItem, wake_on_success: bool) -> bool {
+    assert!(item.state.is_terminal(), "only a finished item is news");
+    let failed = matches!(item.state, QueueState::Failed { .. });
+    let succeeded = matches!(item.state, QueueState::Succeeded { .. });
+    failed || (succeeded && wake_on_success) || item.origin.is_some() || item.wants_notice()
 }
 
 /// Keep the notification small; the queue, stages and orchestrator retain the
@@ -326,7 +439,7 @@ fn notice_sentence(text: &str) -> String {
     clip(sentence, 240)
 }
 
-fn outcome_text(item: &QueueItem) -> String {
+pub(super) fn outcome_text(item: &QueueItem) -> String {
     let text = match &item.state {
         QueueState::Succeeded { summary, .. } => format!("Done: {}. {summary}", item.title),
         QueueState::Failed { error, .. } => format!("Failed: {}. {error}", item.title),
@@ -338,7 +451,7 @@ fn outcome_text(item: &QueueItem) -> String {
 }
 
 /// `text` for the orchestrator; when clipped, it says where the rest is.
-fn finished_summary(text: &str, item: &QueueItem) -> String {
+pub(super) fn finished_summary(text: &str, item: &QueueItem) -> String {
     let total = text.chars().count();
     if total <= MAX_FINISHED_CHARS {
         return text.to_owned();

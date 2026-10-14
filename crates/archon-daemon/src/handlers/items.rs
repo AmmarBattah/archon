@@ -1,5 +1,7 @@
 //! Queue items: enqueue, inspect, update, cancel and retry (§6.1, §7.4).
 
+use std::collections::BTreeMap;
+
 use archon_core::catalog::{StageKind, WorkspaceMode};
 use archon_core::error::ArchonError;
 use archon_core::id::QueueItemId;
@@ -14,7 +16,7 @@ use archon_queue::dispatch::effective_agent_cap;
 use crate::context::DaemonContext;
 use crate::resolve::{self, RepoEnv};
 use crate::worktree::WorktreeManager;
-use crate::{executor, knobs};
+use crate::{executor, knobs, learned};
 
 pub(super) async fn enqueue(
     ctx: &DaemonContext,
@@ -22,24 +24,23 @@ pub(super) async fn enqueue(
 ) -> Result<Reply, ArchonError> {
     let title = req.title.trim().to_owned();
     check_enqueue(&req.title, &req.brief, &req.tags, req.budget_usd)?;
-    let repo = match &req.repo {
-        Some(reference) => Some(ctx.store.lock().await.repo(reference)?),
-        None => None,
-    };
-    let env = RepoEnv::new(repo)?;
-    if env.repo.is_none() && req.pipeline.is_none() {
-        return Err(ArchonError::Invalid(
-            "name a pipeline; only repositories have a default one".into(),
-        ));
-    }
-    let resolved = knobs::resolve(&ctx.config, &env, req.pipeline.clone(), &req.autonomy)?;
-    check_runs_here(ctx, &env, &resolved.spec).await?;
-    let plan = knobs::fill_plan(&resolved.base, &resolved.spec, req.model_plan);
+    let (env, resolved) = enqueue_context(ctx, &req).await?;
+    let id = QueueItemId::new();
+    crate::learned::prepare_routing(ctx, &id, &resolved, &req.tags).await?;
+    let plan = filled_plan(
+        ctx,
+        &id,
+        &env,
+        &resolved.base,
+        &resolved.spec,
+        req.model_plan,
+    )
+    .await?;
     check_plan(ctx, &env, &resolved.spec, &plan)?;
     check_reasons(&resolved.spec, req.model_reasons.as_ref())?;
     let now = archon_core::now();
     let item = QueueItem {
-        id: QueueItemId::new(),
+        id,
         repo: env.repo.as_ref().map(|r| r.id.clone()),
         pipeline: resolved.pipeline,
         title,
@@ -53,6 +54,7 @@ pub(super) async fn enqueue(
         autonomy: resolved.autonomy,
         origin: req.origin.clone(),
         fresh_retries: 0,
+        initiative: None,
         state: QueueState::Queued,
         created_at: now,
         updated_at: now,
@@ -74,6 +76,27 @@ pub(super) async fn enqueue(
     Ok(Reply::Item(stored))
 }
 
+async fn enqueue_context(
+    ctx: &DaemonContext,
+    req: &EnqueueRequest,
+) -> Result<(RepoEnv, knobs::Resolved), ArchonError> {
+    let repo = match &req.repo {
+        Some(reference) => Some(ctx.store.lock().await.repo(reference)?),
+        None => None,
+    };
+    let env = RepoEnv::new(repo)?;
+    if env.repo.is_none() && req.pipeline.is_none() {
+        return Err(ArchonError::Invalid(
+            "name a pipeline; only repositories have a default one".into(),
+        ));
+    }
+    let resolved = knobs::resolve(&ctx.config, &env, req.pipeline.clone(), &req.autonomy)?;
+    check_runs_here(ctx, &env, &resolved.spec).await?;
+    assert_eq!(resolved.spec.name(), resolved.pipeline);
+    assert!(!resolved.spec.file.stages.is_empty());
+    Ok((env, resolved))
+}
+
 pub(super) async fn list(ctx: &DaemonContext, query: &ItemQuery) -> Result<Reply, ArchonError> {
     Ok(Reply::Items(ctx.store.lock().await.items(query)?))
 }
@@ -87,11 +110,12 @@ pub(super) async fn get(ctx: &DaemonContext, id: &QueueItemId) -> Result<Reply, 
     let item = store.item(id)?;
     let mut runs = store.runs_for_item(id)?;
     let mut stages = Vec::new();
+    let mut delegations = BTreeMap::new();
     for run in &mut runs {
         let mut run_stages = store.stage_runs(&run.id)?;
         for stage in &mut run_stages {
-            if let Some(agent) = &stage.aether_agent {
-                stage.cost_usd = store.spend_for_agent(agent, estimates)?;
+            if let Some(delegation) = super::stages::charge(&store, stage, estimates)? {
+                delegations.insert(stage.id.clone(), delegation);
             }
         }
         run.cost_usd = store.spend_for_run(&run.id, estimates)?;
@@ -109,7 +133,11 @@ pub(super) async fn get(ctx: &DaemonContext, id: &QueueItemId) -> Result<Reply, 
     );
     let waiting_on = super::item_views::waiting_on(&store, &item, &runs, &stages)?;
     let waiting_reason = waiting.reason(&store, &item, waiting_on.as_ref())?;
+    let steers = executor::steer::records(&store, id)?;
+    let switched_to = executor::steer::switched_to(&store, &item)?;
     Ok(Reply::ItemDetail(Box::new(ItemDetail {
+        switched_to,
+        steers,
         waiting_reason,
         waiting_on,
         item,
@@ -117,11 +145,12 @@ pub(super) async fn get(ctx: &DaemonContext, id: &QueueItemId) -> Result<Reply, 
         stages,
         spent_usd,
         gates,
+        delegations,
     })))
 }
 
 /// Priority, tags, budget and dependencies change any time before success;
-/// the model plan and the brief only while no run is starting or running.
+/// the model plan and the brief here only while no run is starting or running.
 pub(super) async fn update(
     ctx: &DaemonContext,
     id: &QueueItemId,
@@ -135,7 +164,7 @@ pub(super) async fn update(
     if patch.model_plan.is_some() || patch.model_reasons.is_some() {
         let (env, base, spec) = item_pipeline(ctx, &current).await?;
         if let Some(plan) = patch.model_plan.take() {
-            let plan = knobs::fill_plan(&base, &spec, plan);
+            let plan = filled_plan(ctx, id, &env, &base, &spec, plan).await?;
             check_plan(ctx, &env, &spec, &plan)?;
             patch.model_plan = Some(plan);
         }
@@ -160,8 +189,8 @@ pub(super) async fn update(
     Ok(Reply::Item(item))
 }
 
-/// Refuse a patch `item`'s state does not allow: nothing changes after
-/// success, and a plan or brief its live run already read would not apply.
+/// Refuse a patch `item`'s state does not allow: nothing after success, and
+/// no plan or brief while a run is starting, before a steer can reach it.
 fn check_patchable(item: &QueueItem, patch: &ItemPatch) -> Result<(), ArchonError> {
     let id = &item.id;
     if matches!(item.state, QueueState::Succeeded { .. }) {
@@ -169,20 +198,11 @@ fn check_patchable(item: &QueueItem, patch: &ItemPatch) -> Result<(), ArchonErro
             "item {id} already succeeded"
         )));
     }
-    if !item.state.is_active() {
-        return Ok(());
-    }
-    if patch.model_plan.is_some() {
+    let steered = patch.model_plan.is_some() || patch.brief_append.is_some();
+    if item.state.is_active() && steered {
         return Err(ArchonError::InvalidTransition(format!(
-            "item {id} is {}; cancel and retry it with the new model_plan",
-            item.state.kind()
-        )));
-    }
-    if patch.brief_append.is_some() {
-        return Err(ArchonError::InvalidTransition(format!(
-            "item {id} is {} and its stages already read the brief; amend it once the run \
-             ends, or cancel the item and retry it with brief_append",
-            item.state.kind()
+            "the run of item {id} is just starting; send its new model_plan or brief_append \
+             again in a moment, and it is steered into the run"
         )));
     }
     Ok(())
@@ -245,11 +265,12 @@ pub(super) async fn retry(
 ) -> Result<Reply, ArchonError> {
     let current = ctx.store.lock().await.item(id)?;
     let replaces_plan = retry.model_plan.is_some();
-    let plan = retry
-        .model_plan
-        .unwrap_or_else(|| current.model_plan.clone());
     let (env, base, spec) = item_pipeline(ctx, &current).await?;
-    let plan = knobs::fill_plan(&base, &spec, plan);
+    // A 1.0 item names the ship agent its built-in no longer has; the retry stores the repair.
+    let mut kept_plan = current.model_plan.clone();
+    spec.drop_retired_ship(&mut kept_plan, None);
+    let plan = retry.model_plan.unwrap_or(kept_plan);
+    let plan = filled_plan(ctx, id, &env, &base, &spec, plan).await?;
     check_plan(ctx, &env, &spec, &plan)?;
     check_reasons(&spec, retry.model_reasons.as_ref())?;
     check_runs_here(ctx, &env, &spec).await?;
@@ -260,12 +281,13 @@ pub(super) async fn retry(
     let (item, fresh_note) = {
         let _table = ctx.runs.lock().await;
         let loaded = ctx.store.lock().await.item(id)?;
-        check_retryable(&loaded)?;
+        check_retryable(&*ctx.store.lock().await, &loaded)?;
         let mut item = loaded.clone();
         item.model_plan = plan;
         if replaces_plan || retry.model_reasons.is_some() {
             item.model_reasons = retry.model_reasons;
         }
+        spec.drop_retired_ship(&mut item.model_plan, item.model_reasons.as_mut());
         if let Some(text) = &retry.brief_append {
             item.amend_brief(text, archon_core::now())?;
         }
@@ -293,18 +315,27 @@ pub(super) async fn retry(
     Ok(Reply::Item(item))
 }
 
-fn check_retryable(item: &QueueItem) -> Result<(), ArchonError> {
-    if matches!(
+/// A finished item whose restack fix, which works on its branch, is not
+/// still to run.
+fn check_retryable(store: &archon_queue::Store, item: &QueueItem) -> Result<(), ArchonError> {
+    if !matches!(
         item.state,
-        QueueState::Failed { .. } | QueueState::Cancelled { .. }
+        QueueState::Succeeded { .. } | QueueState::Failed { .. } | QueueState::Cancelled { .. }
     ) {
-        return Ok(());
+        return Err(ArchonError::InvalidTransition(format!(
+            "only finished items are retried; {} is {}",
+            item.id,
+            item.state.kind()
+        )));
     }
-    Err(ArchonError::InvalidTransition(format!(
-        "only failed or cancelled items are retried; {} is {}",
-        item.id,
-        item.state.kind()
-    )))
+    if store.has_pending_stack_fix(&item.id)? {
+        return Err(ArchonError::InvalidTransition(format!(
+            "{} has a restack fix still to finish, which works on its branch; retry it once \
+             the fix is done, or cancel the fix first",
+            item.id
+        )));
+    }
+    Ok(())
 }
 
 /// The repository a fresh retry starts again in: only a pipeline that works
@@ -387,7 +418,7 @@ async fn start_fresh(
 
 /// Store what a retry changed on `loaded` and queue it again, with the
 /// dependents it alone blocked. The caller holds the run table.
-fn queue_again(
+pub(super) fn queue_again(
     store: &mut archon_queue::Store,
     loaded: &QueueItem,
     mut item: QueueItem,
@@ -412,7 +443,7 @@ async fn note_amendment(ctx: &DaemonContext, id: &QueueItemId, text: &str, via: 
 /// Post `text` to the item's progress. What it reports is done and stored
 /// already, and repeating the request would do it twice, so a note that
 /// cannot be posted goes to the daemon's log instead of failing it.
-async fn post_note(ctx: &DaemonContext, id: &QueueItemId, text: &str) {
+pub(super) async fn post_note(ctx: &DaemonContext, id: &QueueItemId, text: &str) {
     assert!(!text.trim().is_empty(), "a note says what was done");
     let posted = executor::notify(ctx, NotificationKind::Progress, text, Some(id), None).await;
     if let Err(error) = posted {
@@ -450,20 +481,45 @@ fn unblock_dependents(
     Ok(())
 }
 
-/// The item's repository environment and the pipeline it would run now,
-/// as the catalog has it and with its knobs' stages.
+/// The item's repository environment and the pipeline it would run now: as
+/// the catalog has it, and with its knobs' stages and any steered stage list.
 async fn item_pipeline(
     ctx: &DaemonContext,
     item: &QueueItem,
 ) -> Result<(RepoEnv, PipelineSpec, PipelineSpec), ArchonError> {
     let env = RepoEnv::load(ctx, item.repo.as_ref()).await?;
     let (base, spec) = knobs::item_specs(&env, item)?;
+    let spec = executor::steer::shaped(ctx, item, spec).await?;
     Ok((env, base, spec))
+}
+
+/// `plan` with what it leaves out filled for `env`'s repository.
+pub(super) async fn filled_plan(
+    ctx: &DaemonContext,
+    id: &QueueItemId,
+    env: &RepoEnv,
+    base: &PipelineSpec,
+    spec: &PipelineSpec,
+    plan: ModelPlan,
+) -> Result<ModelPlan, ArchonError> {
+    let policy = env.policy(&ctx.config);
+    let fallback = knobs::default_choice(&ctx.config, &policy, spec);
+    let store = ctx.store.lock().await;
+    store.configure_learning(&ctx.config.learning)?;
+    let repo = env.repo.as_ref().map(|repo| &repo.id);
+    // What an enqueue naming no model runs with nothing learned: savings are measured against it.
+    let unnamed = ModelPlan::default();
+    let baseline = knobs::fill_static_stages(base, spec, unnamed, fallback.as_ref())?;
+    store.record_static_plan(repo, spec.name(), &baseline)?;
+    let learned = learned::plan_for_item(&store, id, repo, spec, &policy, &plan)?;
+    let mut plan = plan;
+    plan.0.extend(learned.0);
+    knobs::fill_static_stages(base, spec, plan, fallback.as_ref())
 }
 
 /// Every stage has 1 to `fan_out` choices, no unknown stage is named, and
 /// every choice passes the effective model policy.
-fn check_plan(
+pub(super) fn check_plan(
     ctx: &DaemonContext,
     env: &RepoEnv,
     spec: &PipelineSpec,
@@ -492,7 +548,10 @@ fn check_plan(
     env.policy(&ctx.config).check_plan(plan)
 }
 
-fn check_reasons(spec: &PipelineSpec, reasons: Option<&ModelReasons>) -> Result<(), ArchonError> {
+pub(super) fn check_reasons(
+    spec: &PipelineSpec,
+    reasons: Option<&ModelReasons>,
+) -> Result<(), ArchonError> {
     let Some(reasons) = reasons else {
         return Ok(());
     };
@@ -510,7 +569,7 @@ fn check_reasons(spec: &PipelineSpec, reasons: Option<&ModelReasons>) -> Result<
 /// The pipeline can run in `env`: on a repository when it needs one, and
 /// with every team stage within the agent caps. A team stage is admitted
 /// whole (ARCHITECTURE §7.3), so a bigger one would wait forever.
-async fn check_runs_here(
+pub(super) async fn check_runs_here(
     ctx: &DaemonContext,
     env: &RepoEnv,
     spec: &PipelineSpec,

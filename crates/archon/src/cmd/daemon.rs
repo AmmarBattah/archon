@@ -1,6 +1,7 @@
 //! `archon daemon run|start|stop|status` and `archon mcp`.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -25,6 +26,8 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 const DETACH_WAIT: Duration = Duration::from_secs(8);
 /// `daemon status` exit code when nothing is running (as `systemctl status`).
 const NOT_RUNNING: u8 = 3;
+/// Past this size a start moves the startup log to `archond.log.1` first.
+const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub async fn run(command: DaemonCommand, json: bool) -> anyhow::Result<ExitCode> {
     match command {
@@ -35,7 +38,10 @@ pub async fn run(command: DaemonCommand, json: bool) -> anyhow::Result<ExitCode>
             report_running(&client, json)?;
             Ok(ExitCode::SUCCESS)
         }
-        DaemonCommand::Stop { aether } => stop(json, aether).await,
+        DaemonCommand::Stop {
+            aether,
+            keep_aether,
+        } => stop(json, aether, keep_aether).await,
         DaemonCommand::Status => status(json).await,
     }
 }
@@ -78,9 +84,8 @@ async fn foreground() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Start `archon daemon run` in its own process group, its output in the
-/// startup log beside the socket (truncated on every start), and wait until
-/// it listens. Fails as soon as the daemon exits first.
+/// Start `archon daemon run` in its own process group, appending to the startup log
+/// beside the socket, and wait until it listens; fail as soon as it exits first.
 async fn detach(json: bool) -> anyhow::Result<ExitCode> {
     let socket = archon_client::default_socket();
     let socket =
@@ -95,8 +100,7 @@ async fn detach(json: bool) -> anyhow::Result<ExitCode> {
             .parent()
             .context("the socket path has no directory")?,
     )?;
-    let log =
-        File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
+    let log = open_startup_log(&log_path, LOG_ROTATE_BYTES)?;
     let stderr = log
         .try_clone()
         .with_context(|| format!("sharing {}", log_path.display()))?;
@@ -124,6 +128,44 @@ async fn detach(json: bool) -> anyhow::Result<ExitCode> {
         &text,
     )?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The startup log, opened to append after a line marking this start. A log
+/// past `rotate_past` bytes first moves to `<log>.1`, replacing the one there.
+fn open_startup_log(path: &Path, rotate_past: u64) -> anyhow::Result<File> {
+    assert!(
+        path.extension().is_some_and(|ext| ext == "log"),
+        "the rotated log is named after a .log path"
+    );
+    assert!(rotate_past > 0, "a zero cap would rotate on every start");
+    rotate_if_past(path, rotate_past)?;
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    writeln!(log, "{} at {now} ---", archon_core::paths::STARTUP_LOG_MARK)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(log)
+}
+
+fn rotate_if_past(path: &Path, rotate_past: u64) -> anyhow::Result<()> {
+    let size = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if size <= rotate_past {
+        return Ok(());
+    }
+    let older = path.with_extension("log.1");
+    assert_ne!(older, path, "rotation keeps the old log apart");
+    match std::fs::rename(path, &older) {
+        // Another start rotated it first.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        moved => moved.with_context(|| format!("moving {} aside", path.display())),
+    }
 }
 
 /// `archon daemon run` in the data directory, so the daemon never holds the
@@ -170,28 +212,34 @@ async fn await_listening(child: &mut Child, socket: &Path, log: &Path) -> anyhow
     }
 }
 
-/// Stop archond, then with `aether` Archon's own aetherd; shared mode owns
-/// no aetherd, so `--aether` is refused there before anything stops.
-async fn stop(json: bool, aether: bool) -> anyhow::Result<ExitCode> {
-    if aether {
-        let mode = Config::load_default()?.aether.mode;
-        if mode != AetherMode::Dedicated {
-            return Err(archon_core::ArchonError::Invalid(
-                "--aether stops Archon's own aetherd, and [aether] mode is \"shared\": \
+/// Stop archond, then in dedicated mode Archon's own aetherd unless `keep_aether`.
+/// Shared mode owns no aetherd, so `--aether` is refused there before anything stops.
+async fn stop(json: bool, aether: bool, keep_aether: bool) -> anyhow::Result<ExitCode> {
+    assert!(!(aether && keep_aether), "clap refuses both");
+    if aether && Config::load_default()?.aether.mode != AetherMode::Dedicated {
+        return Err(archon_core::ArchonError::Invalid(
+            "--aether stops Archon's own aetherd, and [aether] mode is \"shared\": \
              the operator's aetherd is theirs to stop"
-                    .into(),
-            )
-            .into());
-        }
+                .into(),
+        )
+        .into());
     }
     let (mut value, mut text) = stop_archond().await?;
-    if aether {
+    if !keep_aether && owns_aetherd()? {
         let (aether_value, aether_text) = instance::stop_aether().await?;
         value["aether"] = aether_value;
         text = format!("{text}\n{aether_text}");
     }
     emit(json, || Ok(value), &text)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether Archon runs its own aetherd (`[aether] mode = "dedicated"`), asked once
+/// archond is stopped: a config that no longer loads never keeps archond up.
+fn owns_aetherd() -> anyhow::Result<bool> {
+    let config = Config::load_default()
+        .context("archond stopped, but the config naming Archon's aetherd did not load")?;
+    Ok(config.aether.mode == AetherMode::Dedicated)
 }
 
 async fn stop_archond() -> anyhow::Result<(serde_json::Value, String)> {
@@ -253,4 +301,35 @@ pub async fn mcp() -> anyhow::Result<ExitCode> {
     let socket = archon_client::default_socket();
     archon_mcp::serve_stdio(&socket, &archon_bin()?).await?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_appends_to_the_startup_log_and_moves_a_large_one_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("archond.log");
+        std::fs::write(&log, "the first session\n").unwrap();
+
+        let mut file = open_startup_log(&log, 96).unwrap();
+        writeln!(file, "the second session, long enough to pass the cap").unwrap();
+        drop(file);
+        let both = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            both.starts_with("the first session\n--- archond starting at "),
+            "{both}"
+        );
+        assert!(both.len() > 96, "the log is past its cap now: {both}");
+
+        drop(open_startup_log(&log, 96).unwrap());
+        let older = std::fs::read_to_string(dir.path().join("archond.log.1")).unwrap();
+        assert_eq!(older, both, "the large log moved aside whole");
+        let fresh = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            fresh.starts_with(archon_core::paths::STARTUP_LOG_MARK) && fresh.lines().count() == 1,
+            "the third start begins a new log: {fresh}"
+        );
+    }
 }

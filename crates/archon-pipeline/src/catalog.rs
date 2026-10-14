@@ -93,7 +93,12 @@ impl Catalog {
                 "pipeline {name:?} is broken: {}",
                 problem.error
             ))),
-            None => Err(ArchonError::NotFound(format!("pipeline {name:?}"))),
+            None => match crate::builtin::retired(name) {
+                Some(replacement) => Err(ArchonError::Pipeline(format!(
+                    "{name:?} was a built-in that Archon 1.1.0 removed; use {replacement}"
+                ))),
+                None => Err(ArchonError::NotFound(format!("pipeline {name:?}"))),
+            },
         }
     }
 
@@ -117,8 +122,8 @@ impl Catalog {
         self.pipelines.insert(name, spec);
     }
 
-    /// Record a broken pipeline and drop any lower-precedence one of the
-    /// same name: a broken override never falls back.
+    /// Record a broken pipeline and drop any lower-precedence one of its name:
+    /// a broken override never falls back. The catalog's reader reports it.
     fn record_problem(
         &mut self,
         name: &str,
@@ -126,7 +131,7 @@ impl Catalog {
         path: Option<PathBuf>,
         error: &ArchonError,
     ) {
-        tracing::warn!(pipeline = name, ?source, ?path, %error, "pipeline excluded from catalog");
+        tracing::debug!(pipeline = name, ?source, ?path, %error, "pipeline excluded from catalog");
         self.pipelines.remove(name);
         self.problems.push(PipelineProblem {
             name: name.to_owned(),
@@ -179,7 +184,9 @@ fn pipeline_dirs(dir: &Path) -> Result<Vec<(DirName, PathBuf)>, ArchonError> {
             .file_name()
             .into_string()
             .map_err(|raw| raw.to_string_lossy().into_owned());
-        let hidden = name.as_ref().is_ok_and(|n| n.starts_with('.'));
+        let hidden = name
+            .as_ref()
+            .is_ok_and(|n| n.starts_with('.') || n.ends_with(".proposed"));
         if hidden || !has_manifest(&path) {
             continue;
         }

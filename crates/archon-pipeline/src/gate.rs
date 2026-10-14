@@ -4,7 +4,9 @@
 use archon_core::catalog::{Gate, StageKind};
 use archon_core::run::{StageRun, StageState, Verdict};
 
-use crate::spec::StageSpec;
+use crate::review::Evidence;
+use crate::ship::ShipRecord;
+use crate::spec::{Owed, StageSpec};
 
 /// Feedback handed to a looped-to stage is capped so a verbose reviewer
 /// cannot blow up the next agent's objective.
@@ -19,8 +21,13 @@ pub(crate) enum GroupResult {
 }
 
 /// Evaluate a stage group whose every slot is terminal. `members` holds the
-/// latest stage run per slot, ordered by fan index.
-pub(crate) fn evaluate(stage: &StageSpec, attempt: u32, members: &[&StageRun]) -> GroupResult {
+/// latest stage run per slot, by fan index; `owed` as for `recorded`.
+pub(crate) fn evaluate(
+    stage: &StageSpec,
+    attempt: u32,
+    members: &[&StageRun],
+    owed: Owed,
+) -> GroupResult {
     assert_eq!(members.len(), stage.fan_out as usize, "one member per slot");
     assert!(
         members.iter().all(|m| m.state.is_terminal()),
@@ -33,6 +40,9 @@ pub(crate) fn evaluate(stage: &StageSpec, attempt: u32, members: &[&StageRun]) -
         Gate::Majority => passes * 2 > total,
         Gate::Any => passes >= 1,
     };
+    if ok && owed != Owed::default() {
+        return recorded(stage, attempt, members, owed);
+    }
     if ok {
         return GroupResult::Pass {
             summary: joined_summary(stage, members),
@@ -55,6 +65,45 @@ pub(crate) fn evaluate(stage: &StageSpec, attempt: u32, members: &[&StageRun]) -
     GroupResult::Fail {
         headline,
         report: clip(&report, MAX_FEEDBACK_CHARS),
+    }
+}
+
+/// A stage that passed its gate passes only with what it owes on record: the
+/// ship record archond delivers, and the review, whose line then ends its summary.
+fn recorded(stage: &StageSpec, attempt: u32, members: &[&StageRun], owed: Owed) -> GroupResult {
+    let [member] = members else {
+        panic!("validated: one agent holds a pipeline's review or ship record")
+    };
+    assert_eq!(member.state, StageState::Completed, "it passed its gate");
+    let summary = joined_summary(stage, members);
+    let unrecorded = |headline: String| {
+        let report = format!(
+            "**Stage `{}` attempt {attempt}: {headline}**\n\n{summary}\n",
+            stage.id
+        );
+        GroupResult::Fail {
+            headline,
+            report: clip(&report, MAX_FEEDBACK_CHARS),
+        }
+    };
+    let structured = member.structured.as_ref();
+    if owed.ship_record
+        && let Err(why) = ShipRecord::read(structured)
+    {
+        return unrecorded(format!(
+            "the ship record archond delivers is not on record: {why}"
+        ));
+    }
+    let Some(duty) = owed.review else {
+        return GroupResult::Pass { summary };
+    };
+    match Evidence::read(structured, duty) {
+        Ok(evidence) => GroupResult::Pass {
+            summary: format!("{summary}\n\n{}", evidence.line()),
+        },
+        Err(why) => unrecorded(format!(
+            "the review this pipeline declares is not on record: {why}"
+        )),
     }
 }
 

@@ -1,19 +1,24 @@
 //! `AgentBackend` over a live Aether connection (ARCHITECTURE §4.5).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use archon_core::aether_ids::{AetherAgentId, AetherTaskId};
 use archon_core::error::ArchonError;
 use archon_core::policy::ModelPolicy;
-use archon_core::ports::{AgentBackend, CreatedNode, RunNodeRequest, SpawnRequest, SpawnedAgent};
+use archon_core::ports::{
+    AgentBackend, AgentUpdate, CreatedNode, Descendant, DescendantState, RunNodeRequest,
+    SpawnRequest, SpawnedAgent,
+};
 use archon_core::run::StageOutcome;
 use async_trait::async_trait;
 
 use crate::client::AetherClient;
 use crate::link::AetherLink;
+use crate::resumed;
 use crate::wire::{
-    Agent, AgentConfig, ApprovalPolicy, CreateAgent, NetworkPolicy, Scope, Task, TaskStatus,
-    ToolExposure,
+    Agent, AgentConfig, AgentPatch, AgentQuery, ApprovalPolicy, CreateAgent, NetworkPolicy, Scope,
+    Task, TaskStatus, ToolExposure,
 };
 
 /// Aether agent states in which an agent can still act or take children.
@@ -46,6 +51,56 @@ pub fn agent_state(agent: &Agent) -> String {
 
 pub fn agent_is_live(agent: &Agent) -> bool {
     LIVE_STATES.contains(&agent_state(agent).as_str())
+}
+
+/// How `agent` stands for whoever waits on it: an unknown state is `Live`, so
+/// nothing that may still act is taken for ended.
+fn descendant_state(agent: &Agent) -> DescendantState {
+    match agent_state(agent).as_str() {
+        "completed" => DescendantState::Completed,
+        "failed" | "cancelled" | "imported" => DescendantState::Stopped,
+        _ => DescendantState::Live,
+    }
+}
+
+/// The agents of `agents` beneath `root`, at any depth, nearest first. An
+/// ended agent is passed through: what it delegated may still run.
+pub fn subtree(root: &AetherAgentId, agents: &[Agent]) -> Vec<Descendant> {
+    let mut children: BTreeMap<&AetherAgentId, Vec<&Agent>> = BTreeMap::new();
+    for agent in agents {
+        if let Some(parent) = &agent.parent {
+            children.entry(parent).or_default().push(agent);
+        }
+    }
+    let mut found = Vec::new();
+    let mut seen = BTreeSet::from([root]);
+    let mut next = vec![root];
+    while let Some(parent) = next.pop() {
+        for child in children.get(parent).into_iter().flatten() {
+            // Parentage is a tree in Aether; a repeat would loop forever.
+            if !seen.insert(&child.id) {
+                continue;
+            }
+            next.push(&child.id);
+            found.push(Descendant {
+                agent: child.id.clone(),
+                parent: parent.clone(),
+                model: child.model.clone(),
+                effort: child.config.effort.as_deref().and_then(|e| e.parse().ok()),
+                state: descendant_state(child),
+                task: child.current_task.clone(),
+            });
+        }
+    }
+    assert!(
+        found.len() <= agents.len(),
+        "an agent is found at most once"
+    );
+    assert!(
+        found.iter().all(|d| d.agent != *root),
+        "the root is no descendant"
+    );
+    found
 }
 
 /// The exact `create_agent` for a stage agent. `network` is the request's
@@ -93,7 +148,7 @@ pub fn stage_create_agent(request: &SpawnRequest, network: NetworkPolicy) -> Cre
                 .filter(|_| request.aether_cost_budget != Some(false)),
             deadline: request.deadline,
             tools,
-            long_lived: false,
+            long_lived: request.keep,
             leaf: request.leaf,
         }),
         approval: Some(ApprovalPolicy::none()),
@@ -197,6 +252,25 @@ async fn spawned_from(
         task: task_id,
         run: task.run,
     })
+}
+
+/// `update` as Aether's patch, which leaves alone what it does not name.
+fn agent_patch(update: AgentUpdate) -> AgentPatch {
+    let budget = update.cost_budget_usd;
+    assert!(
+        budget.is_none_or(|usd| usd.is_finite() && usd > 0.0),
+        "a hard cap is a positive dollar amount, not {budget:?}"
+    );
+    let (model, effort) = match update.choice {
+        Some(choice) => (Some(choice.model), Some(choice.effort)),
+        None => (None, None),
+    };
+    AgentPatch {
+        model,
+        effort,
+        cost_budget: budget,
+        deadline: update.deadline.map(|at| serde_json::json!({"set": at})),
+    }
 }
 
 #[async_trait]
@@ -304,6 +378,46 @@ impl AgentBackend for AetherBackend {
         self.link.client()?.cancel(agent, reason).await
     }
 
+    async fn update_agent(
+        &self,
+        agent: &AetherAgentId,
+        update: AgentUpdate,
+    ) -> Result<(), ArchonError> {
+        assert!(!update.is_empty(), "an update changes something");
+        if let Some(choice) = &update.choice {
+            self.policy.check(choice)?;
+        }
+        let patch = agent_patch(update);
+        self.link.client()?.update_agent(agent, patch).await?;
+        Ok(())
+    }
+
+    async fn interrupt(&self, agent: &AetherAgentId) -> Result<bool, ArchonError> {
+        self.link.client()?.interrupt(agent).await
+    }
+
+    /// Two reads however deep the tree: the agent's run, then that run's agents.
+    async fn descendants(&self, agent: &AetherAgentId) -> Result<Vec<Descendant>, ArchonError> {
+        let client = self.link.client()?;
+        let root = match client.get_agent(agent).await {
+            Ok(root) => root,
+            Err(ArchonError::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let run = root.run.ok_or_else(|| {
+            ArchonError::Protocol(format!(
+                "agent {agent} has no run to list its descendants in"
+            ))
+        })?;
+        let query = AgentQuery {
+            run: Some(run),
+            // An agent cleared from the view still links what it delegated.
+            include_archived: true,
+            ..AgentQuery::default()
+        };
+        Ok(subtree(agent, &client.list_agents(query).await?))
+    }
+
     async fn task_outcome(&self, task: &AetherTaskId) -> Result<Option<StageOutcome>, ArchonError> {
         let task = self.link.client()?.get_task(task).await?;
         Ok(task_outcome(&task))
@@ -320,6 +434,27 @@ impl AgentBackend for AetherBackend {
             .send_message(to, content, idempotency_key)
             .await
     }
+
+    async fn resumed_outcome(
+        &self,
+        agent: &AetherAgentId,
+        message: &str,
+    ) -> Result<Option<StageOutcome>, ArchonError> {
+        let client = self.link.client()?;
+        let found = match client.get_agent(agent).await {
+            Ok(found) => found,
+            Err(ArchonError::NotFound(why)) => return Ok(Some(resumed::lost(&why))),
+            Err(error) => return Err(error),
+        };
+        if !agent_is_live(&found) {
+            let state = agent_state(&found);
+            return Ok(Some(resumed::lost(&format!("Aether holds it as {state}"))));
+        }
+        if !resumed::is_idle(&found) {
+            return Ok(None);
+        }
+        resumed::read(&client, agent, message).await
+    }
 }
 
 #[cfg(test)]
@@ -334,7 +469,7 @@ mod tests {
     fn request() -> SpawnRequest {
         SpawnRequest {
             idempotency_key: "stg_01".into(),
-            role: "archon-stage:quick-pr/implement".into(),
+            role: "archon-stage:direct/implement".into(),
             name: "implement · add a greeting".into(),
             objective: "do it".into(),
             instructions: "contract".into(),
@@ -353,13 +488,14 @@ mod tests {
             attach_run: None,
             parent: Some(node_id()),
             network: Some(NetworkPolicy::Denied),
+            keep: false,
         }
     }
 
     fn node_request() -> RunNodeRequest {
         RunNodeRequest {
             idempotency_key: "prun_01:node:1".into(),
-            role: "archon-run:quick-pr".into(),
+            role: "archon-run:direct".into(),
             name: "add a greeting".into(),
             model: "claude-code/claude-opus-5-5".parse().unwrap(),
             workspace: "/work/tree".into(),
@@ -462,6 +598,71 @@ mod tests {
         }
         agent.status = serde_json::json!({});
         assert_eq!(agent_state(&agent), "unknown");
+    }
+
+    fn held(id: &str, parent: Option<&str>, state: &str) -> Agent {
+        let mut value = crate::fake::agent(id, None);
+        value["parent"] = serde_json::json!(parent);
+        value["status"] = serde_json::json!({"state": state});
+        value["config"] = serde_json::json!({"effort": "medium"});
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_subtree_reaches_through_ended_agents_and_leaves_strangers_out() {
+        let id = |raw: &str| AetherAgentId::parse(raw).unwrap();
+        let agents = [
+            held("agt_lead", Some("agt_node"), "completed"),
+            held("agt_child", Some("agt_lead"), "completed"),
+            held("agt_grandchild", Some("agt_child"), "running"),
+            held("agt_odd", Some("agt_lead"), "bogus"),
+            held("agt_sibling", Some("agt_node"), "running"),
+            held("agt_cancelled", Some("agt_lead"), "cancelled"),
+        ];
+        let mut found = subtree(&id("agt_lead"), &agents);
+        found.sort_by(|a, b| a.agent.cmp(&b.agent));
+        let states: Vec<(&str, &str, DescendantState)> = found
+            .iter()
+            .map(|d| (d.agent.as_str(), d.parent.as_str(), d.state))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("agt_cancelled", "agt_lead", DescendantState::Stopped),
+                ("agt_child", "agt_lead", DescendantState::Completed),
+                ("agt_grandchild", "agt_child", DescendantState::Live),
+                ("agt_odd", "agt_lead", DescendantState::Live),
+            ]
+        );
+        assert!(found.iter().all(|d| d.effort == Some(Effort::Medium)));
+        assert!(subtree(&id("agt_grandchild"), &agents).is_empty());
+    }
+
+    #[test]
+    fn an_agent_patch_names_only_what_the_update_changes() {
+        let budget = AgentUpdate {
+            cost_budget_usd: Some(4.0),
+            ..AgentUpdate::default()
+        };
+        let patch = serde_json::to_value(agent_patch(budget)).unwrap();
+        assert_eq!(patch, serde_json::json!({"cost_budget": 4.0}));
+        let choice = AgentUpdate {
+            choice: Some(request().choice),
+            ..AgentUpdate::default()
+        };
+        let patch = agent_patch(choice);
+        assert_eq!(patch.model, Some(request().choice.model));
+        assert_eq!(patch.effort, Some(Effort::High));
+        assert!(patch.cost_budget.is_none() && patch.deadline.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "hard cap")]
+    fn a_non_positive_hard_cap_is_a_bug() {
+        agent_patch(AgentUpdate {
+            cost_budget_usd: Some(0.0),
+            ..AgentUpdate::default()
+        });
     }
 
     #[test]

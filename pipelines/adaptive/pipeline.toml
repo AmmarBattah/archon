@@ -1,0 +1,28 @@
+[pipeline]
+name = "adaptive"
+description = "One lead sizes, builds, integrates and reviews the change before shipping"
+version = 1
+workspace = "worktree"
+requires_repo = true
+
+# The lead holds the review: an item's review level says how many reviewers.
+[pipeline.review]
+level = "standard"
+stage = "build"
+
+# Archon ships the commits this stage records; no agent does.
+[pipeline.ship]
+stage = "build"
+
+[nudges]
+tier = "balanced"
+independent_reviewers = true
+notes = "For a repository change where one lead that keeps its context through fixes, or integrates parts that split, saves restarts. A change one author can make and check belongs in direct, and unrelated changes are never bundled to fit here. The item's review level sets how many independent reviewers the lead owes: none, standard (one) or strict (three)."
+
+[[stage]]
+id = "build"
+kind = "work"
+prompt = "build.md"
+allow_delegation = true
+timeout_minutes = 180
+nudge = "A strong coding model at high effort; medium for a bounded change in familiar code. x_high or max only for a reasoning problem you can name that inspecting the code left unresolved: that the operator prefers strong models is not one. The lead chooses its workers and its reviewer, and their models and efforts, at runtime within model policy."

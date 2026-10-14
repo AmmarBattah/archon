@@ -37,7 +37,7 @@ pub(super) async fn report(
         let Entry::Vacant(entry) = runs.entry(stage.run.clone()) else {
             continue;
         };
-        let spec = match frozen::thaw(&ctx.paths.data_dir, &stage.run, pipeline).await {
+        let spec = match frozen::thaw(ctx, &stage.run, pipeline).await {
             Ok(spec) => Some(spec),
             Err(error) => {
                 tracing::debug!(run = %stage.run, %error, "evidence snapshot unavailable; using catalog");
@@ -54,13 +54,20 @@ pub(super) async fn report(
         };
         entry.insert(spec);
     }
-    let report = snapshot.report(|_, stage| {
+    let mut report = snapshot.report(|_, stage| {
         Ok(runs
             .get(&stage.run)
             .and_then(Option::as_ref)
             .and_then(|spec| spec.stage(&stage.stage_id))
             .is_some_and(|s| matches!(s.kind, StageKind::Review | StageKind::Test)))
     })?;
+    if ctx.config.learning.enabled {
+        let store = ctx.store.lock().await;
+        let repo = query.repo.as_ref().map(|r| store.repo(r)).transpose()?;
+        report.pipelines = store
+            .learning_stats(repo.as_ref().map(|r| &r.id))?
+            .pipelines;
+    }
     Ok(Reply::ModelEvidence(Box::new(report)))
 }
 

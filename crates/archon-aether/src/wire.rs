@@ -77,6 +77,10 @@ pub enum Command {
         agent: AetherAgentId,
         reason: Option<String>,
     },
+    /// Stops the running turn only; the agent waits for its next message.
+    Interrupt {
+        agent: AetherAgentId,
+    },
     Wake {
         agent: AetherAgentId,
     },
@@ -279,8 +283,23 @@ pub enum ToolExposure {
     },
 }
 
+impl ToolExposure {
+    /// Whether an agent with this exposure sees the tool `name`.
+    pub fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only { names } => names.contains(name),
+            Self::Except { names } => !names.contains(name),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct AgentPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_budget: Option<f64>,
     /// `{"set": <rfc3339>}` or `"clear"`.
@@ -379,6 +398,20 @@ pub struct AgentScope {
 pub struct AgentSettings {
     #[serde(default)]
     pub instructions: Option<String>,
+    #[serde(default)]
+    pub tools: ToolExposure,
+    #[serde(default)]
+    pub leaf: bool,
+    /// As Aether wrote it; it may name an effort Archon does not know.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+impl AgentSettings {
+    /// Whether the agent can create child agents with Aether's `delegate`.
+    pub fn can_delegate(&self) -> bool {
+        !self.leaf && self.tools.allows("delegate")
+    }
 }
 
 /// The fields of Aether's `Task` Archon reads.

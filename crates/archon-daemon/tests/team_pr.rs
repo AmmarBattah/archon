@@ -1,7 +1,9 @@
-//! The built-in `team-pr` pipeline against the scripted backend: a plan,
+//! The `team-pr` example pipeline, installed in the repository, against the
+//! scripted backend: a plan,
 //! a backend and frontend team, an end-to-end test that fails and sends
 //! its findings back to the team, a second build on top of the first, then
-//! a passing test, one review and a ship, all on one run branch.
+//! a passing test and one review, all on one run branch, which archond
+//! then delivers itself.
 
 mod common;
 
@@ -12,6 +14,7 @@ use archon_core::model::{Effort, ModelPlan};
 use archon_core::queue::QueueState;
 use archon_core::run::{PipelineRun, StageOutcome, StageRun};
 use archon_pipeline::team::worker_branch;
+use common::delivery::{FakeGh, add_origin, pushed, record};
 use common::{Harness, MODEL, choice, completed, git, verdict};
 
 const ROLES: [&str; 2] = ["backend", "frontend"];
@@ -19,11 +22,32 @@ const ROLES: [&str; 2] = ["backend", "frontend"];
 /// One agent for each stage but `build`, which has one per role.
 fn team_pr_plan() -> ModelPlan {
     let mut stages = BTreeMap::new();
-    for stage in ["plan", "e2e", "review", "ship"] {
+    for stage in ["plan", "e2e", "review"] {
         stages.insert(stage.to_owned(), vec![choice(MODEL, Effort::Medium)]);
     }
     stages.insert("build".into(), vec![choice(MODEL, Effort::High); 2]);
     ModelPlan(stages)
+}
+
+/// Copy `docs/examples/pipelines/team-pr` into the repository's pipelines.
+fn install_team_pr(h: &Harness) {
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/pipelines/team-pr");
+    let installed = h.repo.join(".archon/pipelines/team-pr");
+    std::fs::create_dir_all(&installed).expect("pipeline dir");
+    for entry in std::fs::read_dir(&example).expect("the team-pr example") {
+        let path = entry.expect("an example file").path();
+        let name = path.file_name().expect("a file name");
+        std::fs::copy(&path, installed.join(name)).expect("copy the example");
+    }
+    assert!(
+        installed.join("pipeline.toml").is_file(),
+        "{example:?} is a pipeline"
+    );
+    assert!(
+        installed.join("build.md").is_file(),
+        "{example:?} has its prompts"
+    );
 }
 
 fn commit_file(tree: &Path, file: &str, text: &str) {
@@ -110,6 +134,17 @@ async fn assert_rebuild_starts_from_attempt_one(h: &Harness, run: &PipelineRun) 
     }
 }
 
+/// The reviewer's pass, with the ship record for the run branch it reviewed.
+fn reviewed(run: &PipelineRun) -> StageOutcome {
+    let mut structured = record(&run.workspace);
+    structured["verdict"] = "pass".into();
+    structured["findings"] = serde_json::json!([]);
+    StageOutcome::Completed {
+        summary: "reviewed\nVERDICT: pass".into(),
+        structured: Some(structured),
+    }
+}
+
 /// Both rounds of both roles are merged with `--no-ff` onto the one run
 /// branch that ships.
 fn assert_both_rounds_on_the_run_branch(run: &PipelineRun) {
@@ -131,10 +166,13 @@ fn assert_both_rounds_on_the_run_branch(run: &PipelineRun) {
 #[tokio::test]
 async fn a_failed_end_to_end_test_loops_the_team_back_then_ships() {
     let h = Harness::new().await;
+    install_team_pr(&h);
+    let origin = add_origin(&h);
+    let gh = FakeGh::install(&h);
     let item = h
         .enqueue_in("team-pr", "sign in", team_pr_plan())
         .await
-        .expect("team-pr is a built-in");
+        .expect("the team-pr example loads");
     h.dispatch().await;
     let run = h.run(&item.id).await;
     running_one(&h, "plan", 1).await;
@@ -159,22 +197,26 @@ async fn a_failed_end_to_end_test_loops_the_team_back_then_ships() {
     h.settle_running(|_| verdict(true)).await;
     h.dispatch().await;
     running_one(&h, "review", 1).await;
-    h.settle_running(|_| verdict(true)).await;
-    h.dispatch().await;
-    running_one(&h, "ship", 1).await;
     assert_both_rounds_on_the_run_branch(&run);
+    let head = git(&run.workspace, &["rev-parse", "HEAD"]);
 
-    h.settle_running(|_| completed("opened a pull request"))
-        .await;
-    assert!(
-        matches!(h.state(&item.id).await, QueueState::Succeeded { .. }),
-        "{:?}",
-        h.state(&item.id).await
+    h.settle_running(|_| reviewed(&run)).await;
+    h.dispatch().await;
+    let QueueState::Succeeded { summary, .. } = h.state(&item.id).await else {
+        panic!("the item ships: {:?}", h.state(&item.id).await);
+    };
+    let shipped = format!("SHIPPED: https://github.com/o/r/pull/1 (commit {head})");
+    assert!(summary.ends_with(&shipped), "{summary}");
+    assert_eq!(
+        pushed(&origin, &run.branch),
+        Some(head),
+        "the merged branch"
     );
+    assert_eq!(gh.count("pr create"), 1);
     assert_eq!(
         h.stages(&item.id).await.len(),
-        9,
-        "plan, 2x2 build, 2 e2e, review, ship"
+        8,
+        "plan, 2x2 build, 2 e2e, review: no agent ships"
     );
     assert!(!run.workspace.exists(), "a shipped run's worktree goes");
     let kept = git(&h.repo, &["branch", "--list", &run.branch]);

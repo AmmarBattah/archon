@@ -14,7 +14,9 @@ use archon_core::config::ModelsConfig;
 use archon_core::error::ArchonError;
 use archon_core::model::{Effort, ModelChoice};
 use archon_core::policy::ModelPolicy;
-use archon_core::ports::{AgentBackend, NetworkPolicy, RunNodeRequest, SpawnRequest};
+use archon_core::ports::{
+    AgentBackend, AgentUpdate, DescendantState, NetworkPolicy, RunNodeRequest, SpawnRequest,
+};
 use archon_core::run::StageOutcome;
 use common::{AGENT, RUN, TASK, WAIT, completed, connect};
 
@@ -25,7 +27,7 @@ use serde_json::{Value, json};
 fn spawn_request() -> SpawnRequest {
     SpawnRequest {
         idempotency_key: "stg_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-        role: "archon-stage:quick-pr/implement".into(),
+        role: "archon-stage:direct/implement".into(),
         name: "implement · the thing".into(),
         objective: "implement the thing".into(),
         instructions: "stage contract".into(),
@@ -44,13 +46,14 @@ fn spawn_request() -> SpawnRequest {
         attach_run: None,
         parent: Some(AetherAgentId::parse(NODE).unwrap()),
         network: Some(NetworkPolicy::Denied),
+        keep: false,
     }
 }
 
 fn node_request() -> RunNodeRequest {
     RunNodeRequest {
         idempotency_key: "prun_01ARZ3NDEKTSV4RRFFQ69G5FAV:node:1".into(),
-        role: "archon-run:quick-pr".into(),
+        role: "archon-run:direct".into(),
         name: "the thing".into(),
         model: "claude-code/claude-opus-5-5".parse().unwrap(),
         workspace: "/work/tree".into(),
@@ -259,7 +262,7 @@ async fn network_default_reads_aethers_status() {
 }
 
 fn assert_create_shape(create: &Value) {
-    assert_eq!(create["role"], "archon-stage:quick-pr/implement");
+    assert_eq!(create["role"], "archon-stage:direct/implement");
     assert_eq!(create["objective"], "implement the thing");
     assert_eq!(create["start"], true);
     assert_eq!(
@@ -339,7 +342,7 @@ async fn run_nodes_are_created_passive_and_keyed() {
         create["idempotency_key"],
         "prun_01ARZ3NDEKTSV4RRFFQ69G5FAV:node:1"
     );
-    assert_eq!(create["role"], "archon-run:quick-pr");
+    assert_eq!(create["role"], "archon-run:direct");
     assert_eq!(create["name"], "the thing");
     assert_eq!(create["start"], false);
     assert!(create.get("objective").is_none() && create.get("parent").is_none());
@@ -441,6 +444,276 @@ async fn is_live_reads_the_agent_state_and_treats_unknown_as_dead() {
     assert!(!backend.is_live(&node).await.unwrap(), "unknown is dead");
     let error = backend.is_live(&node).await.unwrap_err();
     assert!(!matches!(error, ArchonError::NotFound(_)), "{error}");
+}
+
+#[tokio::test]
+async fn update_agent_patches_only_what_the_update_names() {
+    let (_dir, fake) = fake_aether().await;
+    fake.set_default(
+        "update_agent",
+        Scripted::reply("agent", fake::agent(AGENT, None)),
+    );
+    let backend = backend(&fake, any_model()).await;
+    let agent = AetherAgentId::parse(AGENT).unwrap();
+    let deadline = archon_core::now();
+    let update = AgentUpdate {
+        choice: Some(ModelChoice {
+            model: "claude-code/claude-opus-5-5".parse().unwrap(),
+            effort: Effort::High,
+        }),
+        cost_budget_usd: Some(7.5),
+        deadline: Some(deadline),
+    };
+    backend.update_agent(&agent, update).await.unwrap();
+    let longer = AgentUpdate {
+        deadline: Some(deadline),
+        ..AgentUpdate::default()
+    };
+    backend.update_agent(&agent, longer).await.unwrap();
+
+    let sent = fake.received_named("update_agent");
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["id"], AGENT);
+    let patch = json!({
+        "model": {"provider": "claude-code", "model": "claude-opus-5-5"},
+        "effort": "high",
+        "cost_budget": 7.5,
+        "deadline": {"set": deadline},
+    });
+    assert_eq!(sent[0]["patch"], patch);
+    assert_eq!(sent[1]["patch"], json!({"deadline": {"set": deadline}}));
+}
+
+#[tokio::test]
+async fn update_agent_refuses_a_disallowed_model_without_calling_aether() {
+    let (_dir, fake) = fake_aether().await;
+    let only_codex = ModelPolicy::from_lists(&["codex/astra".parse().unwrap()], &[], None);
+    let backend = backend(&fake, only_codex).await;
+    let agent = AetherAgentId::parse(AGENT).unwrap();
+    let update = AgentUpdate {
+        choice: Some(spawn_request().choice),
+        ..AgentUpdate::default()
+    };
+    let error = backend.update_agent(&agent, update).await.unwrap_err();
+    assert!(matches!(error, ArchonError::Policy(_)), "{error}");
+    assert!(fake.received_named("update_agent").is_empty());
+}
+
+#[tokio::test]
+async fn interrupt_reports_whether_a_turn_was_running() {
+    let (_dir, fake) = fake_aether().await;
+    let interrupted =
+        |was_running: bool| Scripted::reply("interrupted", json!({"was_running": was_running}));
+    fake.script("interrupt", interrupted(true));
+    fake.script("interrupt", interrupted(false));
+    fake.script("interrupt", Scripted::refuse("not_found", "no such agent"));
+    let backend = backend(&fake, any_model()).await;
+    let agent = AetherAgentId::parse(AGENT).unwrap();
+    assert!(backend.interrupt(&agent).await.unwrap());
+    assert!(!backend.interrupt(&agent).await.unwrap());
+    let error = backend.interrupt(&agent).await.unwrap_err();
+    assert!(matches!(error, ArchonError::NotFound(_)), "{error}");
+    let sent = fake.received_named("interrupt");
+    assert_eq!(sent.len(), 3);
+    assert!(sent.iter().all(|command| command["agent"] == AGENT));
+}
+
+/// An agent kept for its stage's fix loop outlives its task; any other ends
+/// with it (ARCHITECTURE §6.7).
+#[tokio::test]
+async fn only_a_kept_agent_is_created_long_lived() {
+    let (_dir, fake) = fake_aether().await;
+    fake.set_default(
+        "create_agent",
+        Scripted::reply("agent", fake::agent(AGENT, Some(TASK))),
+    );
+    let task = fake::task(TASK, Some(AGENT), RUN, json!({"state": "assigned"}));
+    fake.set_default("get_task", Scripted::reply("task", task));
+    let backend = backend(&fake, any_model()).await;
+    backend.spawn(spawn_request()).await.unwrap();
+    let kept = SpawnRequest {
+        keep: true,
+        ..spawn_request()
+    };
+    backend.spawn(kept).await.unwrap();
+    let creates = fake.received_named("create_agent");
+    assert_eq!(creates.len(), 2);
+    assert_eq!(creates[0]["config"]["long_lived"], false);
+    assert_eq!(creates[1]["config"]["long_lived"], true);
+}
+
+/// One event of agent `AGENT`, as `get_events` lists it.
+fn agent_event(seq: u64, kind: Value) -> Value {
+    json!({
+        "id": format!("evt_{seq}"), "seq": seq, "at": "2026-10-14T10:00:00Z",
+        "actor": {"type": "system"}, "agent_id": AGENT, "run": RUN, "kind": kind,
+    })
+}
+
+/// The delivery of `text` to the agent's inbox as item `item`.
+fn delivered(seq: u64, item: u64, text: &str) -> Value {
+    let kind = json!({
+        "kind": "message", "message_id": "msg_1", "from": {"actor": "system"},
+        "content": [{"type": "text", "text": text}],
+    });
+    let item = json!({
+        "id": "inb_1", "agent_id": AGENT, "seq": item,
+        "delivered_at": "2026-10-14T10:00:00Z", "kind": kind,
+    });
+    agent_event(seq, json!({"type": "inbox.delivered", "item": item}))
+}
+
+fn said(seq: u64, text: &str) -> Value {
+    let content = json!([{"type": "text", "text": text}]);
+    let kind = json!({"type": "agent.message", "role": "assistant", "content": content});
+    agent_event(seq, kind)
+}
+
+fn idle_agent() -> Value {
+    let mut agent = fake::agent(AGENT, None);
+    agent["status"] = json!({"state": "waiting", "condition": {"on": "inbox"}});
+    agent
+}
+
+/// A resumed agent has no task: its answer is the last thing it said in the
+/// turn that took the message, once it waits for its inbox again.
+#[tokio::test]
+async fn a_resumed_agents_answer_is_read_once_its_turn_ended() {
+    const FINDINGS: &str = "Fix the two findings.";
+    let (_dir, fake) = fake_aether().await;
+    let backend = backend(&fake, any_model()).await;
+    let agent = AetherAgentId::parse(AGENT).unwrap();
+    let events = |events: Vec<Value>| Scripted::reply("events", json!(events));
+    let consumed = agent_event(
+        11,
+        json!({"type": "inbox.consumed", "up_to": 4, "items": []}),
+    );
+
+    // Still in its turn: nothing is read.
+    fake.script(
+        "get_agent",
+        Scripted::reply("agent", fake::agent(AGENT, None)),
+    );
+    assert_eq!(
+        backend.resumed_outcome(&agent, FINDINGS).await.unwrap(),
+        None
+    );
+    assert!(fake.received_named("get_events").is_empty());
+
+    // Idle, but no turn took the message yet.
+    fake.script("get_agent", Scripted::reply("agent", idle_agent()));
+    fake.script("get_events", events(vec![delivered(10, 4, FINDINGS)]));
+    fake.script("get_events", events(vec![]));
+    assert_eq!(
+        backend.resumed_outcome(&agent, FINDINGS).await.unwrap(),
+        None
+    );
+
+    // Idle after the turn that took it: its last word is the outcome.
+    fake.script("get_agent", Scripted::reply("agent", idle_agent()));
+    fake.script("get_events", events(vec![delivered(10, 4, FINDINGS)]));
+    let turn = vec![
+        consumed,
+        said(12, "On it."),
+        said(13, "Fixed both in src/a.rs."),
+    ];
+    fake.script("get_events", events(turn));
+    let outcome = backend.resumed_outcome(&agent, FINDINGS).await.unwrap();
+    assert_eq!(outcome, Some(completed_outcome("Fixed both in src/a.rs.")));
+    let reads = fake.received_named("get_events");
+    assert_eq!(reads.len(), 4);
+    assert_eq!(reads[3]["after"], 10, "read forward from the delivery");
+    let own = reads.iter().all(|read| read["query"]["agent"] == AGENT);
+    assert!(own, "only the agent's own events are asked for: {reads:?}");
+}
+
+fn completed_outcome(summary: &str) -> StageOutcome {
+    StageOutcome::Completed {
+        summary: summary.into(),
+        structured: None,
+    }
+}
+
+/// A kept agent that cannot answer fails its attempt as infrastructure, so
+/// a fresh agent replaces it.
+#[tokio::test]
+async fn a_resumed_agent_that_cannot_answer_is_lost() {
+    let (_dir, fake) = fake_aether().await;
+    let backend = backend(&fake, any_model()).await;
+    let agent = AetherAgentId::parse(AGENT).unwrap();
+    let mut cancelled = fake::agent(AGENT, None);
+    cancelled["status"] = json!({"state": "cancelled", "reason": "gone"});
+    fake.script("get_agent", Scripted::reply("agent", cancelled));
+    fake.script("get_agent", Scripted::refuse("not_found", "no such agent"));
+    // Idle, and Aether never recorded the message it was resumed with.
+    fake.script("get_agent", Scripted::reply("agent", idle_agent()));
+    fake.script("get_events", Scripted::reply("events", json!([])));
+    // Idle after a turn that took the message and said nothing.
+    fake.script("get_agent", Scripted::reply("agent", idle_agent()));
+    let found = vec![delivered(10, 4, "Fix it.")];
+    fake.script("get_events", Scripted::reply("events", json!(found)));
+    let silent = vec![agent_event(
+        11,
+        json!({"type": "inbox.consumed", "up_to": 4, "items": []}),
+    )];
+    fake.script("get_events", Scripted::reply("events", json!(silent)));
+    for case in ["cancelled", "unknown", "no delivery", "silent turn"] {
+        let outcome = backend.resumed_outcome(&agent, "Fix it.").await.unwrap();
+        assert!(
+            matches!(&outcome, Some(StageOutcome::Failed { infra: true, error })
+                if error.starts_with("the agent kept for this stage could not answer: ")),
+            "{case}: {outcome:?}"
+        );
+    }
+    fake.script("get_agent", Scripted::refuse("internal", "store is busy"));
+    let error = backend
+        .resumed_outcome(&agent, "Fix it.")
+        .await
+        .unwrap_err();
+    assert!(!matches!(error, ArchonError::NotFound(_)), "{error}");
+}
+
+/// The stop of a lead's helpers waits on this: the whole run is read once,
+/// archived agents included, and only what sits beneath the agent is returned.
+#[tokio::test]
+async fn descendants_lists_the_agents_run_once_and_keeps_only_its_subtree() {
+    let (_dir, fake) = fake_aether().await;
+    let held = |id: &str, parent: &str, state: &str| {
+        let mut agent = fake::agent(id, None);
+        agent["parent"] = json!(parent);
+        agent["status"] = json!({"state": state});
+        agent["config"] = json!({"effort": "x_high"});
+        agent
+    };
+    let listed = json!([
+        fake::agent(NODE, None),
+        held(AGENT, NODE, "completed"),
+        held("agt_helper", AGENT, "running"),
+        held("agt_other_stage", NODE, "running"),
+    ]);
+    fake.script(
+        "get_agent",
+        Scripted::reply("agent", fake::agent(AGENT, None)),
+    );
+    fake.script("list_agents", Scripted::reply("agents", listed));
+    fake.script("get_agent", Scripted::refuse("not_found", "no such agent"));
+    let backend = backend(&fake, any_model()).await;
+    let lead = AetherAgentId::parse(AGENT).unwrap();
+
+    let found = backend.descendants(&lead).await.unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].agent.as_str(), "agt_helper");
+    assert_eq!(found[0].parent, lead);
+    assert_eq!(found[0].state, DescendantState::Live);
+    assert_eq!(found[0].effort, Some(Effort::XHigh));
+    let query = &fake.received_named("list_agents")[0]["query"];
+    assert_eq!(query["run"], fake::FAKE_RUN);
+    assert_eq!(query["include_archived"], true);
+    assert!(query.get("parent").is_none(), "one read, not one per agent");
+
+    let forgotten = backend.descendants(&lead).await.unwrap();
+    assert!(forgotten.is_empty(), "a forgotten agent left nothing");
+    assert_eq!(fake.received_named("list_agents").len(), 1);
 }
 
 #[tokio::test]

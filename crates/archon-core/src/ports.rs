@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::Timestamp;
 use crate::aether_ids::{AetherAgentId, AetherRunId, AetherTaskId};
 use crate::error::ArchonError;
-use crate::model::{ModelChoice, ModelRef};
+use crate::model::{Effort, ModelChoice, ModelRef};
 use crate::run::StageOutcome;
 
 /// Aether's scope network knob. An explicit scope is `denied` unless it
@@ -51,9 +51,11 @@ pub struct SpawnRequest {
     pub workspace: PathBuf,
     pub repository: Option<String>,
     pub labels: BTreeMap<String, String>,
-    /// Tool names hidden from the agent (`mcp__archon__*`).
+    /// Tool names hidden from the agent: Archon's (`mcp__archon__*`) and
+    /// Aether's own that no stage agent gets.
     pub hidden_tools: Vec<String>,
-    /// `true` unless the item's `tools` is `yolo`.
+    /// `false` when the agent may delegate: by its stage's
+    /// `allow_delegation` or the item's `tools = yolo`.
     pub leaf: bool,
     /// Archon's grant, retained even when Aether cannot enforce a hard cap.
     pub cost_budget_usd: Option<f64>,
@@ -74,6 +76,58 @@ pub struct SpawnRequest {
     /// that daemon sent it, with Aether's default.
     #[serde(default)]
     pub network: Option<NetworkPolicy>,
+    /// The agent outlives its task, so a later attempt of its slot can
+    /// resume it by message instead of starting cold (§6.7).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep: bool,
+}
+
+/// A resumed attempt's outcome from its final message (§6.7): failed after
+/// `FAILED:`, `BLOCKED:` or `ESCALATE:`, else its summary and `structured`.
+pub fn resumed_reply_outcome(reply: &str) -> StageOutcome {
+    const FAILED_PREFIX: &str = "FAILED:";
+    let reply = reply.trim();
+    assert!(!reply.is_empty(), "a silent turn is not an answer");
+    if let Some(why) = reply.strip_prefix(FAILED_PREFIX) {
+        let error = match why.trim() {
+            "" => "the stage agent reported that it could not fix its work".to_owned(),
+            why => why.to_owned(),
+        };
+        return StageOutcome::Failed {
+            error,
+            infra: false,
+        };
+    }
+    if StageOutcome::ends_run(reply) {
+        return StageOutcome::Failed {
+            error: reply.to_owned(),
+            infra: false,
+        };
+    }
+    let (summary, structured) = handed_in(reply);
+    StageOutcome::Completed {
+        summary,
+        structured,
+    }
+}
+
+/// The summary of `reply` and the object of its last fenced `json` block: a
+/// resumed agent's task is settled, so its message carries `structured`.
+fn handed_in(reply: &str) -> (String, Option<serde_json::Value>) {
+    const OPEN: &str = "```json";
+    assert_eq!(reply, reply.trim(), "the reply comes trimmed");
+    for (at, _) in reply.rmatch_indices(OPEN) {
+        // A stream reads one value and leaves the closing fence unread.
+        let block = &reply[at + OPEN.len()..];
+        let mut values = serde_json::Deserializer::from_str(block).into_iter();
+        let Some(Ok(data @ serde_json::Value::Object(_))) = values.next() else {
+            continue;
+        };
+        let said = reply[..at].trim();
+        let summary = if said.is_empty() { reply } else { said };
+        return (summary.to_owned(), Some(data));
+    }
+    (reply.to_owned(), None)
 }
 
 /// The passive Aether agent under which one pipeline run's stage agents
@@ -114,6 +168,47 @@ pub struct CreatedNode {
     pub run: AetherRunId,
 }
 
+/// Whether Aether still runs an agent beneath another, and how it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescendantState {
+    /// Not ended, or in a state Archon does not know: it may still act.
+    Live,
+    Completed,
+    /// Failed, cancelled or imported: it ended without completing.
+    Stopped,
+}
+
+/// An agent beneath another in Aether's tree, as Aether holds it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Descendant {
+    pub agent: AetherAgentId,
+    /// The agent asked about for a direct child, a descendant otherwise.
+    pub parent: AetherAgentId,
+    pub model: ModelRef,
+    /// `None` when its config states none Archon can read.
+    pub effort: Option<Effort>,
+    pub state: DescendantState,
+    /// The task it was given, kept after it ends; `None` before it has one.
+    pub task: Option<AetherTaskId>,
+}
+
+/// A change to a live agent; `None` leaves that part as it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentUpdate {
+    /// Model and effort together: the policy judges the pair that will run.
+    pub choice: Option<ModelChoice>,
+    /// Aether's hard cap in dollars, for an agent whose spawn sent one
+    /// (`SpawnRequest::aether_cost_budget`).
+    pub cost_budget_usd: Option<f64>,
+    pub deadline: Option<Timestamp>,
+}
+
+impl AgentUpdate {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[async_trait]
 pub trait AgentBackend: Send + Sync {
     /// Create and start a stage agent. Safe to retry with the same
@@ -142,8 +237,25 @@ pub trait AgentBackend: Send + Sync {
     /// Aether no longer knows is `false`, not an error.
     async fn is_live(&self, agent: &AetherAgentId) -> Result<bool, ArchonError>;
 
-    /// Cancel an agent and its live descendants.
+    /// Ask Aether to cancel an agent and its live descendants. Aether cancels
+    /// cooperatively: `Ok` means accepted, not that any of them has ended.
     async fn cancel(&self, agent: &AetherAgentId, reason: &str) -> Result<(), ArchonError>;
+
+    /// Change a live agent in place; it keeps its transcript. Implementations
+    /// re-check the model policy. Aether decides when a new model takes over.
+    async fn update_agent(
+        &self,
+        agent: &AetherAgentId,
+        update: AgentUpdate,
+    ) -> Result<(), ArchonError>;
+
+    /// Stop the turn `agent` is in; it then waits for its next message.
+    /// `false` when it was in no turn.
+    async fn interrupt(&self, agent: &AetherAgentId) -> Result<bool, ArchonError>;
+
+    /// Every agent beneath `agent` at any depth, ended ones included; none
+    /// when Aether no longer knows `agent`.
+    async fn descendants(&self, agent: &AetherAgentId) -> Result<Vec<Descendant>, ArchonError>;
 
     /// `None` while the task is still open; the settled outcome otherwise.
     async fn task_outcome(&self, task: &AetherTaskId) -> Result<Option<StageOutcome>, ArchonError>;
@@ -156,11 +268,90 @@ pub trait AgentBackend: Send + Sync {
         content: &str,
         idempotency_key: &str,
     ) -> Result<(), ArchonError>;
+
+    /// How the turn ended in which a kept agent took `message` (§6.7): `None`
+    /// while it works, an `infra` failure when it is gone or said nothing.
+    async fn resumed_outcome(
+        &self,
+        agent: &AetherAgentId,
+        message: &str,
+    ) -> Result<Option<StageOutcome>, ArchonError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::NetworkPolicy::{Allowed, Denied};
+
+    #[test]
+    fn a_resumed_reply_is_a_summary_unless_it_starts_with_a_failure_prefix() {
+        use super::resumed_reply_outcome;
+        use crate::run::StageOutcome;
+        let done = resumed_reply_outcome("  Fixed the null check in src/a.rs; tests pass.\n");
+        let summary = "Fixed the null check in src/a.rs; tests pass.".to_owned();
+        let structured = None;
+        assert_eq!(
+            done,
+            StageOutcome::Completed {
+                summary,
+                structured
+            }
+        );
+        let failed = resumed_reply_outcome("FAILED: the API this needs does not exist");
+        let error = "the API this needs does not exist".to_owned();
+        assert_eq!(
+            failed,
+            StageOutcome::Failed {
+                error,
+                infra: false
+            }
+        );
+        let blocked = resumed_reply_outcome("BLOCKED: needs a deploy key");
+        assert!(blocked.is_operator_blocker(), "{blocked:?}");
+        let escalated = resumed_reply_outcome("ESCALATE: this needs a schema migration first");
+        assert!(
+            matches!(&escalated, StageOutcome::Failed { error, .. } if StageOutcome::ends_run(error)),
+            "{escalated:?}"
+        );
+        let bare = resumed_reply_outcome("FAILED:");
+        assert!(matches!(bare, StageOutcome::Failed { ref error, .. } if !error.is_empty()));
+    }
+
+    /// A resumed agent of the stage whose result archond ships hands the
+    /// ship record in with its message: its task took `structured` once.
+    #[test]
+    fn a_resumed_reply_hands_in_the_object_of_its_last_json_block() {
+        use super::resumed_reply_outcome;
+        use crate::run::StageOutcome;
+        let body = "Shown as:\n```json\n{\"a\": 1}\n```";
+        let record = serde_json::json!({"commit": "c0ffee", "pr": {"body": body}});
+        let reply = format!("Fixed the null check.\n\n```json\n{record}\n```\nThat is all.");
+        let StageOutcome::Completed {
+            summary,
+            structured,
+        } = resumed_reply_outcome(&reply)
+        else {
+            panic!("a reply with a record completes");
+        };
+        assert_eq!(summary, "Fixed the null check.");
+        assert_eq!(structured, Some(record), "fences inside a string are text");
+
+        for plain in [
+            "Fixed it.",
+            "Fixed it.\n```json\nnot json\n```",
+            "```json\n[1]\n```",
+        ] {
+            let StageOutcome::Completed {
+                summary,
+                structured,
+            } = resumed_reply_outcome(plain)
+            else {
+                panic!("{plain} completes");
+            };
+            assert_eq!((summary.as_str(), structured), (plain, None));
+        }
+        let only = resumed_reply_outcome("```json\n{\"a\": 1}\n```");
+        assert!(matches!(only, StageOutcome::Completed { ref summary, .. } if !summary.is_empty()));
+    }
 
     #[test]
     fn the_narrower_network_denies_unless_both_allow() {

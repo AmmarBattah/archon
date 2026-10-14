@@ -2,8 +2,11 @@
 //! agent backend, and a temp git repository carrying a test pipeline.
 #![allow(dead_code)]
 
+pub mod delivery;
 pub mod team;
 pub mod team_worktree;
+
+pub mod initiative;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;
@@ -21,7 +24,8 @@ use archon_core::id::{PipelineRunId, QueueItemId};
 use archon_core::model::{Effort, ModelChoice, ModelPlan};
 use archon_core::notify::{FeedEntry, NotificationKind};
 use archon_core::ports::{
-    AgentBackend, CreatedNode, NetworkPolicy, RunNodeRequest, SpawnRequest, SpawnedAgent,
+    AgentBackend, AgentUpdate, CreatedNode, Descendant, DescendantState, NetworkPolicy,
+    RunNodeRequest, SpawnRequest, SpawnedAgent,
 };
 use archon_core::protocol::{ClientKind, EnqueueRequest, Reply, RepoAdd, RepoRef, Request};
 use archon_core::queue::{QueueItem, QueueState};
@@ -35,6 +39,7 @@ use archon_daemon::triggers::TriggerQueue;
 use archon_daemon::{dispatcher, executor, handlers};
 use archon_lavish::Lavish;
 use archon_queue::Store;
+use archon_queue::store::keys;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, broadcast};
 
@@ -42,6 +47,8 @@ use tokio::sync::{Mutex, Notify, broadcast};
 /// `implement` → `review` (two agents, all must pass, loops once) → `ship`.
 pub const PIPELINE: &str = "wp5-review";
 pub const REPO_NAME: &str = "demo";
+/// The orchestrator [`Harness::orchestrator`] makes its calls as.
+pub const ORCHESTRATOR: &str = "agt_orchestrator";
 pub const MODEL: &str = "claude-code/claude-sonnet-5";
 pub const REVIEW_MODEL: &str = "codex/gpt-5";
 
@@ -74,18 +81,45 @@ prompt = "ship.md"
 timeout_minutes = 90
 "#;
 
+/// A repository pipeline shaped like 1.0's `default-pr-review`: one reviewer
+/// with up to two fix loops, then archond ships what `implement` records.
+pub const REVIEWED: &str = "reviewed";
+pub const REVIEWED_TOML: &str = r#"[pipeline]
+name = "reviewed"
+description = "implement, one review, then ship"
+version = 1
+workspace = "worktree"
+requires_repo = true
+
+[pipeline.ship]
+stage = "implement"
+
+[[stage]]
+id = "implement"
+kind = "work"
+prompt = "implement.md"
+timeout_minutes = 120
+
+[[stage]]
+id = "review"
+kind = "review"
+prompt = "review.md"
+gate = "all_pass"
+timeout_minutes = 60
+on_fail = { goto = "implement", max_loops = 2 }
+"#;
+
 const PROMPTS: [(&str, &str); 3] = [
     (
         "implement.md",
-        include_str!("../../../../pipelines/default-pr-review/implement.md"),
+        // 1.0's `default-pr-review` prompts, which these tests were written for.
+        include_str!("implement.md"),
     ),
-    (
-        "review.md",
-        include_str!("../../../../pipelines/default-pr-review/review.md"),
-    ),
+    ("review.md", include_str!("review.md")),
     (
         "ship.md",
-        include_str!("../../../../pipelines/default-pr-review/ship.md"),
+        // A pipeline of the user's own may still end in a ship agent.
+        include_str!("ship.md"),
     ),
 ];
 
@@ -142,9 +176,12 @@ impl Harness {
             std::fs::write(
                 &config.github.binary,
                 r#"#!/bin/sh
-[ "$1 $2 $3 $5 $6 $7 $8 $9" = "pr list --head --state open --limit 2 --json" ] || exit 2
-[ "$4" = "$(git branch --show-current)" ] || exit 3
-printf '[{"url":"https://github.com/o/r/pull/1","number":1,"headRefName":"%s","state":"OPEN"}]' "$4"
+if [ "$1 $2" = "pr edit" ]; then exit 0; fi
+[ "$1 $2" = "pr list" ] || exit 2
+# GitHub lists a repository's open pull requests as none, a branch's as one.
+if [ "$3 $4 $5 $6 $7" = "--state open --limit 1000 --json" ]; then printf '[]'; exit 0; fi
+[ "$3 $5 $7 $8 $9" = "--head --state --limit 20 --json" ] || exit 2
+printf '[{"url":"https://github.com/o/r/pull/1","number":1,"headRefName":"%s","state":"OPEN","baseRefName":"main"}]' "$4"
 "#,
             )
             .unwrap();
@@ -188,6 +225,25 @@ printf '[{"url":"https://github.com/o/r/pull/1","number":1,"headRefName":"%s","s
 
     pub async fn cli(&self, request: Request) -> Result<Reply, ArchonError> {
         handlers::handle(&self.ctx, ClientKind::ArchonCli, request).await
+    }
+
+    /// `request` as `archon mcp` forwards it for the orchestrator, which is
+    /// [`ORCHESTRATOR`] unless the store already names another.
+    pub async fn orchestrator(&self, request: Request) -> Result<Reply, ArchonError> {
+        let caller = {
+            let mut store = self.ctx.store.lock().await;
+            if store.kv_get(keys::ORCHESTRATOR_AGENT)?.is_none() {
+                store.kv_set(keys::ORCHESTRATOR_AGENT, ORCHESTRATOR)?;
+            }
+            store
+                .kv_get(keys::ORCHESTRATOR_AGENT)?
+                .expect("just stored")
+        };
+        let request = Request::ForAgent {
+            caller: AetherAgentId::parse(&caller)?,
+            request: Box::new(request),
+        };
+        handlers::handle(&self.ctx, ClientKind::ArchonMcp, request).await
     }
 
     /// Enqueue `title` on the test pipeline with [`plan`].
@@ -290,6 +346,9 @@ printf '[{"url":"https://github.com/o/r/pull/1","number":1,"headRefName":"%s","s
     }
 
     pub async fn dispatch(&self) {
+        executor::coordination::reconcile(&self.ctx)
+            .await
+            .expect("coordination pass");
         dispatcher::dispatch_once(&self.ctx)
             .await
             .expect("dispatch pass");
@@ -410,11 +469,14 @@ pub fn context(
         backend,
         feed,
         dispatch: dispatch.clone(),
+        coordination: Default::default(),
         runs: Mutex::new(RunTable::default()),
         replies: Mutex::new(ReplyTracker::default()),
         answering: Mutex::new(()),
         report_files: Arc::new(Mutex::new(())),
         triggers: TriggerQueue::default(),
+        mirrors: archon_daemon::mirror::MirrorQueue::default(),
+        spawn_recorded: Notify::new(),
         caps_override: Mutex::new(None),
         lavish,
         supervisor: archon_daemon::supervisor::Supervisor::default(),
@@ -554,6 +616,11 @@ struct FakeState {
     lost_replies: u32,
     outcomes: BTreeMap<AetherTaskId, StageOutcome>,
     cancelled: Vec<AetherAgentId>,
+    /// Every accepted `update_agent`, in order.
+    updates: Vec<(AetherAgentId, AgentUpdate)>,
+    update_failures: VecDeque<ArchonError>,
+    /// Every `interrupt` call, in order.
+    interrupts: Vec<AetherAgentId>,
     next: u32,
     /// The request each key was created with; a replay must repeat it.
     recorded: BTreeMap<String, SpawnRequest>,
@@ -573,6 +640,15 @@ struct FakeState {
     /// Every `send_message` call's key, including repeats and refused ones.
     message_calls: Vec<String>,
     message_failures: VecDeque<ArchonError>,
+    /// Agents a stage agent delegated to, as Aether holds them.
+    delegated: Vec<Descendant>,
+    descendant_failures: VecDeque<ArchonError>,
+    /// Every `descendants` call, in order.
+    descendant_checks: Vec<AetherAgentId>,
+    /// What a kept agent said to end the turn it was resumed in.
+    answers: BTreeMap<AetherAgentId, StageOutcome>,
+    /// Spawns whose objective holds the text wait for the gate to open.
+    stalls: Vec<(String, Arc<tokio::sync::Semaphore>)>,
 }
 
 impl FakeState {
@@ -593,6 +669,14 @@ impl FakeState {
 
     fn is_node(&self, agent: &AetherAgentId) -> bool {
         self.node_by_key.values().any(|n| n.agent == *agent)
+    }
+
+    /// Created long-lived: it outlives its task until it is cancelled.
+    fn is_kept(&self, agent: &AetherAgentId) -> bool {
+        let kept = |key: &String| self.recorded[key].keep;
+        self.by_key
+            .iter()
+            .any(|(key, s)| s.agent == *agent && kept(key))
     }
 
     /// The network a node's request stated.
@@ -662,9 +746,30 @@ impl FakeBackend {
         self.state().cancelled.clone()
     }
 
+    /// The next `update_agent` calls fail with these errors, in order.
+    pub fn fail_next_update(&self, error: ArchonError) {
+        self.state().update_failures.push_back(error);
+    }
+
+    /// Every update a live agent took, oldest first.
+    pub fn updates(&self) -> Vec<(AetherAgentId, AgentUpdate)> {
+        self.state().updates.clone()
+    }
+
+    /// Every agent `interrupt` was asked to stop, in order.
+    pub fn interrupts(&self) -> Vec<AetherAgentId> {
+        self.state().interrupts.clone()
+    }
+
     /// `task_outcome` reports this for `task` from now on.
     pub fn settle_task(&self, task: &AetherTaskId, outcome: StageOutcome) {
         self.state().outcomes.insert(task.clone(), outcome);
+    }
+
+    /// The kept `agent` ended the turn it was resumed in with `outcome`;
+    /// `resumed_outcome` reports it until the agent is resumed again.
+    pub fn answer(&self, agent: &AetherAgentId, outcome: StageOutcome) {
+        self.state().answers.insert(agent.clone(), outcome);
     }
 
     /// The next `create_run_node` calls fail with these errors, in order.
@@ -755,6 +860,15 @@ impl FakeBackend {
             .collect()
     }
 
+    /// What the kept agent of stage run `stage` was resumed with.
+    pub fn resumed_with(&self, stage: &StageRun) -> String {
+        let state = self.state();
+        let told = |(key, _, _): &&(String, AetherAgentId, String)| key == stage.id.as_str();
+        let (_, to, content) = state.delivered.iter().find(told).expect("a resume message");
+        assert_eq!(Some(to), stage.aether_agent.as_ref(), "sent to its agent");
+        content.clone()
+    }
+
     /// Every `send_message` call's idempotency key, including repeats.
     pub fn message_calls(&self) -> Vec<String> {
         self.state().message_calls.clone()
@@ -765,11 +879,84 @@ impl FakeBackend {
         let held = self.state().in_turn.remove(agent);
         assert!(held, "end_turn ends a held turn: {agent}");
     }
+
+    /// `parent` delegated to a new agent running `model`, live until
+    /// `end_delegated`: like Aether, a cancel of its parent only asks it to end.
+    pub fn delegate(&self, parent: &AetherAgentId, model: &str) -> AetherAgentId {
+        let mut state = self.state();
+        let known = state.knows(parent) || state.delegated.iter().any(|d| d.agent == *parent);
+        assert!(known, "only a created agent delegates: {parent}");
+        let n = state.delegated.len() + 1;
+        let agent = AetherAgentId::parse(&format!("agt_child{n:04}")).expect("agent id");
+        let task = AetherTaskId::parse(&format!("tsk_child{n:04}")).expect("task id");
+        state.delegated.push(Descendant {
+            agent: agent.clone(),
+            parent: parent.clone(),
+            model: model.parse().expect("model"),
+            effort: Some(Effort::Medium),
+            state: DescendantState::Live,
+            task: Some(task),
+        });
+        agent
+    }
+
+    /// The delegated `agent` completed its task with `structured` as its
+    /// result, as a reviewer returns its verdict.
+    pub fn complete_delegated(&self, agent: &AetherAgentId, structured: serde_json::Value) {
+        let mut state = self.state();
+        let delegated = state.delegated.iter_mut().find(|d| d.agent == *agent);
+        let delegated = delegated.expect("a delegated agent");
+        delegated.state = DescendantState::Completed;
+        let task = delegated
+            .task
+            .clone()
+            .expect("a delegated agent has a task");
+        let outcome = StageOutcome::Completed {
+            summary: "reviewed".into(),
+            structured: Some(structured),
+        };
+        state.outcomes.insert(task, outcome);
+    }
+
+    /// The delegated agent ended as `ended`.
+    pub fn end_delegated(&self, agent: &AetherAgentId, ended: DescendantState) {
+        assert_ne!(ended, DescendantState::Live, "an ended agent is not live");
+        let mut state = self.state();
+        let delegated = state.delegated.iter_mut().find(|d| d.agent == *agent);
+        delegated.expect("a delegated agent").state = ended;
+    }
+
+    /// The next `descendants` calls fail with these errors, in order.
+    pub fn fail_next_descendants(&self, error: ArchonError) {
+        self.state().descendant_failures.push_back(error);
+    }
+
+    /// Hold every spawn whose objective contains `text` until the returned
+    /// gate gets a permit.
+    pub fn stall_spawns(&self, text: &str) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        self.state().stalls.push((text.to_owned(), gate.clone()));
+        gate
+    }
+
+    /// Every agent `descendants` was asked about, in order.
+    pub fn descendant_checks(&self) -> Vec<AetherAgentId> {
+        self.state().descendant_checks.clone()
+    }
 }
 
 #[async_trait]
 impl AgentBackend for FakeBackend {
     async fn spawn(&self, request: SpawnRequest) -> Result<SpawnedAgent, ArchonError> {
+        let stalled = self.state().stalls.iter().find_map(|(text, gate)| {
+            request
+                .objective
+                .contains(text.as_str())
+                .then(|| gate.clone())
+        });
+        if let Some(gate) = stalled {
+            let _open = gate.acquire().await.expect("a stall gate is never closed");
+        }
         let mut state = self.state();
         state.requests.push(request.clone());
         if let Some(error) = state.failures.pop_front() {
@@ -858,7 +1045,7 @@ impl AgentBackend for FakeBackend {
         if state.dead.contains(agent) {
             return Ok(false);
         }
-        Ok(state.is_node(agent) || state.in_turn.contains(agent))
+        Ok(state.is_node(agent) || state.in_turn.contains(agent) || state.is_kept(agent))
     }
 
     async fn cancel(&self, agent: &AetherAgentId, _reason: &str) -> Result<(), ArchonError> {
@@ -872,12 +1059,83 @@ impl AgentBackend for FakeBackend {
         Ok(())
     }
 
+    async fn update_agent(
+        &self,
+        agent: &AetherAgentId,
+        update: AgentUpdate,
+    ) -> Result<(), ArchonError> {
+        assert!(!update.is_empty(), "an update changes something");
+        let mut state = self.state();
+        if let Some(error) = state.update_failures.pop_front() {
+            return Err(error);
+        }
+        if !state.knows(agent) || state.dead.contains(agent) {
+            return Err(ArchonError::NotFound(format!(
+                "aether: no live agent {agent}"
+            )));
+        }
+        state.updates.push((agent.clone(), update));
+        Ok(())
+    }
+
+    /// Ends a held turn, as Aether's interrupt does.
+    async fn interrupt(&self, agent: &AetherAgentId) -> Result<bool, ArchonError> {
+        let mut state = self.state();
+        state.interrupts.push(agent.clone());
+        if !state.knows(agent) {
+            return Err(ArchonError::NotFound(format!("aether: no agent {agent}")));
+        }
+        Ok(state.in_turn.remove(agent))
+    }
+
+    async fn descendants(&self, agent: &AetherAgentId) -> Result<Vec<Descendant>, ArchonError> {
+        let mut state = self.state();
+        state.descendant_checks.push(agent.clone());
+        if let Some(error) = state.descendant_failures.pop_front() {
+            return Err(error);
+        }
+        let mut found: Vec<Descendant> = Vec::new();
+        let mut parents = vec![agent.clone()];
+        while let Some(parent) = parents.pop() {
+            for child in state.delegated.iter().filter(|d| d.parent == parent) {
+                parents.push(child.agent.clone());
+                found.push(child.clone());
+            }
+        }
+        Ok(found)
+    }
+
     async fn task_outcome(&self, task: &AetherTaskId) -> Result<Option<StageOutcome>, ArchonError> {
         let mut state = self.state();
         if let Some(error) = state.outcome_failures.pop_front() {
             return Err(error);
         }
         Ok(state.outcomes.get(task).cloned())
+    }
+
+    async fn resumed_outcome(
+        &self,
+        agent: &AetherAgentId,
+        message: &str,
+    ) -> Result<Option<StageOutcome>, ArchonError> {
+        let mut state = self.state();
+        if let Some(error) = state.outcome_failures.pop_front() {
+            return Err(error);
+        }
+        let told = |(_, to, text): &(String, AetherAgentId, String)| to == agent && text == message;
+        assert!(
+            state.delivered.iter().any(told),
+            "asked about a message never sent"
+        );
+        if state.dead.contains(agent) {
+            return Ok(Some(StageOutcome::Failed {
+                error:
+                    "the agent kept for this stage could not answer: Aether holds it as cancelled"
+                        .into(),
+                infra: true,
+            }));
+        }
+        Ok(state.answers.get(agent).cloned())
     }
 
     async fn send_message(
@@ -891,7 +1149,8 @@ impl AgentBackend for FakeBackend {
         if let Some(error) = state.message_failures.pop_front() {
             return Err(error);
         }
-        if !state.knows(to) {
+        let delegated = state.delegated.iter().any(|d| d.agent == *to);
+        if !state.knows(to) && !delegated {
             return Err(ArchonError::NotFound(format!("aether: no agent {to}")));
         }
         let seen = state
@@ -906,6 +1165,8 @@ impl AgentBackend for FakeBackend {
             None => {
                 let delivery = (idempotency_key.to_owned(), to.clone(), content.to_owned());
                 state.delivered.push(delivery);
+                // A new message starts a new turn: the last answer is history.
+                state.answers.remove(to);
                 Ok(())
             }
         }

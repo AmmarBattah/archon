@@ -31,48 +31,15 @@ macro_rules! builtin {
 }
 
 pub const BUILTINS: &[BuiltinPipeline] = &[
-    builtin!("quick-pr", ["implement.md", "ship.md"]),
-    builtin!(
-        "default-pr-review",
-        ["implement.md", "review.md", "ship.md"]
-    ),
-    builtin!("bugfix", ["reproduce.md", "fix.md", "review.md", "ship.md"]),
-    builtin!("docs", ["write.md", "verify.md", "ship.md"]),
-    builtin!(
-        "dependency-upgrade",
-        ["survey.md", "upgrade.md", "verify.md", "ship.md"]
-    ),
+    builtin!("adaptive", ["build.md"]),
+    builtin!("direct", ["implement.md"]),
     builtin!(
         "refactor",
-        [
-            "baseline.md",
-            "refactor.md",
-            "verify.md",
-            "review.md",
-            "ship.md"
-        ]
-    ),
-    builtin!(
-        "strict-pr-review",
-        ["implement.md", "test.md", "review.md", "ship.md"]
-    ),
-    builtin!(
-        "team-pr",
-        ["plan.md", "build.md", "e2e.md", "review.md", "ship.md"]
+        ["baseline.md", "refactor.md", "verify.md", "review.md"]
     ),
     builtin!(
         "performance",
-        [
-            "measure.md",
-            "optimize.md",
-            "verify.md",
-            "review.md",
-            "ship.md"
-        ]
-    ),
-    builtin!(
-        "test-coverage",
-        ["analyze.md", "write.md", "verify.md", "ship.md"]
+        ["measure.md", "optimize.md", "verify.md", "review.md"]
     ),
     builtin!("agent-testing", ["plan.md", "exercise.md", "report.md"]),
     builtin!("code-audit", ["scope.md", "audit.md", "report.md"]),
@@ -81,3 +48,29 @@ pub const BUILTINS: &[BuiltinPipeline] = &[
     builtin!("errand", ["errand.md"]),
     builtin!("design-doc", ["research.md", "critique.md", "report.md"]),
 ];
+
+/// The pipeline an enqueue that names none runs: it takes every review level.
+pub const DEFAULT_PIPELINE: &str = "direct";
+
+/// Built-ins 1.1.0 removed, each with what replaces it.
+pub const RETIRED: &[(&str, &str)] = &[
+    ("quick-pr", "direct with review none"),
+    ("default-pr-review", "direct with review standard"),
+    ("strict-pr-review", "direct with review strict"),
+    (
+        "team-pr",
+        "adaptive, or docs/examples/pipelines/team-pr as a user pipeline",
+    ),
+    ("bugfix", "direct"),
+    ("docs", "direct"),
+    ("test-coverage", "direct"),
+    ("dependency-upgrade", "direct"),
+];
+
+/// What replaces `name` when it is a built-in 1.1.0 removed.
+pub fn retired(name: &str) -> Option<&'static str> {
+    RETIRED
+        .iter()
+        .find(|(retired, _)| *retired == name)
+        .map(|(_, replacement)| *replacement)
+}

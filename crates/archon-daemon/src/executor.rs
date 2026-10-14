@@ -7,13 +7,25 @@
 //! across an Aether call. Work that needs Aether or git after a state change
 //! is returned as a `FollowUp` and run once the run table is released.
 
+pub mod coordination;
+mod dependencies;
+mod descendants;
 mod finish;
 pub(crate) mod frozen;
 mod gate_news;
 mod gates;
+pub(crate) mod gh;
+pub(crate) mod initiative_ship;
+mod lanes;
 mod naming;
 mod pages;
+pub mod pull_requests;
 mod recover;
+pub(crate) mod repo_identity;
+pub(crate) mod restack;
+mod resume;
+mod review;
+mod revive;
 mod roster;
 mod run_node;
 mod settle;
@@ -21,6 +33,7 @@ mod ship;
 mod siblings;
 mod spawn;
 mod start;
+pub(crate) mod steer;
 mod sweep;
 mod team;
 
@@ -33,16 +46,19 @@ use archon_core::id::{PipelineRunId, QueueItemId, StageRunId};
 use archon_core::queue::QueueItem;
 use archon_core::run::{GateDecision, OperatorGate, StageOutcome};
 use archon_pipeline::team::MergePlan;
-use archon_pipeline::{RunDriver, SpawnPlan};
+use archon_pipeline::{RunDriver, ShipPlan, SpawnPlan};
 
 use crate::context::DaemonContext;
 
 pub(crate) use finish::notify;
 pub(crate) use recover::prune_finished_run_vars;
+pub(crate) use revive::revived;
 pub(crate) use roster::prune_settled_rosters;
 pub(crate) use run_node::recover_message_node;
 pub(crate) use run_node::{is_node_agent, node_run, prune_retired_node_agents};
+pub(crate) use ship::prune_finished_ships;
 pub(crate) use spawn::{load_spawn, prune_settled_requests, runs_awaiting_spawn};
+pub(crate) use start::held_by_stack;
 pub(crate) use sweep::sweep_live_stages;
 pub(crate) use team::prune_finished_merges;
 
@@ -62,6 +78,20 @@ pub struct RunTable {
     pub merges: BTreeMap<PipelineRunId, MergePlan>,
     /// Runs whose team merge is running git right now.
     pub merging: BTreeSet<PipelineRunId>,
+    /// Deliveries drivers asked archond for, not yet recorded.
+    pub ships: BTreeMap<PipelineRunId, ShipPlan>,
+    /// Runs whose delivery is running git or `gh` right now.
+    pub shipping: BTreeSet<PipelineRunId>,
+    /// Deliveries that failed in a way another try may pass, and their wait.
+    pub ship_retries: BTreeMap<PipelineRunId, ShipRetry>,
+}
+
+/// The failed tries of one run's delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShipRetry {
+    pub failures: u32,
+    /// The next try waits for this.
+    pub not_before: std::time::Instant,
 }
 
 /// The failed `create_agent` calls of one spawning stage run, by kind.
@@ -77,6 +107,7 @@ pub struct SpawnErrors {
 /// a snapshot, whose run ended however it did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Cleanup {
+    pub item: QueueItemId,
     pub repo_path: PathBuf,
     pub worktree: PathBuf,
     /// A `repo-readonly` run's snapshot, removed with `--force`.
@@ -104,6 +135,8 @@ pub(crate) struct FollowUp {
     pub cancel_agents: Vec<(AetherAgentId, String)>,
     /// Team roles cancelled for a failed sibling whose agent stop is owed.
     pub sibling_stops: Vec<StageRunId>,
+    /// Settled stage runs of delegating agents whose descendants to stop.
+    pub descendant_stops: Vec<StageRunId>,
     /// Runs whose team roster may be owed to their running roles.
     pub roster: Vec<PipelineRunId>,
     pub cleanup: Vec<Cleanup>,
@@ -113,6 +146,14 @@ pub(crate) struct FollowUp {
     pub publish: Vec<StageRunId>,
     /// Runs whose queued team merge to run.
     pub merge: Vec<PipelineRunId>,
+    /// Runs whose queued delivery to make.
+    pub ship: Vec<PipelineRunId>,
+    /// Attempts resumed on a kept agent, which may have answered (§6.7).
+    pub resumed: Vec<StageRunId>,
+    /// Kept agents to park or end now that an attempt of theirs settled.
+    pub kept: Vec<resume::Kept>,
+    /// Live stage runs a steer still owes a patch or a message (§6.6).
+    pub steers: Vec<StageRunId>,
     /// Capacity or pending spawns changed: wake the dispatcher.
     pub poke: bool,
 }
@@ -133,11 +174,16 @@ impl FollowUp {
         self.retire.extend(other.retire);
         self.cancel_agents.extend(other.cancel_agents);
         self.sibling_stops.extend(other.sibling_stops);
+        self.descendant_stops.extend(other.descendant_stops);
         self.roster.extend(other.roster);
         self.cleanup.extend(other.cleanup);
         self.gates.extend(other.gates);
         self.publish.extend(other.publish);
         self.merge.extend(other.merge);
+        self.ship.extend(other.ship);
+        self.resumed.extend(other.resumed);
+        self.kept.extend(other.kept);
+        self.steers.extend(other.steers);
         self.poke |= other.poke;
     }
 
@@ -149,11 +195,16 @@ impl FollowUp {
             && self.retire.is_empty()
             && self.cancel_agents.is_empty()
             && self.sibling_stops.is_empty()
+            && self.descendant_stops.is_empty()
             && self.roster.is_empty()
             && self.cleanup.is_empty()
             && self.gates.is_empty()
             && self.publish.is_empty()
             && self.merge.is_empty()
+            && self.ship.is_empty()
+            && self.resumed.is_empty()
+            && self.kept.is_empty()
+            && self.steers.is_empty()
     }
 }
 
@@ -164,6 +215,57 @@ impl FollowUp {
 pub async fn start_item(ctx: &DaemonContext, item: &QueueItemId) -> Result<(), ArchonError> {
     let follow = start::start_item(ctx, item).await?;
     run_follow_up(ctx, follow).await
+}
+
+/// Start `items` as [`start_item`] does, each repository's git work in order and
+/// `lanes::MAX_LANES` repositories at once; a failure stops no other, the first is returned.
+pub async fn start_items(ctx: &DaemonContext, items: &[QueueItemId]) -> Result<(), ArchonError> {
+    let by_repo = items_by_repository(ctx, items).await?;
+    let started = lanes::run(by_repo, |id| async move {
+        (id, start::start_item(ctx, id).await)
+    })
+    .await;
+    assert_eq!(started.len(), items.len(), "every item is started once");
+    let mut follow = FollowUp::default();
+    let mut first_error = None;
+    for (id, result) in started {
+        match result {
+            Ok(more) => follow.merge(more),
+            Err(error) => {
+                tracing::error!(item = %id, %error, "starting item failed");
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    let followed = run_follow_up(ctx, follow).await;
+    match (first_error, followed) {
+        (Some(error), Err(later)) => {
+            tracing::error!(error = %later, "following up started items failed");
+            Err(error)
+        }
+        (Some(error), Ok(())) => Err(error),
+        (None, followed) => followed,
+    }
+}
+
+/// `items` in lanes by repository; one without a repository runs no git
+/// and has a lane of its own.
+async fn items_by_repository<'a>(
+    ctx: &DaemonContext,
+    items: &'a [QueueItemId],
+) -> Result<BTreeMap<String, Vec<&'a QueueItemId>>, ArchonError> {
+    let store = ctx.store.lock().await;
+    let mut keyed = Vec::with_capacity(items.len());
+    for id in items {
+        let lane = match store.item(id)?.repo {
+            Some(repo) => repo.as_str().to_owned(),
+            None => id.as_str().to_owned(),
+        };
+        keyed.push((lane, id));
+    }
+    let lanes = lanes::group(keyed);
+    assert_eq!(lanes.values().map(Vec::len).sum::<usize>(), items.len());
+    Ok(lanes)
 }
 
 /// Start up to `slots` pending spawns of `run` (dispatcher-admitted).
@@ -206,6 +308,17 @@ pub async fn stage_settled(
         return Ok(());
     };
     let follow = settle::settle(ctx, &stage.id, outcome).await?;
+    run_follow_up(ctx, follow).await
+}
+
+/// Called by the event pump when an agent's turn ended: an attempt resumed
+/// on a kept agent settles on what it said (§6.7); any other is left alone.
+pub async fn turn_ended(ctx: &DaemonContext, agent: &AetherAgentId) -> Result<(), ArchonError> {
+    let stage = ctx.store.lock().await.stage_run_by_agent(agent)?;
+    let Some(stage) = stage.filter(|s| !s.state.is_terminal() && s.aether_task.is_none()) else {
+        return Ok(());
+    };
+    let follow = resume::check(ctx, &stage.id).await?;
     run_follow_up(ctx, follow).await
 }
 
@@ -339,68 +452,173 @@ pub(crate) async fn run_follow_up(
     first_error.map_or(Ok(()), Err)
 }
 
-async fn follow_up_round(ctx: &DaemonContext, follow: FollowUp) -> (FollowUp, Option<ArchonError>) {
-    let mut next = FollowUp::default();
-    let mut first_error = None;
-    let mut record = |result: Result<FollowUp, ArchonError>| match result {
-        Ok(more) => next.merge(more),
-        Err(error) if first_error.is_none() => first_error = Some(error),
-        Err(error) => tracing::error!(%error, "follow-up failed"),
-    };
-    match issuable(ctx, follow.issue).await {
-        Ok(issue) => {
-            for id in issue {
-                record(spawn::issue(ctx, &id).await);
-            }
+/// What one round of follow-ups leaves: the work it found and its first
+/// error. Later errors are logged, so every step is still attempted.
+#[derive(Default)]
+struct Round {
+    next: FollowUp,
+    first_error: Option<ArchonError>,
+}
+
+impl Round {
+    fn record(&mut self, result: Result<FollowUp, ArchonError>) {
+        match result {
+            Ok(more) => self.next.merge(more),
+            Err(error) if self.first_error.is_none() => self.first_error = Some(error),
+            Err(error) => tracing::error!(%error, "follow-up failed"),
         }
-        Err(error) => record(Err(error)),
     }
-    for (stage, task) in follow.check {
-        record(sweep::check_outcome(ctx, &stage, &task).await);
+}
+
+async fn follow_up_round(
+    ctx: &DaemonContext,
+    mut follow: FollowUp,
+) -> (FollowUp, Option<ArchonError>) {
+    let mut round = Round::default();
+    stop_and_spawn(ctx, &mut round, &mut follow).await;
+    deliver_and_tidy(ctx, &mut round, follow).await;
+    (round.next, round.first_error)
+}
+
+/// The agents a round ends, starts and asks about, taken out of `follow`.
+async fn stop_and_spawn(ctx: &DaemonContext, round: &mut Round, follow: &mut FollowUp) {
+    use std::mem::take;
+    // First: a spawn of the same run waits for these.
+    for stage in dedup(take(&mut follow.descendant_stops)) {
+        round.record(descendants::stop(ctx, &stage).await);
     }
-    for run in dedup(follow.stop) {
-        record(sweep::stop_run(ctx, &run).await);
+    match issuable(ctx, take(&mut follow.issue)).await {
+        Ok(issue) => issue_by_run(ctx, round, issue).await,
+        Err(error) => round.record(Err(error)),
     }
-    for stage in dedup(follow.time_out) {
-        record(sweep::time_out(ctx, &stage).await);
+    for (stage, task) in take(&mut follow.check) {
+        round.record(sweep::check_outcome(ctx, &stage, &task).await);
     }
-    for run in dedup(follow.retire) {
-        record(
-            run_node::retire(ctx, &run)
-                .await
-                .map(|()| FollowUp::default()),
-        );
+    for run in dedup(take(&mut follow.stop)) {
+        round.record(sweep::stop_run(ctx, &run).await);
     }
-    for (agent, reason) in follow.cancel_agents {
-        record(sweep::cancel_stray(ctx, &agent, &reason).await);
+    for stage in dedup(take(&mut follow.time_out)) {
+        round.record(sweep::time_out(ctx, &stage).await);
     }
-    for stage in dedup(follow.sibling_stops) {
-        record(siblings::stop(ctx, &stage).await);
+    for run in dedup(take(&mut follow.retire)) {
+        let retired = run_node::retire(ctx, &run).await;
+        round.record(retired.map(|()| FollowUp::default()));
+    }
+    for (agent, reason) in take(&mut follow.cancel_agents) {
+        round.record(sweep::cancel_stray(ctx, &agent, &reason).await);
+    }
+    for stage in dedup(take(&mut follow.sibling_stops)) {
+        round.record(siblings::stop(ctx, &stage).await);
+    }
+}
+
+/// What a round owes once its stops and spawns are made: steers, rosters,
+/// gates, pages, merges, kept agents and the worktrees of ended runs.
+async fn deliver_and_tidy(ctx: &DaemonContext, round: &mut Round, follow: FollowUp) {
+    assert!(
+        follow.descendant_stops.is_empty() && follow.issue.is_empty(),
+        "stops and spawns are made first"
+    );
+    assert!(
+        follow.stop.is_empty() && follow.sibling_stops.is_empty(),
+        "stops and spawns are made first"
+    );
+    for stage in dedup(follow.steers) {
+        round.record(steer::deliver(ctx, &stage).await);
     }
     for run in dedup(follow.roster) {
-        record(roster::deliver(ctx, &run).await);
+        round.record(roster::deliver(ctx, &run).await);
     }
     for key in dedup(follow.gates) {
-        record(gates::announce(ctx, &key).await);
+        round.record(gates::announce(ctx, &key).await);
     }
     for stage in dedup(follow.publish) {
-        record(pages::publish_stage(ctx, &stage).await);
+        round.record(pages::publish_stage(ctx, &stage).await);
     }
     for run in dedup(follow.merge) {
-        record(team::merge(ctx, &run).await);
+        round.record(team::merge(ctx, &run).await);
     }
-    for cleanup in follow.cleanup {
-        let when = match cleanup.snapshot {
-            true => "after its run ended",
-            false => "after its run succeeded",
+    for kept in dedup(follow.kept) {
+        round.record(resume::settle_kept(ctx, kept).await);
+    }
+    for stage in dedup(follow.resumed) {
+        round.record(resume::check(ctx, &stage).await);
+    }
+    let ships = runs_by_repository(ctx, round, dedup(follow.ship)).await;
+    for shipped in lanes::run(ships, |run| async move { ship::deliver(ctx, &run).await }).await {
+        round.record(shipped);
+    }
+    let cleanups = lanes::group(follow.cleanup.into_iter().map(|c| (c.repo_path.clone(), c)));
+    for removed in lanes::run(cleanups, |cleanup| remove_ended_worktree(ctx, cleanup)).await {
+        round.record(removed);
+    }
+}
+
+/// Issue `spawns`: one run's in order, as its first may create the run's
+/// node, and up to `lanes::MAX_LANES` runs at once.
+async fn issue_by_run(ctx: &DaemonContext, round: &mut Round, spawns: BTreeSet<StageRunId>) {
+    let by_run = {
+        let store = ctx.store.lock().await;
+        let mut keyed = Vec::with_capacity(spawns.len());
+        for id in spawns {
+            match store.stage_run(&id) {
+                Ok(stage) => keyed.push((stage.run, id)),
+                Err(error) => round.record(Err(error)),
+            }
+        }
+        lanes::group(keyed)
+    };
+    for issued in lanes::run(by_run, |id| async move { spawn::issue(ctx, &id).await }).await {
+        round.record(issued);
+    }
+}
+
+/// `runs` in lanes by repository: one repository's deliveries go one at a
+/// time, so its remote and GitHub see one push or pull request at once.
+async fn runs_by_repository(
+    ctx: &DaemonContext,
+    round: &mut Round,
+    runs: BTreeSet<PipelineRunId>,
+) -> BTreeMap<String, Vec<PipelineRunId>> {
+    let store = ctx.store.lock().await;
+    let mut keyed = Vec::with_capacity(runs.len());
+    for run in runs {
+        let repo = store.run(&run).and_then(|r| store.item(&r.item));
+        match repo.map(|item| item.repo) {
+            Ok(Some(repo)) => keyed.push((repo.as_str().to_owned(), run)),
+            Ok(None) => keyed.push((run.as_str().to_owned(), run)),
+            Err(error) => round.record(Err(error)),
+        }
+    }
+    lanes::group(keyed)
+}
+
+/// Remove the worktree a run left behind; nothing follows from it.
+async fn remove_ended_worktree(
+    ctx: &DaemonContext,
+    cleanup: Cleanup,
+) -> Result<FollowUp, ArchonError> {
+    let mark = {
+        let _table = ctx.runs.lock().await;
+        let store = ctx.store.lock().await;
+        if !store.item(&cleanup.item)?.state.is_terminal()
+            || store.has_pending_stack_fix(&cleanup.item)?
+        {
+            return Ok(FollowUp::default());
+        }
+        let Some(mark) = ctx.collecting.mark(cleanup.item.clone()) else {
+            return Ok(FollowUp::default());
         };
-        record(
-            finish::remove_worktree(ctx, cleanup, when)
-                .await
-                .map(|()| FollowUp::default()),
-        );
-    }
-    (next, first_error)
+        mark
+    };
+    assert!(ctx.collecting.contains(&cleanup.item));
+    assert!(cleanup.worktree.starts_with(&ctx.paths.worktrees));
+    let when = match cleanup.snapshot {
+        true => "after its run ended",
+        false => "after its run succeeded",
+    };
+    finish::remove_worktree(ctx, cleanup, when, Some(mark)).await?;
+    Ok(FollowUp::default())
 }
 
 /// The spawns to issue now. While dispatch is held for disk space only those

@@ -44,6 +44,8 @@ pub struct TuiArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Inspect, record and manage learned advice.
+    Lessons(crate::cmd::lessons::LessonsArgs),
     /// Open the quiet line chat with the orchestrator.
     Chat {
         /// Also show progress notifications.
@@ -128,6 +130,11 @@ pub enum Command {
     /// Inspect and change queue items and runtime caps.
     #[command(subcommand)]
     Queue(QueueCommand),
+    /// Coordinated requests across repositories.
+    Initiatives {
+        #[command(subcommand)]
+        command: Option<InitiativeCommand>,
+    },
     /// List and validate pipelines.
     #[command(subcommand)]
     Pipelines(PipelineCommand),
@@ -249,7 +256,8 @@ pub enum RepoCommand {
         /// The repository's name or repo_… id.
         repo: String,
     },
-    /// Change a repository's settings.
+    /// Change a repository's settings and record its git identity again;
+    /// with no option, only the identity.
     Set {
         /// The repository's name or repo_… id.
         repo: String,
@@ -487,8 +495,8 @@ pub enum QueueCommand {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Queue a failed or cancelled item again. Its new run reuses the
-    /// item's worktree and branch unless `--fresh`.
+    /// Queue a finished item again, in its worktree and branch unless `--fresh`;
+    /// a succeeded one delivers into its pull request and corrects the run.
     Retry {
         /// The item's qi_… id, or enough of its start to name one item.
         item: String,
@@ -504,6 +512,12 @@ pub enum QueueCommand {
         #[arg(long, value_name = "TEXT")]
         append: Option<String>,
     },
+    /// Change an item without cancelling it: its brief, a stage's model, its
+    /// budget or deadline, or the stages that have not started.
+    #[command(
+        after_help = "Examples:\n  archon queue steer qi_… --note 'Use the v2 client'\n  archon queue steer qi_… --stage implement --model claude-code/claude-opus-5-5 --effort high\n  archon queue steer qi_… --abort --goto implement\n  archon queue steer qi_… --insert verify --from refactor --after implement"
+    )]
+    Steer(Box<QueueSteerArgs>),
     /// Show the runtime caps, or change them until archond restarts (the
     /// config's `[limits]` apply again then).
     Caps {
@@ -522,6 +536,65 @@ pub enum QueueCommand {
     },
 }
 
+/// What a run does once `--abort` stopped its stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AfterAbort {
+    /// Start the stage again with a new agent.
+    Retry,
+    /// Pass the stage over and go on with the next one.
+    Skip,
+}
+
+/// One steer; archond checks it against the item, its run and the catalog.
+#[derive(Debug, Args)]
+pub struct QueueSteerArgs {
+    /// The item's qi_… id, or enough of its start to name one item.
+    pub item: String,
+    /// Guidance added to the brief and sent to the agents working now.
+    #[arg(long, value_name = "TEXT")]
+    pub note: Option<String>,
+    /// The stage --model, --effort and --abort are about; the running one
+    /// when omitted.
+    #[arg(long)]
+    pub stage: Option<String>,
+    /// The stage's model, from its agents' next turn on.
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub model: Option<archon_core::model::ModelRef>,
+    /// The stage's effort: low, medium, high, x_high or max.
+    #[arg(long)]
+    pub effort: Option<archon_core::model::Effort>,
+    /// The item's new budget in USD.
+    #[arg(long, value_name = "USD")]
+    pub budget_usd: Option<f64>,
+    /// Minutes added to the deadline of the stage running now.
+    #[arg(long, value_name = "MINUTES")]
+    pub extend: Option<u32>,
+    /// Stop the stage's agents now, then retry it (or --then, --goto).
+    #[arg(long)]
+    pub abort: bool,
+    /// After --abort: retry the stage or skip it.
+    #[arg(long, value_enum, requires = "abort", conflicts_with = "goto")]
+    pub then: Option<AfterAbort>,
+    /// After --abort: continue at this stage.
+    #[arg(long, value_name = "STAGE", requires = "abort")]
+    pub goto: Option<String>,
+    /// Remove a stage that has not started.
+    #[arg(long, value_name = "STAGE", conflicts_with_all = ["stage", "abort", "model", "effort"])]
+    pub remove: Option<String>,
+    /// Add this stage among those not started.
+    #[arg(long, value_name = "STAGE", conflicts_with = "switch")]
+    pub insert: Option<String>,
+    /// The pipeline --insert copies the stage from; the item's own when omitted.
+    #[arg(long, value_name = "PIPELINE", requires = "insert")]
+    pub from: Option<String>,
+    /// The stage --insert follows; before the next unstarted one when omitted.
+    #[arg(long, value_name = "STAGE", requires = "insert")]
+    pub after: Option<String>,
+    /// Replace the stages not started with those this pipeline runs next.
+    #[arg(long, value_name = "PIPELINE")]
+    pub switch: Option<String>,
+}
+
 /// File inputs are decoded here; policy and pipeline validation belong to archond.
 #[derive(Debug, Args)]
 pub struct QueueAddArgs {
@@ -537,9 +610,10 @@ pub struct QueueAddArgs {
     /// UTF-8 brief file, or - to read stdin.
     #[arg(long, value_name = "PATH|-")]
     pub brief_file: PathBuf,
-    /// JSON or TOML stage-to-choice-array map, as MCP model_plan.
+    /// JSON or TOML stage-to-choice-array map, as MCP model_plan. Stages it
+    /// leaves out, or all without it, get the daemon's defaults.
     #[arg(long)]
-    pub model_plan_file: PathBuf,
+    pub model_plan_file: Option<PathBuf>,
     /// Optional JSON or TOML stage-to-reason map, as MCP model_reasons.
     #[arg(long)]
     pub model_reasons_file: Option<PathBuf>,
@@ -577,6 +651,16 @@ pub struct QueueAddArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PipelineCommand {
+    /// List proposed pipelines, or show one proposal and its files.
+    Proposals {
+        /// Proposal name to inspect; omit to list.
+        name: Option<String>,
+    },
+    /// Activate a validated proposed user pipeline.
+    Accept {
+        /// Name of the proposed pipeline, without .proposed.
+        name: String,
+    },
     /// The catalog, with problems.
     List {
         /// Include this repository's pipelines: its directory, or the name of
@@ -626,11 +710,15 @@ pub enum DaemonCommand {
     },
     /// Start archond in the background unless it is running.
     Start,
-    /// Ask archond to shut down and wait until it has.
+    /// Ask archond to shut down and wait until it has; in dedicated mode,
+    /// then Archon's own aetherd too.
     Stop {
-        /// Also stop Archon's own aetherd (dedicated mode).
-        #[arg(long, visible_alias = "all")]
+        /// Require stopping Archon's own aetherd: refused in shared mode.
+        #[arg(long, visible_alias = "all", conflicts_with = "keep_aether")]
         aether: bool,
+        /// Leave Archon's own aetherd running; only archond stops.
+        #[arg(long)]
+        keep_aether: bool,
     },
     /// Whether archond is running (exit code 3 when not).
     Status,
@@ -642,6 +730,46 @@ pub enum OrchestratorCommand {
     Status,
     /// Cancel and recreate the orchestrator agent.
     Restart,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InitiativeCommand {
+    /// List coordinated initiatives.
+    List,
+    /// Start one from a .json or .toml file holding what `enqueue_initiative`
+    /// takes: title, contract, atomic, members and idempotency_key.
+    #[command(after_help = "Example: archon initiatives create rename-account.json")]
+    Create {
+        /// The initiative's request file.
+        file: PathBuf,
+    },
+    /// Show the shared contract and member states.
+    Show {
+        /// Initiative id (ini_…) or its start.
+        initiative: String,
+    },
+    /// Append to the shared contract, or replace it; running members are
+    /// told the whole new contract.
+    Update {
+        /// Initiative id (ini_…) or its start.
+        initiative: String,
+        /// File with the text to append (`-` reads stdin).
+        #[arg(long, value_name = "FILE", required_unless_present = "contract_file")]
+        append_file: Option<PathBuf>,
+        /// File with the whole new contract (`-` reads stdin).
+        #[arg(long, value_name = "FILE", conflicts_with = "append_file")]
+        contract_file: Option<PathBuf>,
+    },
+    /// Stop unfinished members, preserving successful work and PRs.
+    Cancel {
+        /// Initiative id (ini_…) or its start.
+        initiative: String,
+    },
+    /// Requeue unsuccessful members on their existing branches.
+    Retry {
+        /// Initiative id (ini_…) or its start.
+        initiative: String,
+    },
 }
 
 #[cfg(test)]
@@ -854,6 +982,11 @@ mod tests {
             panic!()
         };
         assert_eq!(autonomy_max.as_deref(), Some("merge=auto"));
+        let Command::Repo(RepoCommand::Set { repo, ship, .. }) = parse(&["repo", "set", "api"])
+        else {
+            panic!("a bare repo set records the git identity again")
+        };
+        assert_eq!((repo.as_str(), ship), ("api", None));
         let both = [
             "repo",
             "set",
@@ -1027,6 +1160,35 @@ mod tests {
     }
 
     #[test]
+    fn queue_steer_takes_one_abort_decision_and_one_shape_change() {
+        let Command::Queue(QueueCommand::Steer(args)) =
+            parse(&["queue", "steer", "qi_1", "--abort", "--goto", "implement"])
+        else {
+            panic!()
+        };
+        assert!(args.abort && args.then.is_none());
+        assert_eq!(args.goto.as_deref(), Some("implement"));
+        let refused: [&[&str]; 6] = [
+            &["--then", "skip"],
+            &["--goto", "review"],
+            &["--abort", "--then", "skip", "--goto", "review"],
+            &["--remove", "review", "--abort"],
+            &["--insert", "verify", "--switch", "quick"],
+            &["--from", "deep-review"],
+        ];
+        for flags in refused {
+            let line = [&["archon", "queue", "steer", "qi_1"], flags].concat();
+            assert!(Cli::try_parse_from(line).is_err(), "{flags:?}");
+        }
+        let model = ["--model", "claude-opus-5-5"];
+        let line = [&["archon", "queue", "steer", "qi_1"], &model[..]].concat();
+        assert!(
+            Cli::try_parse_from(line).is_err(),
+            "a model names its provider"
+        );
+    }
+
+    #[test]
     fn queue_retry_takes_fresh_and_an_amendment() {
         let Command::Queue(QueueCommand::Retry {
             item,
@@ -1064,9 +1226,28 @@ mod tests {
         for flag in ["--aether", "--all"] {
             assert!(matches!(
                 parse(&["daemon", "stop", flag]),
-                Command::Daemon(DaemonCommand::Stop { aether: true })
+                Command::Daemon(DaemonCommand::Stop {
+                    aether: true,
+                    keep_aether: false
+                })
             ));
         }
+        assert!(matches!(
+            parse(&["daemon", "stop"]),
+            Command::Daemon(DaemonCommand::Stop {
+                aether: false,
+                keep_aether: false
+            })
+        ));
+        assert!(matches!(
+            parse(&["daemon", "stop", "--keep-aether"]),
+            Command::Daemon(DaemonCommand::Stop {
+                aether: false,
+                keep_aether: true
+            })
+        ));
+        let both = ["archon", "daemon", "stop", "--aether", "--keep-aether"];
+        assert!(Cli::try_parse_from(both).is_err());
         assert!(matches!(parse(&["tui"]), Command::Tui(_)));
     }
 

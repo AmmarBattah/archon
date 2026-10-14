@@ -11,17 +11,24 @@
 
 mod codec;
 mod cost;
+mod delegated;
 mod directives;
 mod feed;
 mod gates;
+mod handoffs;
+pub mod initiatives;
 mod items;
+mod lessons;
 mod model_evidence;
+mod outcomes;
 mod repos;
+mod run_edits;
 mod runs;
 mod schema;
 mod settings;
 mod snapshot;
 mod spend;
+pub mod stacks;
 
 use std::path::Path;
 
@@ -38,10 +45,13 @@ use archon_core::protocol::{ItemQuery, RepoRef};
 use archon_core::queue::{PauseState, QueueItem, QueueState};
 use archon_core::repo::Repo;
 use archon_core::run::{OperatorGate, PipelineRun, StageRun};
+use archon_core::steer::RunEdit;
 
 use crate::dispatch::DispatchSnapshot;
 
 pub use model_evidence::ModelEvidenceSnapshot;
+pub use model_evidence::{RouteEvidence, preferred_route};
+pub use run_edits::RecordedEdit;
 
 /// Well-known `kv` keys.
 pub mod keys {
@@ -60,10 +70,29 @@ pub struct SpendRow {
     /// Raw Aether amounts retained for budget accounting, independent of basis.
     pub cost_usd: f64,
     pub cost_basis: archon_core::cost::CostBasis,
+    /// Aether's word that no invocation is missing from `cost_usd`; `None`
+    /// when it did not say.
+    pub cost_complete: Option<bool>,
     pub estimated_cost_usd: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub at: Timestamp,
+}
+
+/// What a kept agent and every agent beneath it had been charged when it
+/// passed to `attempt` of its slot: where that attempt's cost starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentHandoff {
+    pub attempt: u32,
+    /// Each agent of the subtree the ledger had charged by then.
+    pub spent: std::collections::BTreeMap<AetherAgentId, f64>,
+}
+
+impl AgentHandoff {
+    /// What `agent` had been charged by the hand-off; 0 if nothing.
+    pub fn spent_by(&self, agent: &AetherAgentId) -> f64 {
+        self.spent.get(agent).copied().unwrap_or(0.0)
+    }
 }
 
 /// What [`Store::finish_run`] committed: the settled item, and the feed
@@ -77,6 +106,10 @@ pub struct FinishedRun {
 #[derive(Debug)]
 pub struct Store {
     conn: rusqlite::Connection,
+    learning: std::cell::RefCell<archon_core::config::LearningConfig>,
+    learning_config_loaded: std::cell::Cell<bool>,
+    learning_models: std::cell::RefCell<Vec<archon_core::model::ModelRef>>,
+    learning_models_at: std::cell::Cell<Option<archon_core::Timestamp>>,
 }
 
 impl Store {
@@ -115,7 +148,13 @@ impl Store {
         };
         let conn = conn.map_err(|e| opening(&e))?;
         schema::check_read_only(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            learning: Default::default(),
+            learning_config_loaded: Default::default(),
+            learning_models: Default::default(),
+            learning_models_at: Default::default(),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, ArchonError> {
@@ -128,7 +167,13 @@ impl Store {
         schema::configure(&conn, on_disk)?;
         let version = schema::migrate(&mut conn)?;
         debug_assert_eq!(version, schema::MIGRATIONS.len());
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            learning: Default::default(),
+            learning_config_loaded: Default::default(),
+            learning_models: Default::default(),
+            learning_models_at: Default::default(),
+        })
     }
 
     // ----- repositories ----------------------------------------------------
@@ -292,6 +337,22 @@ impl Store {
         runs::live_stages(&self.conn)
     }
 
+    // ----- run edits ---------------------------------------------------------
+    /// Record a steer's change to a live run's shape; returns its 1-based
+    /// place in the run's order.
+    pub fn append_run_edit(
+        &mut self,
+        run: &PipelineRunId,
+        edit: &RunEdit,
+        at: Timestamp,
+    ) -> Result<u32, ArchonError> {
+        run_edits::append(&mut self.conn, run, edit, at)
+    }
+    /// A run's edits in the order they were made.
+    pub fn run_edits(&self, run: &PipelineRunId) -> Result<Vec<RecordedEdit>, ArchonError> {
+        run_edits::for_run(&self.conn, run)
+    }
+
     // ----- dispatch ----------------------------------------------------------
     /// Caps, repo caps, pending spawns and first-stage fan-out are filled in
     /// by the daemon. Spend counts estimates; a daemon configured with
@@ -438,9 +499,8 @@ impl Store {
     }
 
     // ----- spend ---------------------------------------------------------------
-    /// Charge the agent's growth: usage events carry absolute totals. A row
-    /// older than the stored one (a replayed event) is ignored, and a lower
-    /// total (a correction) keeps the amounts already charged.
+    /// Charge the agent's growth: usage events carry absolute totals. A replayed
+    /// (older) row is ignored, and only a provider-settled total lowers a charge.
     pub fn record_spend(&mut self, row: &SpendRow) -> Result<(), ArchonError> {
         spend::record(&mut self.conn, row)
     }
@@ -468,6 +528,32 @@ impl Store {
         estimates: bool,
     ) -> Result<f64, ArchonError> {
         spend::for_agent(&self.conn, agent, estimates)
+    }
+    /// Every time the kept agent `agent` passed to a later attempt, by attempt.
+    pub fn agent_handoffs(
+        &self,
+        agent: &AetherAgentId,
+        estimates: bool,
+    ) -> Result<Vec<AgentHandoff>, ArchonError> {
+        handoffs::of_agent(&self.conn, agent, estimates)
+    }
+    /// `parent` delegated to `agent`, on `model`; `effort` once it is known.
+    pub fn record_delegated(
+        &mut self,
+        agent: &AetherAgentId,
+        parent: &AetherAgentId,
+        model: &archon_core::model::ModelRef,
+        effort: Option<archon_core::model::Effort>,
+    ) -> Result<(), ArchonError> {
+        delegated::record(&self.conn, agent, parent, model, effort)
+    }
+    /// Every agent beneath `agent`, at any depth, with what each was charged.
+    pub fn delegated_beneath(
+        &self,
+        agent: &AetherAgentId,
+        estimates: bool,
+    ) -> Result<Vec<archon_core::protocol::DelegatedAgent>, ArchonError> {
+        delegated::beneath(&self.conn, agent, estimates)
     }
     /// `(today, total)`; "today" is the local calendar day of `now`.
     pub fn spend_totals(&self, now: Timestamp, estimates: bool) -> Result<(f64, f64), ArchonError> {

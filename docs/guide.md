@@ -13,8 +13,10 @@ If you are already signed in to Claude Code or Codex, neither Archon nor Aether 
 The orchestrator chooses a model and effort for every stage, taking account
 of complexity, risk, operator instructions and recorded cost evidence.
 Pipeline nudges are advice, not enforced model choices. It records a short
-`model_reasons` explanation and can query `model_evidence`. The daemon
-checks choices against your allowlist, caps and budgets.
+`model_reasons` explanation and can query `model_evidence`. You predefine
+no models or tiers: every model Aether reports ready may be chosen unless
+`[models]` in the config narrows that. The daemon checks each choice
+against that policy, the caps and the budgets.
 
 The SQLite store preserves the queue and run state. Work-creating Aether
 requests use idempotency keys so replay after a restart does not create a
@@ -35,13 +37,188 @@ you ─ archon chat ─▶ archond ──▶ Aether ──▶ orchestrator agent
 
 1. You tell the orchestrator what you want: in the terminal UI (`archon`),
    in the line chat (`archon chat`) or with `archon say`.
-2. The orchestrator plans the work and calls `enqueue` once per unit of work,
-   choosing a repository, a pipeline and a model and effort for each stage.
-3. `archond` dispatches items as capacity allows. It creates a git worktree
+2. The orchestrator decides how the request is done, taking the first of
+   these that fits: answer it directly, reading your code where that takes
+   it, hand it to a helper agent, or queue it through a pipeline, a large
+   request as a backlog of items.
+3. For queued work it calls `enqueue` once per unit of work, choosing a
+   repository, the pipeline that fits and a model and effort for each stage.
+4. `archond` dispatches items as capacity allows. It creates a git worktree
    for each item and runs the pipeline's stages as Aether agents.
-4. The pipeline enforces review and test gates and fix loops. Outcomes and
-   blockers come back to the orchestrator, and it tells you only what
-   matters.
+5. The pipeline enforces its own review and test gates and fix loops.
+   `archond` posts every outcome and blocker to your feed itself, and wakes
+   the orchestrator only for those it has something to do about.
+
+### What the orchestrator does without queueing
+
+Answering needs no item, and neither does reading your code. The
+orchestrator answers what it already knows. For a question about a
+repository it reads the code itself and answers in the same conversation.
+For research on the web or in documents, a wide read, a comparison, a
+draft or a second look at a result it delegates to a helper agent (Aether's
+`delegate`). No worktree is made and nothing is shipped.
+
+It reads code in a mirror: for every registered repository `archond` keeps
+a clone at `~/.local/share/archon/orchestrator/repos/<name>`, checked out
+at the base branch. A mirror holds committed work only and has no remote,
+so nothing done in it reaches your checkout, your branches or GitHub.
+`archond` refreshes it when an item finishes and when you write to the
+orchestrator, and says so in the feed if a refresh fails; the orchestrator
+is told as well, so it knows when what it reads may be behind. The `ask`
+pipeline is still there for a question you want answered as a recorded
+item, but nothing needs it.
+
+Every change to a repository is an item, so the pipeline's
+gates, your ship mode, caps and autonomy ceiling apply. The orchestrator
+picks the cheapest pipeline that fits: `direct` for any change one author
+can make and check, whatever its size, where one agent does all of it,
+`adaptive` where one lead that keeps its context through fixes or
+integrates independent parts saves restarts, and a heavier one only when
+the work clearly calls for it. How much review an item gets is a choice of
+its own, set by risk rather than size: see
+[Autonomy levels](#autonomy-levels). The orchestrator adds no review on top
+of a pipeline, and when work was split into parts it has the integrated
+result reviewed once, with a depth that follows the risk.
+
+What to know about helper agents:
+
+- A helper works in one mirror, or in the orchestrator's scratch directory
+  when it reads no code, and never in your checkout. To build or try
+  something it gets its own copy of the mirror (Aether's isolated
+  workspace). `archond` cancels a helper that Aether placed in a registered
+  repository or among the items' worktrees, also when the path only leads
+  there through a symlink, and posts a blocker. This checks where the
+  helper was placed; what a native agent's tools can reach beyond that is
+  up to Aether
+  ([`docs/ARCHITECTURE.md` §17](ARCHITECTURE.md#17-aether-limitations-and-how-archon-handles-them)).
+- A helper must use a model and effort that `[models]` allows and that the
+  repository whose mirror it reads does not refuse in its own `[models]`.
+  Another repository's policy does not apply to it. One outside is
+  cancelled. Its spend counts toward your daily and total budgets. Helpers
+  are not counted by `max_parallel_agents`; the orchestrator is told to
+  stay within that cap, and the daemon does not enforce it.
+- A helper may hand part of its work to a helper of its own, once.
+  `archond` cancels an agent a third delegation below the orchestrator.
+- Helpers cannot queue, cancel or change anything in Archon: those tools
+  answer only the current orchestrator (see
+  [After upgrading](#after-upgrading) for what that depends on).
+- Helpers belong to the orchestrator agent. `archon orchestrator restart`,
+  and any recovery that replaces the orchestrator, cancels them. A cancel
+  Aether could not take is kept and retried until Aether confirms it.
+- A GitHub request without operator standing is never delegated: the
+  orchestrator answers it itself, from that repository's mirror when it
+  takes code. Its prompt says so; `archond` cannot tell which request a
+  helper serves and does not enforce it.
+- A helper's result reaches you through the orchestrator: in its reply to
+  the message you sent when it waited for the helper, otherwise as a
+  notification. Such a reply is two lines in the chat: what the orchestrator
+  said before it waited, then the answer.
+- If the orchestrator has no `delegate`, or Aether refuses a delegation, it
+  says why and uses the `ask` or `errand` pipeline instead.
+
+### Pipelines the orchestrator writes
+
+When you keep asking for the same shape of work and no pipeline captures it,
+the orchestrator writes one into your user pipelines directory
+(`~/.config/archon/pipelines/`), checks it with `archon pipelines check` and
+tells you its name. It never overwrites a pipeline it did not write. A
+pipeline inside a repository (`<repo>/.archon/pipelines/`) is committed with
+the repository, so there it only proposes the pipeline and waits for you.
+
+Preferences that should outlast a conversation are kept in two places: a
+standing instruction becomes a directive (`archon autonomy` lists them),
+which every future orchestrator reads, and what it learned about how you
+work goes to Aether's memory.
+
+### After upgrading
+
+A running orchestrator keeps the prompt, tools and workspace it was created
+with, also across Aether's `restart`. Run `archon orchestrator restart` once
+after upgrading so that a new orchestrator starts with the current ones.
+
+Archon's tools that change something answer only the current orchestrator,
+and `archond` knows who is calling only when Aether names the agent behind
+each call: `send_caller_meta = true` on the `archon` MCP server in Aether's
+config. Aether reads that setting only as its daemon starts.
+
+- **Dedicated instance (the default).** Nothing to do. The config is
+  Archon's own: the next `archon` command that needs Aether brings the
+  registration up to date and restarts Archon's `aetherd` so that it takes
+  effect. That restart happens once, and interrupts the agents then running
+  in that instance as any Aether restart does; Archon recovers its items.
+- **`--shared`.** Archon never edits your Aether config. `archon doctor`
+  fails with the line to add; add it and restart your `aetherd`, then run
+  `archon orchestrator restart`.
+
+Until Aether names the callers, `archond` posts one blocker saying so,
+accepts those tools only from an orchestrator that cannot delegate (so the
+caller can be nobody else), starts new orchestrators without native
+delegation, and refuses every other unnamed call. An orchestrator from
+before the upgrade cannot delegate and keeps working. One started with
+`delegate` before `archond` saw the first unnamed call has that call
+refused: `archon orchestrator restart` replaces it with one that works
+until you have made the fix above. Once the orchestrator makes a named
+call, a read included, `archond` says so and the next orchestrator
+delegates again.
+
+## What Archon learns
+
+Archon keeps outcomes and short lessons in its own store. `archon lessons stats`
+shows per-repository pipeline pass rates, correction rates, median cost and wall
+time, and learned model defaults with sample sizes. The existing
+`model_evidence` tool includes compact pipeline evidence for the
+orchestrator's pipeline selection. These are observations, not guarantees.
+Estimated model savings compare median stage costs with the static default a
+plan would have had without learning, need at least five samples of that
+default, and are shown per planned run. Missing baseline evidence is reported
+as unknown.
+
+```sh
+archon lessons --repo my-repo
+archon lessons --all
+archon lessons add --repo my-repo --kind pitfall "Run migrations against an old database."
+archon lessons edit lsn_ID "Check both upgrades and fresh databases."
+archon lessons pin lsn_ID
+archon lessons retract lsn_ID
+archon lessons accept lsn_ID
+archon lessons why qi_ID
+archon lessons stats --repo my-repo --json
+archon pipelines proposals
+archon pipelines proposals learned-check
+archon pipelines accept learned-check
+```
+
+`why` shows the frozen lesson text and routing sample sizes used for an item.
+A run uses at most six lessons, with a 1,200-byte rendered section, preferring
+its repository and pipeline. Lessons are untrusted advice and cannot expand
+permissions. Duplicate text is merged; operator edits take precedence. Wins
+are successful runs without corrections. Five or more scored uses can retract
+a lesson whose raw Wilson lower bound drops below 0.3. Confidence decays since
+last use; age alone never retracts a winning lesson. Pinning prevents
+automatic retraction and decay; `pin --unpin` releases the pin.
+
+Ordinary chat and scope or effort steers never count as model failures. To record
+an explicit correction, send a structured operator message:
+`correction {"item":"qi_ID","stage":"implement","cause":"quality","reason":"The result missed the invariant"}`.
+Causes can also be `scope`, `infrastructure` or `budget`; only quality feedback
+penalizes the named stage. A reviewer that correctly finds a builder's error is not
+penalized. Run-level retry, gate and GitHub observations remain visible as audit
+history and can revoke lesson wins.
+
+The orchestrator's lessons require a source item and stay scoped to its repository.
+They begin Proposed with low weight until a confirming win or your acceptance.
+Distilled proposals wait for `archon lessons accept`. Lessons are one plain sentence
+without markup, links, external paths or instruction overrides. Use `lessons --all`
+to inspect proposed advice. Read-only lessons commands also work with the daemon
+stopped and do not start Aether.
+
+Routing explores ready, permitted models on at most ten percent of item IDs,
+including models with no history. `why` shows Wilson quality intervals, cost and the
+pipeline revision, review level, task class and diff-size bucket. You can tag an item
+`task:maintenance` or `diff:small` to keep evidence relevant. Costs may settle after
+completion; statistics and pending completion news use the current ledger figure.
+Distillation has one errand per repository at a time and a global default $3 daily
+reservation. Imported history is not distilled. See [configuration](configuration.md#learning).
 
 ## Agents talking to the orchestrator
 
@@ -52,13 +229,16 @@ the wrong agent, `escalation` for a blocker outside the stage, or `info`
 tool returns a receipt immediately; the agent must continue its stage
 without waiting for a reply or ending its turn.
 
-Archon records item, run, stage, attempt and agent attribution in the
-item log (`archon log --item <id>`) and delivers an `agent_message`
-news event to the orchestrator. Delivery is durable and coalesced; each
-agent can send at most 20 messages, with a clear refusal after that.
+Archon writes the message to the feed itself, whole, with its stage, sender
+and kind (`archon log --item <id>`): an escalation shows in the chat as a
+blocker, a relay or info with progress. It also delivers an `agent_message`
+news event to the orchestrator, which acts on it and does not repeat it to
+you. Delivery is durable and coalesced; each
+agent can send at most 20 messages (`[limits] max_agent_messages`), with
+a clear refusal after that.
 Delivered messages to passive run nodes are forwarded through the same
 path, including late events for retired nodes whose normal index was pruned. External
-messages have a separate 20-message cap per run node; refusals reach the
+messages have a separate cap of the same size per run node; refusals reach the
 sending agent or the operator feed. Use the tool for stage messages.
 
 Relay wording alone grants no operator authority. A relay has operator
@@ -67,12 +247,15 @@ stage quotes exactly the latest operator message Archon observed in its
 inbox. Other relays retain agent provenance. The orchestrator can answer
 using Aether `send_message`, a retry with `brief_append`, or new items.
 
-New `archon setup` registrations enable Aether's `send_caller_meta = true`.
-In dedicated mode, `archon setup --resync` also migrates that registration.
-For an existing shared registration, add that field to the `archon` MCP server's
-`[[mcp.servers]]` entry in the active Aether config and restart that Aether daemon;
-also add `message_orchestrator = "mutation"` to its `classes` table.
-Calls without caller identity are refused. Setup preserves existing entries.
+`message_orchestrator` needs Aether to name its caller
+(`send_caller_meta = true`, see [After upgrading](#after-upgrading)): a call
+without caller identity is refused. In dedicated mode Archon keeps its
+registration current by itself. For an existing shared registration, add
+that field to the `archon` MCP server's `[[mcp.servers]]` entry in the
+active Aether config, add `message_orchestrator = "mutation"` to its
+`classes` table, and restart that Aether daemon. `archon doctor` reports a
+registration that lacks the field in both modes. Setup preserves existing
+entries.
 
 A registration written before `record_chat_answer` existed does not list
 that tool, and Aether then classes it as `external`. Run
@@ -88,16 +271,10 @@ per stage. Add your own under `~/.config/archon/pipelines/` or
 
 | Pipeline | Stages | Leans toward |
 | --- | --- | --- |
-| `quick-pr` | implement → ship | fast models |
-| `default-pr-review` | implement → review (gate, fix loop) → ship | balanced models |
-| `bugfix` | reproduce (failing test) → fix → review (`all_pass`, back to fix ×2) → ship | balanced models, independent reviewer; describable bugs (`quick-pr` for trivial one-liners, `strict-pr-review` for security/concurrency) |
-| `docs` | write → verify (all claims, commands and internal links; gate, back to write ×2) → ship | documentation with an independent reviewer; fast/balanced models. Use `quick-pr` for a typo. |
-| `dependency-upgrade` | survey → upgrade → verify (build/tests/audit, back to upgrade ×3) → ship | balanced models; version bumps, with changelog research; use `default-pr-review` for features that add dependencies |
-| `refactor` | baseline/characterize → refactor → verify (gate, back to refactor ×3) → review (gate, back to refactor ×2) → ship | balanced tier, independent reviewer; structure-only changes, use `default-pr-review` for behaviour changes |
-| `strict-pr-review` | implement → test (gate) → 3 independent reviews (all must pass) → ship | the strongest models |
-| `team-pr` | plan → build (a `backend` and a `frontend` role in parallel) → e2e (gate, fix loop) → review (gate, fix loop) → ship | changes that split cleanly into parts |
-| `performance` | measure → optimize → verify (gate, back to optimize ×3) → review (gate, back to optimize ×2) → ship | strongest tier, independent reviewer. For a specific slow path with a measurable goal; use `default-pr-review` for ordinary changes. |
-| `test-coverage` | analyze → write → verify (`all_pass`, back to write ×2) → ship | balanced models; raise coverage of existing code, with bugs reported as follow-ups; use `bugfix` to fix one |
+| `direct` | implement | balanced models; the default, and the cheapest path for a change one author can make and check, whatever its size: a fix, a feature, tests, docs or a dependency upgrade. One agent implements it, runs the affected checks and commits, and Archon ships. No review unless the item's `review` knob asks for one; the agent hands back work that turns out risky. See [`docs/PIPELINES.md`](PIPELINES.md#direct) |
+| `adaptive` | build (delegation enabled, holds the review) | balanced models; the orchestrator's choice where one lead that keeps its context through fixes, or integrates independent parts, saves restarts. One lead builds it, delegates the parts worth splitting and has the integrated diff reviewed by as many independent reviewers as the item's `review` knob asks for (one by default); Archon ships only a build with those reviewers verified. Chosen by name or as a repository's `default_pipeline`; see [`docs/PIPELINES.md`](PIPELINES.md#adaptive) |
+| `refactor` | baseline/characterize → refactor → verify (gate, back to refactor ×3) → review (gate, back to refactor ×2) | balanced tier, independent reviewer; structure-only changes, use `direct` for behaviour changes |
+| `performance` | measure → optimize → verify (gate, back to optimize ×3) → review (gate, back to optimize ×2) | strongest tier, independent reviewer. For a specific slow path with a measurable goal; use `direct` for ordinary changes. |
 | `agent-testing` | plan → exercise (fan-out) → report | agents using the product as a user would |
 | `code-audit` | scope → audit (3 independent lenses) → report (HTML with issue drafts) | code inspection with evidence and follow-up findings; use `ask` for one question |
 | `e2e-testing` | setup → e2e (gate) → report | HTML and screenshot reports for Lavish |
@@ -105,11 +282,28 @@ per stage. Add your own under `~/.config/archon/pipelines/` or
 | `errand` | errand (report) | a small job that changes no repository, answered in text or as a Lavish page; no outward side effects |
 | `design-doc` | research → critique (gate, retry ×2) → report (HTML design/RFC) | design before a large or ambiguous change, strongest tier and independent critic; no product-code changes or shipping. Use `proposal: lavish` for design and implementation in one item |
 
+A change that splits cleanly into a backend and a frontend part can run the
+[`team-pr` example](examples/pipelines/team-pr/pipeline.toml): copy its
+directory to your pipelines and edit its roles.
+
 A work item ships in one of two modes, set per repository:
 
 - `pr` (the default): opens a PR. Merging requires the item's `merge = auto`
   knob and permission in your ceiling (`--auto-merge` permits it for a repository).
 - `local`: commits on the run branch and never pushes.
+
+No agent ships. A stage of the pipeline, usually the last that commits,
+returns what is to ship (the commit, its tree, the checks it ran, the PR
+title and body), and `archond` delivers it in a few seconds: it checks that
+the worktree is clean, still holds that tree and carries only commits under
+your repository's git identity (as `archon repo add` recorded it; run
+`archon repo set <repo>` after you change it), pushes without ever forcing,
+and opens the PR with `gh`, or reuses the one already open for the branch. A
+delivery that is refused fails the item with what to change, and a restart
+in the middle never opens a second PR. The item succeeds once its PR is
+open: `archond` does not wait for your CI and does not repair a failing
+check. Ask for a fix, or run `archon queue retry <id> --append "…"`, which
+delivers into the same PR. See [Shipping](PIPELINES.md#shipping).
 
 ## Aether setup
 
@@ -222,7 +416,13 @@ Archon's feed. They overlap, but they are not the same list.
   by Archon news, which the line chat never shows), your own messages,
   Aether's native questions and approvals, delegations, stage messages,
   failures, and one row per Archon news trigger, such as
-  `Trigger from archon · item finished: qi_… succeeded — <title>`.
+  `Trigger from archon · item finished: qi_… failed — <title>`.
+- **Shown later than in the line chat, with `wake_on_success = false`:** an
+  item that simply succeeded. The orchestrator is then not woken for it (see
+  [When the orchestrator is woken](#when-the-orchestrator-is-woken)), so the
+  terminal UI shows it with the orchestrator's next turn, as a row
+  `3 routine items finished`, while `archon chat`, `archon log` and
+  `archon status` show it as it happens.
 - **Shown because the orchestrator restates them** (its instructions say so;
   the tool calls themselves are hidden in calm): the text of each `notify`
   and `ask_operator`, a published report's title and location, an item's
@@ -234,6 +434,37 @@ Archon's feed. They overlap, but they are not the same list.
   progress notices, system notices, and the chat's "open questions" header.
   A gate also opens in Lavish when it is installed; `archon status` and
   `archon questions` always show what waits.
+
+### When the orchestrator is woken
+
+Every turn of the orchestrator reads its whole context again, so a wake
+costs money whether or not there is anything to decide. `archond` posts
+every outcome to the feed itself and wakes the orchestrator for:
+
+- an item that succeeded, so the terminal UI shows it: Aether's chat shows
+  only what the orchestrator says, and Aether has no way to add an entry to
+  it without a turn. While other items are still queued or running, a
+  routine success waits for them, up to five minutes, so one turn reports
+  the batch;
+- an item that failed or is blocked, to diagnose it, retry it or tell you;
+- an item tagged `notify` (`archon queue add --tag notify`, or the
+  orchestrator's own choice when it wants to act on the result);
+- an item a GitHub thread asked for, to post the result there;
+- a stage agent's message, a gate that opened, your answer to its question,
+  feedback on a report, a budget that was reached, a cancelled helper.
+
+A cancelled item waits. So does a routine success when you turn success
+wakes off, which saves a turn per item when you follow Archon in
+`archon chat` or `archon status` rather than in the terminal UI:
+
+```toml
+[orchestrator]
+wake_on_success = false
+```
+
+The orchestrator reads all waiting items as one short list at its next
+turn, and a message from you delivers that list first, so it never answers
+you without it.
 
 ### Answering in the orchestrator's chat
 
@@ -290,14 +521,14 @@ Known limitations:
 
 `archon` starts Archon's `aetherd` and `archond` when they are not running.
 `archon aether <args…>` runs any `aether` command against Archon's instance,
-for example `archon aether agents`. `archon daemon stop --aether` stops both
-daemons. In the TUI's tree each work item is one subtree: a node named after
+for example `archon aether agents`. `archon daemon stop` stops both
+daemons (`--keep-aether` stops only archond). In the TUI's tree each work item is one subtree: a node named after
 the item, with its stage agents (`implement · <title>`, `review 1/2 · <title>`,
 `ship · <title>`) underneath, beside the `archon` orchestrator.
 
 ```sh
 archon repo add ~/code/api --ship pr
-archon repo add ~/code/web --pipeline strict-pr-review
+archon repo add ~/code/web --pipeline adaptive
 ```
 
 In `archon chat`, just talk. Slash commands cover the rest: `/questions`,
@@ -317,19 +548,20 @@ progress too; also `/verbose`), `/pause` and `/resume` (optionally `hard`,
 | `archon status` | waiting items and their next action, daemon, orchestrator, `archon` MCP server health, caps, spend and Aether link |
 | `archon cost [--since <date\|7d>] [--until <date\|1d>] [--by day\|repo\|pipeline\|model\|item\|stage]` | spend as the budgets count it, grouped (by day over the last 7 days by default), with a total; spend with no owner in the grouping, such as the orchestrator's under `--by model`, is the `-` row |
 | `archon model-evidence [--repo <name\|id>] [--pipeline <name>] [--stage <id>] [--since <date\|30d>]` | recorded stage attempts, completed cost median/p90, median minutes and review/test pass shares; small samples marked, at most 60 groups; evidence only |
-| `archon queue add --title … --brief-file <path\|-> --model-plan-file <json\|toml>` | enqueue scripted work through the daemon's MCP-equivalent policy checks; prints the id or the item with `--json` |
+| `archon queue add --title … --brief-file <path\|-> [--model-plan-file <json\|toml>]` | enqueue scripted work through the daemon's MCP-equivalent policy checks; stages the plan leaves out get Archon's default model; prints the id or the item with `--json` |
 | `archon queue wait <id>… [--timeout 30m]` | wait for every item to become terminal, bounded to 30m by default; exit 0 all succeeded, 3 failed/cancelled, 4 timeout, 5 failed/cancelled dependency |
 | `archon queue list` | one line per item: state, current stage, age, cost, title, PR URL and derived waiting reason with one next action |
-| `archon queue show <id> [--full]` | an item's runs and each stage's attempt, slot, state, verdict, model, agent, cost and summary (first lines; `--full` for all), with the PR URL, recorded plan reasons and full waiting explanation when present |
+| `archon queue show <id> [--full]` | an item's runs and each stage's attempt, slot, state, verdict, model, agent, cost and summary (first lines; `--full` for all), with the PR URL, recorded plan reasons and full waiting explanation when present. A stage that delegated shows how its cost splits (its own agent, then each delegated agent with model, effort and cost), and a stage holding a declared review shows the review on record. Steers made to the item are listed with who made them |
 | `archon queue cancel <id>` / `archon queue caps` | cancel an item, or show and change runtime caps |
-| `archon queue retry <id> [--fresh] [--append "…"]` | queue a failed or cancelled item again in its worktree and branch; `--fresh` starts over from the base branch on a new branch and sets the old worktree aside, which worktree gc deletes, uncommitted work included, `worktrees.gc_after` (7 days) after the item's last run; `--append` adds guidance to the brief |
+| `archon queue retry <id> [--fresh] [--append "…"]` | queue a finished item again in its worktree and branch (a succeeded one delivers into its pull request again, and the retry counts against the run that passed); `--fresh` starts over from the base branch on a new branch and sets the old worktree aside, which worktree gc deletes, uncommitted work included, `worktrees.gc_after` (7 days) after the item's last run; `--append` adds guidance to the brief |
+| `archon queue steer <id> [--note "…"] [--stage <stage>] [--model <provider/model>] [--effort <effort>] [--budget-usd <usd>] [--extend <minutes>] [--abort [--then retry\|skip] [--goto <stage>]] [--remove <stage>] [--insert <stage> [--from <pipeline>] [--after <stage>]] [--switch <pipeline>]` | change an item without cancelling it; see [steering an item](#steering-an-item) |
 | `archon log` | the complete feed; `--item <id>` keeps one item's entries, `--kind <kind>` (repeatable) some kinds, and `--follow` keeps printing new ones |
 | `archon reports` / `archon reports reopen <rpt_…>` | list published reports with their state and URL, or show a closed one again |
 | `archon github-watcher …` | route `@archon` on GitHub issues and PRs to the orchestrator. `operators <LOGIN>...` lets the GitHub accounts you list instruct it with your authority (off by default); see [`docs/github-watcher.md`](github-watcher.md) |
 | `archon pause` / `archon resume` | hold dispatch globally, per repo or per pipeline; `--hard` also pauses running agents |
 | `archon gc [--offline]` | delete finished runs' build caches and remove their old worktrees now; `--offline` works without archond, e.g. on a full disk. See [disk use](configuration.md#disk-use) |
 | `archon aether …` | Aether's CLI on Archon's own Aether |
-| `archon daemon status` / `archon daemon stop [--aether]` | both daemons' state; stop archond, and with `--aether` Archon's aetherd too |
+| `archon daemon status` / `archon daemon stop [--keep-aether]` | both daemons' state; stop archond and, in dedicated mode, Archon's aetherd unless `--keep-aether` |
 
 See [scripted queue usage](queue-scripting.md) for file formats, autonomy
 flags, idempotency, JSON results and wait exit statuses.
@@ -339,7 +571,11 @@ unclassified legacy or mixed-basis amounts. The counted total follows budgets:
 Aether's reported cost always counts, including list-price amounts; only its
 separate API-equivalent estimate depends on `limits.count_estimated_cost`.
 Finished run costs in `queue show` sum their own stages' current ledger costs,
-so late usage stays with the correct run after a retry or restart.
+so late usage stays with the correct run after a retry or restart. A stage's
+cost includes the agents it delegated to; a run's and an item's totals count
+each agent once. While a turn runs, Aether prices it at list price, and when
+it ends the provider's own figure replaces that: a running total can come
+down a little then, and budgets count the corrected figure.
 
 Wherever a command takes a `qi_…` item id, the start of it is enough, with
 or without `qi_` and in any case (`archon queue show 01k2`), as long as it
@@ -412,6 +648,97 @@ target contains the full URL or encoded absolute file path. Pipes, unknown
 or dumb terminals, and `NO_COLOR` use the full location as plain text;
 `archon reports` and JSON retain the full location in all cases.
 
+### Steering an item
+
+`archon queue steer <id> …` changes an item while it runs, and the
+orchestrator does the same with `steer_item`. Nothing is cancelled and
+queued again: the agents at work keep their context and their worktree.
+Give at least one change; several in one command are applied together.
+
+| Flag | What it does |
+| --- | --- |
+| `--note "…"` | Adds the text to the brief under a dated `## Amendment` heading and sends it to every agent working on the item now, helpers included. Later stages read it in the brief. |
+| `--model <provider/model>`, `--effort <effort>` | Changes the model or effort of `--stage` (the running stage when omitted), within the model policy. A running agent ends its turn and goes on with its work on the new model; later attempts and retries use it too. |
+| `--budget-usd <usd>` | Sets the item's budget. Running agents that carry their own cap get the difference. |
+| `--extend <minutes>` | Gives the stage running now more time, up to 1440 minutes a steer. |
+| `--abort` | Stops the agents of `--stage` now. The stage is then started again with a new agent, or passed over with `--then skip`, or the run continues at another stage with `--goto <stage>`. |
+| `--remove <stage>` | Takes out a stage that has not started, for this run. |
+| `--insert <stage> [--from <pipeline>] [--after <stage>]` | Adds a copy of a stage, from the item's own pipeline or another, among the stages that have not started. |
+| `--switch <pipeline>` | Replaces the stages that have not started with what that pipeline runs after the stages both share. |
+
+```console
+$ archon queue steer 01k2 --note "Use the v2 client, not the legacy one."
+Steered qi_01K2…: amended the brief.
+$ archon queue steer 01k2 --stage implement --model claude-code/claude-opus-5-5 --effort high
+$ archon queue steer 01k2 --abort --goto implement
+$ archon queue steer 01k2 --insert verify --from refactor --after implement
+```
+
+A stage that already started keeps its shape: an insert lands after it, a
+switch keeps it, and a stage that ran and is not running now cannot be
+removed. To run such a stage again, abort the running one with `--goto`.
+The model policy, the budgets and the review your autonomy settings require
+hold for a steer as they do for an enqueue, and a refusal says which rule
+it met. Steers survive a daemon restart: the run goes on with the stages
+and decisions they left.
+
+An item that is not running takes what it runs next: a note, a budget, a
+stage's model (name the stage), and an insert or a switch. `--abort`,
+`--extend` and `--remove` need a running item. A failed item given
+`--insert` or `--switch` is queued again on the same branch and worktree,
+with what its failed run committed; this is how an item whose stage gave
+up with `ESCALATE:` continues on a stronger pipeline instead of starting
+over. A cancelled item takes no stage change and a succeeded one no steer
+at all until it is retried. `archon queue retry` queues a succeeded item
+again on its branch, delivering into the pull request it has; an item
+waiting on it waits for it to succeed again, and the retry counts against
+the run that passed.
+
+Every steer is recorded with who made it (`operator` or `orchestrator`) and
+what it changed. `archon queue show <id>` lists them, and the feed has a
+`Steered …` entry for each. An item switched to another pipeline keeps the
+name it was queued with, and `queue show`, `queue list` and `status` print
+both, as in `direct → adaptive`.
+
+### Stacked changes
+
+An item that `depends_on` an unmerged item of its own repository stacks on it:
+its branch forks from the first unmerged parent's, and `archond` opens its
+pull request against that branch. Other parents are merged
+in. A parent's merge retargets the child PR; later parent commits are merged
+forward. Conflicts create a fix item on the child branch, visible in the queue.
+
+### Coordinated changes across repositories
+
+Ask for one initiative when a request spans repositories. Its shared contract
+states the API names, formats and rollout rules each member must follow.
+`enqueue_initiative` accepts a title, contract (up to 2 KiB), and 1 to 16 members with
+`repo`, `brief`, optional `title`, `pipeline`, `model_plan` and `autonomy` (as
+in an enqueue), and `after: [0, ...]` indices of earlier members. Supply an
+`idempotency_key` when retrying a request. Set `atomic: true` to keep all PRs
+draft until every member passes; they are then readied together and you merge
+them, so an atomic member asking for `merge: auto` is refused. The daemon
+adds a “Part of …” section with sibling PR links and reports one group outcome.
+
+`archon initiatives` lists groups; `archon initiatives show ini_…` shows the
+shared contract and members. `archon queue show qi_…` names its initiative.
+`update_initiative` appends to the shared contract or replaces it when what was
+agreed changes, and tells live member leads the whole new contract.
+From the CLI, `archon initiatives create request.json` sends the same request
+from a JSON or TOML file, `archon initiatives update ini_… --append-file
+more.md` appends, and `--contract-file revised.md` replaces (`-` reads stdin
+for either). Like an item, an initiative can be named by the start of its id:
+`archon initiatives show 01k2`. `[limits] initiative_members` and
+`initiative_contract_bytes` raise the 16 members and 2 KiB
+([configuration](configuration.md#structural-limits)).
+
+`archon initiatives cancel ini_…` stops unfinished members and leaves successful
+branches and PRs in place. `archon initiatives retry ini_…` resumes failed,
+cancelled and blocked members on their existing branches once no member is
+active. Successful members are preserved. A member failure holds queued siblings;
+retry the initiative to resume them. Retrying individual members does not reopen
+a failed or cancelled group.
+
 ## Using Archon from Aether's remote app
 
 This depends on an Aether build that has the remote app (a web app
@@ -427,7 +754,7 @@ to be served by that instance, not by your everyday Aether:
 - Give that instance its own `[remote] address` in
   `~/.config/archon/aether/config.toml`. The default, `127.0.0.1:8377`, is
   the one your own Aether uses, and two daemons cannot bind it. Restart
-  Archon's aetherd afterwards (`archon daemon stop --aether`, then `archon`).
+  Archon's aetherd afterwards (`archon daemon stop`, then `archon`).
   `archon setup --resync` rebuilds that file from your own Aether config, so
   set the address again after a resync.
 
@@ -456,11 +783,11 @@ risk and from what you told it, within a ceiling that only you can raise.
 
 | Knob | Values (default first) | What it changes |
 | --- | --- | --- |
-| `review` | `standard`, `strict`, `none` | `default-pr-review`, `strict-pr-review` or `quick-pr` |
+| `review` | `standard`, `strict`, `none` | how much independent checking the change gets. With no pipeline named the item runs `direct`; in `adaptive` or `direct` the stage agent delegates one, three or no reviewers and Archon verifies them. Any other pipeline has the level its gated stages give it, whatever its reviewer count: a gated review or test stage makes it `standard` and both make it `strict`, so `refactor` is `strict` with one reviewer |
 | `proposal` | `off`, `lavish` | `lavish`: a proposal page first, and nothing is built until you approve it |
 | `report` | `off`, `with-pr`, `before-pr` | a change report in the PR; `before-pr` waits for your approval before the PR |
-| `merge` | `manual`, `auto` | `auto`: the ship stage merges its own PR |
-| `tools` | `guarded`, `yolo` | `yolo`: the item's agents may delegate, and nothing waits for approval |
+| `merge` | `manual`, `auto` | `auto`: Archon asks GitHub to merge the PR once its checks allow |
+| `tools` | `guarded`, `yolo` | `guarded`: a stage agent delegates only when its stage sets `allow_delegation`. `yolo`: every stage agent may delegate, and nothing waits for approval |
 
 Answer a waiting proposal or report in chat with `/a <n> yes`,
 `/a <n> <feedback>` or `/a <n> reject`, with `archon answer <n> …`, on

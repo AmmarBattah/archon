@@ -3,6 +3,8 @@
 //! acts on is written out; only long free text is clipped, and says so.
 
 mod cost;
+mod initiatives;
+mod lessons;
 mod stages;
 
 use std::fmt::Write as _;
@@ -38,22 +40,7 @@ pub(super) fn reply(tool: &str, reply: &Reply) -> String {
         Reply::Item(item) => format!("{}{}", verb(tool), item_line(item, CLIP_CHARS)),
         Reply::Items(items) => listing("items", items.iter().map(|i| item_line(i, LINE_CHARS))),
         Reply::ItemDetail(detail) => item_detail(detail),
-        Reply::ItemSummaries(rows) => listing(
-            "items",
-            rows.iter().map(|row| {
-                let mut line = item_line(&row.item, LINE_CHARS);
-                if let Some(reason) = &row.waiting_reason {
-                    let _ = write!(
-                        line,
-                        "; waiting {}: {:?}; next: {:?}",
-                        snake(&reason.code),
-                        reason.message,
-                        reason.next_action
-                    );
-                }
-                line
-            }),
-        ),
+        Reply::ItemSummaries(rows) => item_summaries(rows),
         Reply::StageDetail(detail) => stages::detail(detail),
         Reply::Catalog(catalog) => catalog_text(catalog),
         Reply::ModelPolicy(policy) => policy_text(policy),
@@ -70,7 +57,13 @@ pub(super) fn reply(tool: &str, reply: &Reply) -> String {
         Reply::GithubComment { url } => format!("Posted {url}"),
         Reply::CostReport(report) => cost::report(report),
         Reply::ModelEvidence(report) => report.text(),
+        Reply::Initiatives(all) => initiatives::list(all),
+        Reply::Initiative(detail) => initiatives::detail(tool, detail),
+        Reply::Lesson(lesson) => lessons::recorded(lesson),
         Reply::Questions(_)
+        | Reply::Lessons(_)
+        | Reply::LessonsWhy(_)
+        | Reply::LessonStats(_)
         | Reply::Reports(_)
         | Reply::Welcome(_)
         | Reply::Subscribed { .. }
@@ -80,6 +73,26 @@ pub(super) fn reply(tool: &str, reply: &Reply) -> String {
         | Reply::Gc(_) => serde_json::to_string(reply)
             .unwrap_or_else(|e| format!("(reply could not be encoded: {e})")),
     }
+}
+
+fn item_summaries(rows: &[archon_core::protocol::ItemSummary]) -> String {
+    listing(
+        "items",
+        rows.iter().map(|row| {
+            let mut line = item_line(&row.item, LINE_CHARS);
+            switched(&mut line, row.switched_to.as_deref());
+            if let Some(reason) = &row.waiting_reason {
+                let _ = write!(
+                    line,
+                    "; waiting {}: {:?}; next: {:?}",
+                    snake(&reason.code),
+                    reason.message,
+                    reason.next_action
+                );
+            }
+            line
+        }),
+    )
 }
 
 fn question_text(tool: &str, question: &Question) -> String {
@@ -175,6 +188,13 @@ fn item_line(item: &QueueItem, reason_chars: usize) -> String {
     line
 }
 
+/// Name the catalog pipeline a steer switched the item to, if one did.
+fn switched(line: &mut String, to: Option<&str>) {
+    if let Some(to) = to {
+        let _ = write!(line, "; a steer switched it to pipeline {to}");
+    }
+}
+
 fn state_detail(state: &QueueState) -> Option<String> {
     match state {
         QueueState::Running { run } => Some(format!("run {run}")),
@@ -200,6 +220,7 @@ fn item_detail(detail: &ItemDetail) -> String {
         .budget_usd
         .map_or("the configured default".to_owned(), usd);
     let mut text = item_line(item, CLIP_CHARS);
+    switched(&mut text, detail.switched_to.as_deref());
     if let Some(reason) = &detail.waiting_reason {
         let _ = write!(
             text,
@@ -230,10 +251,20 @@ fn item_detail(detail: &ItemDetail) -> String {
         let older = (Some(&run.id) != latest).then_some(&run.id);
         for stage in detail.stages.iter().filter(|s| s.run == run.id) {
             let _ = write!(text, "\n  - {}", stage_line(&item.id, older, stage));
+            if let Some(delegation) = detail.delegations.get(&stage.id) {
+                let _ = write!(text, "\n    cost split: {}", delegation.line());
+            }
         }
     }
     if detail.runs.is_empty() {
         text.push_str("\nNo pipeline run yet.");
+    }
+    for steer in &detail.steers {
+        let at = steer.at.to_rfc3339();
+        let _ = write!(text, "\nSteered {at} by {}: {}", steer.by, steer.what);
+        if let Some(note) = &steer.note {
+            let _ = write!(text, " Note: {}", clip(note, CLIP_CHARS));
+        }
     }
     text
 }
@@ -365,9 +396,10 @@ fn stage_line(item: &QueueItemId, run: Option<&PipelineRunId>, stage: &StageRun)
         }
         other => snake(other).replace('_', " "),
     };
+    let choice = stage.current_choice();
     let mut line = format!(
         "{} attempt {} slot {}: {} {} [{state}]",
-        stage.stage_id, stage.attempt, stage.fan_index, stage.choice.model, stage.choice.effort
+        stage.stage_id, stage.attempt, stage.fan_index, choice.model, choice.effort
     );
     if let Some(verdict) = stage.verdict {
         let _ = write!(line, " verdict {}", snake(&verdict));
@@ -404,8 +436,17 @@ fn stage_ref(
     format!("get_stage with item {item}{run}, stage {stage:?}, attempt {attempt}, slot {slot}")
 }
 
+/// One line per pipeline, or a lone pipeline (one asked for by name) in full.
 fn catalog_text(catalog: &CatalogListing) -> String {
-    let mut text = listing("pipelines", catalog.pipelines.iter().map(pipeline_text));
+    let full = catalog.pipelines.len() == 1;
+    let lines = catalog.pipelines.iter().map(|pipeline| match full {
+        true => pipeline_text(pipeline),
+        false => pipeline_line(pipeline),
+    });
+    let mut text = listing("pipelines", lines);
+    if catalog.pipelines.len() > 1 {
+        text.push_str("\nName a `pipeline` to see its stages, gates, loops and nudges.");
+    }
     for problem in &catalog.problems {
         let place = problem
             .path
@@ -419,6 +460,24 @@ fn catalog_text(catalog: &CatalogListing) -> String {
             problem.error
         );
     }
+    text
+}
+
+/// What choosing `pipeline` takes: its description and stage ids.
+fn pipeline_line(pipeline: &PipelineSummary) -> String {
+    let stages: Vec<&str> = pipeline.stages.iter().map(|s| s.id.as_str()).collect();
+    assert!(!stages.is_empty(), "a loaded pipeline has stages");
+    let mut text = format!(
+        "{} ({}): {}; stages {}",
+        pipeline.name,
+        snake(&pipeline.source),
+        pipeline.description,
+        stages.join(", ")
+    );
+    if let Some(tier) = pipeline.nudges.tier {
+        let _ = write!(text, "; tier {}", snake(&tier));
+    }
+    text.push('.');
     text
 }
 

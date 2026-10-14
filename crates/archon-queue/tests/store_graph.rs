@@ -55,6 +55,7 @@ fn an_item_keeps_the_github_thread_that_asked_for_it() {
     let first = QueueItem {
         origin: Some(thread()),
         fresh_retries: 0,
+        initiative: None,
         ..item(Some(&repo), "fix")
     };
     store.insert_item(&first, Some("gh-1")).unwrap();
@@ -72,6 +73,7 @@ fn an_item_keeps_the_github_thread_that_asked_for_it() {
         id: QueueItemId::new(),
         origin: None,
         fresh_retries: 0,
+        initiative: None,
         ..first
     };
     let err = store.insert_item(&unasked, Some("gh-1")).unwrap_err();
@@ -109,6 +111,7 @@ fn request_variants(first: &QueueItem) -> Vec<QueueItem> {
         QueueItem {
             origin: Some(thread()),
             fresh_retries: 0,
+            initiative: None,
             ..base.clone()
         },
         QueueItem {
@@ -406,6 +409,7 @@ fn the_snapshot_counts_live_agents_runs_pause_and_spend() {
         item: Some(items[0].id.clone()),
         cost_usd: 1.0,
         cost_basis: archon_core::cost::CostBasis::ProviderReported,
+        cost_complete: None,
         estimated_cost_usd: 2.0,
         input_tokens: 1,
         output_tokens: 1,
@@ -417,7 +421,7 @@ fn the_snapshot_counts_live_agents_runs_pause_and_spend() {
     assert_eq!(snapshot.running_total, 4);
     assert_eq!(snapshot.running_by_repo.get(&repo.id), Some(&3));
     assert_eq!(snapshot.running_by_repo.len(), 1);
-    assert_eq!(snapshot.running_by_pipeline.get("quick-pr"), Some(&3));
+    assert_eq!(snapshot.running_by_pipeline.get("direct"), Some(&3));
     assert_eq!(snapshot.running_by_pipeline.get("ask"), Some(&1));
     assert_eq!(snapshot.active_runs, 3);
     assert_eq!(snapshot.pause, pause);

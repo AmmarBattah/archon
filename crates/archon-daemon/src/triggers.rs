@@ -1,14 +1,19 @@
 //! Archon news for the orchestrator, delivered as Aether `trigger`s with
 //! `source = "archon"` and coalesced (ARCHITECTURE §5.4).
-//! Other components enqueue events through [`push`]; a long or stale
+//! Other components enqueue events through [`push`], or [`push_quiet`] for
+//! routine news that waits for the orchestrator's next turn; a long or stale
 //! backlog is compacted as it is keyed (see `compact`).
 
 mod compact;
+mod directives;
+mod flush;
+mod routine;
 mod summary;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use archon_core::Timestamp;
 use archon_core::aether_ids::AetherAgentId;
 use archon_core::autonomy::Directive;
 use archon_core::error::ArchonError;
@@ -22,6 +27,10 @@ use tokio::time::Instant;
 
 pub use self::compact::MAX_PENDING;
 use self::compact::{Facts, Held};
+pub use self::directives::DirectiveChanges;
+use self::directives::DirectiveNews;
+pub use self::flush::flush_quiet;
+pub use self::routine::{FinishedItem, MAX_LISTED};
 use crate::context::DaemonContext;
 use crate::{feed, supervisor};
 
@@ -57,10 +66,21 @@ pub enum TriggerEvent {
         summary: String,
         pr_url: Option<String>,
         cost_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lesson_hint: Option<String>,
         /// The GitHub thread that asked for the item; the orchestrator
         /// reports the outcome there.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<GithubThread>,
+    },
+    InitiativeFinished {
+        initiative: archon_core::id::InitiativeId,
+        title: String,
+        state: String,
+        members: Vec<QueueItemId>,
+        /// The finished members' outcomes, as `item_finished` words them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        results: Vec<MemberResult>,
     },
     ItemBlocked {
         item: QueueItemId,
@@ -122,6 +142,40 @@ pub enum TriggerEvent {
         /// Where the orchestrator finds the detail.
         note: String,
     },
+    /// Items that finished without needing the orchestrator since its last
+    /// turn, newest outcome of each; made when news is keyed, never pushed.
+    ItemsFinished {
+        items: Vec<FinishedItem>,
+        /// Older ones left out of `items`.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        more: u32,
+    },
+    /// A mirror changed state: `stale` (a refresh failed), `withheld` (its
+    /// model policy refuses the orchestrator) or `current` again.
+    Mirror {
+        repo: String,
+        state: String,
+        detail: String,
+    },
+    /// The orchestrator may have lost the directives (a new generation, a
+    /// compacted context): this trigger's `directives` state all in force.
+    DirectivesRestated {
+        reason: String,
+    },
+}
+
+/// One finished member of an `initiative_finished` event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemberResult {
+    pub item: QueueItemId,
+    /// `QueueState::kind()`.
+    pub state: String,
+    pub summary: String,
+    pub cost_usd: f64,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 impl TriggerEvent {
@@ -146,6 +200,7 @@ impl TriggerEvent {
         match self {
             Self::AgentMessage { .. } => "agent_message",
             Self::ItemFinished { .. } => "item_finished",
+            Self::InitiativeFinished { .. } => "initiative_finished",
             Self::ItemBlocked { .. } => "item_blocked",
             Self::OperatorAnswer { .. } => "operator_answer",
             Self::GateOpened { .. } => "gate_opened",
@@ -154,6 +209,31 @@ impl TriggerEvent {
             Self::Budget { .. } => "budget",
             Self::PolicyViolation { .. } => "policy_violation",
             Self::NewsDigest { .. } => "news_digest",
+            Self::ItemsFinished { .. } => "items_finished",
+            Self::Mirror { .. } => "mirror",
+            Self::DirectivesRestated { .. } => "directives_restated",
+        }
+    }
+
+    /// Whether the operator waits on the turn it starts, or must act on it:
+    /// such news skips the coalescing window.
+    fn is_urgent(&self) -> bool {
+        use archon_core::agent_message::MessageKind;
+        match self {
+            Self::OperatorAnswer { .. }
+            | Self::ChatAnswer { .. }
+            | Self::GateOpened { .. }
+            | Self::ItemBlocked { .. }
+            | Self::LavishFeedback { .. }
+            | Self::Budget { .. } => true,
+            Self::AgentMessage { message } => message.kind == MessageKind::Escalation,
+            Self::ItemFinished { .. }
+            | Self::InitiativeFinished { .. }
+            | Self::PolicyViolation { .. }
+            | Self::NewsDigest { .. }
+            | Self::ItemsFinished { .. }
+            | Self::Mirror { .. }
+            | Self::DirectivesRestated { .. } => false,
         }
     }
 }
@@ -215,15 +295,23 @@ fn excerpt(text: &str, limit: usize) -> String {
     )
 }
 
-/// Every trigger restates the operator directives in force (ARCHITECTURE
-/// §18.5). Serialization adds a one-line `summary` for the TUI, derived
-/// from `events` so restored batches and callers cannot carry stale labels.
+/// One trigger; a generation's first states every directive, later ones what
+/// changed (§18.5). Serializing adds a `summary` line derived from `events`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TriggerPayload {
     pub archon: u32,
     pub events: Vec<TriggerEvent>,
+    /// Every directive in force, when this trigger restates them.
     #[serde(default)]
-    pub directives: Vec<Directive>,
+    pub directives: Option<Vec<Directive>>,
+    /// What was set and cleared since the trigger before; absent when
+    /// nothing was, or when `directives` states them all.
+    #[serde(default)]
+    pub directive_changes: Option<DirectiveChanges>,
+    /// How many directives are in force, in every trigger: an orchestrator
+    /// that holds fewer lost some and reads them with `autonomy_policy`.
+    #[serde(default)]
+    pub directives_in_force: u32,
 }
 
 /// Every event pushed and not yet delivered. Each change is a single
@@ -237,22 +325,59 @@ struct Outbox {
     /// waited, so the next batch is compacted whatever its size.
     #[serde(default)]
     collapse: bool,
+    /// The orchestrator is starting a turn anyway: quiet news goes out now.
+    #[serde(default)]
+    flush: bool,
+}
+
+impl Outbox {
+    /// Whether `pending` makes a trigger at `now`: some of it wakes the
+    /// orchestrator, or a turn is starting that quiet news can join.
+    fn is_due(&self, now: Timestamp) -> bool {
+        !self.pending.is_empty() && (self.flush || self.pending.iter().any(|news| news.wakes(now)))
+    }
+
+    /// Whether `pending` should go out without waiting for more news.
+    fn is_now(&self, now: Timestamp) -> bool {
+        self.is_due(now) && (self.flush || self.pending.iter().any(|news| news.event.is_urgent()))
+    }
+
+    /// When the first deferred news comes due, if nothing wakes the
+    /// orchestrator before.
+    fn next_due(&self) -> Option<Timestamp> {
+        let deferred = self.pending.iter().filter(|news| !news.quiet);
+        deferred.filter_map(|news| news.defer_until).min()
+    }
 }
 
 /// One trigger under the idempotency key it keeps across retries, with the
-/// directives in force when it was keyed, so a retry sends the same payload.
+/// directive news decided when it was keyed, so a retry sends the same payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Batch {
     key: String,
     events: Vec<TriggerEvent>,
-    #[serde(default)]
-    directives: Vec<Directive>,
+    #[serde(flatten)]
+    directives: DirectiveNews,
 }
 
 /// Wakes the delivery task; the news itself waits in the outbox.
 #[derive(Debug, Default)]
 pub struct TriggerQueue {
     news: Notify,
+    /// Cuts the coalescing window short: a turn is starting right now.
+    urgent: Notify,
+    /// Batches delivered, or keyed with nothing left to tell, since start;
+    /// changed under the store lock, so [`flush_quiet`] can wait on it.
+    settled: watch::Sender<u64>,
+}
+
+impl TriggerQueue {
+    /// Count one more batch settled; the caller holds the store lock.
+    fn settle_one(&self) {
+        let before = *self.settled.borrow();
+        self.settled.send_modify(|count| *count += 1);
+        assert_eq!(*self.settled.borrow(), before + 1, "one batch at a time");
+    }
 }
 
 /// Save `event` for the orchestrator, then wake delivery. Once this returns
@@ -265,19 +390,84 @@ pub async fn push(ctx: &DaemonContext, event: TriggerEvent) -> Result<(), Archon
     Ok(())
 }
 
+/// Save routine `event`, durably, without waking the orchestrator: it joins the
+/// next trigger or operator turn ([`flush_quiet`]).
+pub async fn push_quiet(ctx: &DaemonContext, event: TriggerEvent) -> Result<(), ArchonError> {
+    let news = Held::new(event, archon_core::now(), true);
+    hold_as(&mut *ctx.store.lock().await, news)
+}
+
+/// Enqueue a durable event and its receipt in one store transaction.
+pub(crate) async fn push_once(
+    ctx: &DaemonContext,
+    event: TriggerEvent,
+    key: &str,
+) -> Result<(), ArchonError> {
+    let mut store = ctx.store.lock().await;
+    if store.kv_get(key)?.is_some() {
+        return Ok(());
+    }
+    assert!(!key.is_empty());
+    assert!(matches!(event, TriggerEvent::InitiativeFinished { .. }));
+    let mut outbox = read_outbox(&store)?;
+    outbox
+        .pending
+        .push(Held::new(event, archon_core::now(), false));
+    if outbox.pending.len() > MAX_PENDING {
+        compact_pending(&mut store, &mut outbox)?;
+    }
+    let raw = serde_json::to_string(&outbox)?;
+    let entry = archon_core::notify::FeedEntry::System {
+        text: "Initiative finished; coordinated result queued.".into(),
+    };
+    let saved = store.append_feed_with_kv(
+        entry,
+        archon_core::now(),
+        &[(OUTBOX_KEY, &raw), (key, "queued")],
+    )?;
+    drop(store);
+    crate::feed::publish(ctx, vec![saved]);
+    wake(ctx);
+    Ok(())
+}
+
 /// Save `event` under the caller's store lock, beside the change it reports;
 /// the caller then calls [`wake`].
 pub(crate) fn hold(store: &mut Store, event: TriggerEvent) -> Result<(), ArchonError> {
+    hold_as(store, Held::new(event, archon_core::now(), false))
+}
+
+/// Save an item's success under the caller's store lock, to wake the
+/// orchestrator at `until` unless news wakes it before; the caller then calls [`wake`].
+pub(crate) fn hold_deferred(
+    store: &mut Store,
+    event: TriggerEvent,
+    until: Timestamp,
+) -> Result<(), ArchonError> {
+    let now = archon_core::now();
+    assert!(until > now, "deferred news comes due later");
     assert!(
-        !matches!(event, TriggerEvent::NewsDigest { .. }),
+        matches!(&event, TriggerEvent::ItemFinished { state, .. } if state == "succeeded"),
+        "only a routine success waits for company"
+    );
+    let news = Held {
+        defer_until: Some(until),
+        ..Held::new(event, now, false)
+    };
+    hold_as(store, news)
+}
+
+fn hold_as(store: &mut Store, news: Held) -> Result<(), ArchonError> {
+    assert!(
+        !matches!(
+            news.event,
+            TriggerEvent::NewsDigest { .. } | TriggerEvent::ItemsFinished { .. }
+        ),
         "a digest is made when news is keyed, never pushed"
     );
     let mut outbox = read_outbox(store)?;
     let before = outbox.pending.len();
-    outbox.pending.push(Held {
-        event,
-        pushed_at: Some(archon_core::now()),
-    });
+    outbox.pending.push(news);
     if outbox.pending.len() > MAX_PENDING {
         compact_pending(store, &mut outbox)?;
     }
@@ -288,28 +478,33 @@ pub(crate) fn hold(store: &mut Store, event: TriggerEvent) -> Result<(), ArchonE
     write_outbox(store, &outbox)
 }
 
+/// Record a stage's or run node's message as one feed entry and the
+/// orchestrator's news together; only an escalation shows in the quiet chat.
 pub(crate) fn record_message(
     store: &mut Store,
     message: archon_core::agent_message::AgentMessage,
     updates: &[(&str, &str)],
 ) -> Result<archon_core::notify::FeedItem, ArchonError> {
+    use archon_core::agent_message::MessageKind;
     use archon_core::notify::{FeedEntry, Notification, NotificationKind};
     let at = archon_core::now();
+    let kind = match message.kind {
+        MessageKind::Escalation => NotificationKind::Blocker,
+        MessageKind::Relay | MessageKind::Info => NotificationKind::Progress,
+    };
     let entry = FeedEntry::Notification(Notification {
         id: archon_core::id::NotificationId::new(),
-        kind: NotificationKind::Progress,
-        text: serde_json::to_string(&message)?,
+        kind,
+        text: summary::feed_line(&message),
         item: Some(message.item.clone()),
         run: Some(message.run.clone()),
         at,
     });
     let mut outbox = read_outbox(store)?;
-    outbox.pending.push(Held {
-        event: TriggerEvent::AgentMessage {
-            message: Box::new(message),
-        },
-        pushed_at: Some(at),
-    });
+    let event = TriggerEvent::AgentMessage {
+        message: Box::new(message),
+    };
+    outbox.pending.push(Held::new(event, at, false));
     if outbox.pending.len() > MAX_PENDING {
         compact_pending(store, &mut outbox)?;
     }
@@ -360,40 +555,86 @@ pub async fn deliver_loop(ctx: std::sync::Arc<DaemonContext>) -> Result<(), Arch
     }
 }
 
-/// Wait for news when none is held, then let more gather for `coalesce`.
+/// Wait for news that makes a trigger, then let more gather for `coalesce`.
 /// The window is not extended by later events, so a steady stream still
-/// yields a trigger per window.
+/// yields a trigger per window. Quiet news alone is not waited on; a flush
+/// or urgent news ends the window, as the operator waits on that turn.
 async fn wait_for_news(ctx: &DaemonContext, coalesce: Duration) -> Result<(), ArchonError> {
-    let held = read_outbox(&*ctx.store.lock().await)?;
-    assert!(
-        held.in_flight.is_none(),
-        "news waits only when nothing is in flight"
-    );
-    if held.pending.is_empty() {
-        ctx.triggers.news.notified().await;
+    wait_until_due(ctx).await?;
+    let deadline = tokio::time::Instant::now() + coalesce;
+    loop {
+        // Enabled before the outbox is read, so a flush in between still ends the window.
+        let flushed = ctx.triggers.urgent.notified();
+        tokio::pin!(flushed);
+        flushed.as_mut().enable();
+        let held = read_outbox(&*ctx.store.lock().await)?;
+        assert!(held.in_flight.is_none(), "only this task keys a batch");
+        let now = archon_core::now();
+        // Compaction may have left nothing waking; keying then finds nothing due.
+        if !held.is_due(now) || held.is_now(now) {
+            return Ok(());
+        }
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => return Ok(()),
+            () = flushed => return Ok(()),
+            () = ctx.triggers.news.notified() => {}
+        }
     }
-    tokio::time::sleep(coalesce).await;
-    Ok(())
+}
+
+/// Wait until held news makes a trigger: news arrives, or deferred news
+/// comes due.
+async fn wait_until_due(ctx: &DaemonContext) -> Result<(), ArchonError> {
+    loop {
+        let held = read_outbox(&*ctx.store.lock().await)?;
+        assert!(
+            held.in_flight.is_none(),
+            "news waits only when nothing is in flight"
+        );
+        let now = archon_core::now();
+        if held.is_due(now) {
+            return Ok(());
+        }
+        let Some(due) = held.next_due() else {
+            ctx.triggers.news.notified().await;
+            continue;
+        };
+        let wait = (due - now).to_std();
+        assert!(wait.is_ok(), "news not due yet comes due later");
+        tokio::select! {
+            () = tokio::time::sleep(wait.unwrap_or_default()) => {}
+            () = ctx.triggers.news.notified() => {}
+        }
+    }
 }
 
 /// Move every pending event into one keyed batch, compacted when it is
-/// due; a no-op when none waits. A batch already keyed is never touched.
+/// due; a no-op while only quiet news waits. A batch already keyed is never
+/// touched.
 async fn key_pending(ctx: &DaemonContext) -> Result<(), ArchonError> {
     let store_id = supervisor::store_id(ctx).await?;
+    let generation = supervisor::generation(ctx).await?;
     let mut store = ctx.store.lock().await;
     let mut outbox = read_outbox(&store)?;
     assert!(
         outbox.in_flight.is_none(),
         "one batch is in flight at a time"
     );
-    if outbox.pending.is_empty() {
+    if !outbox.is_due(archon_core::now()) {
         return Ok(());
     }
     let held = std::mem::take(&mut outbox.pending);
     let collapse = std::mem::take(&mut outbox.collapse);
+    outbox.flush = false;
     let events = batch_events(&mut store, held, collapse)?;
+    if events.is_empty() {
+        // Every outcome held was superseded since: nothing is left to tell.
+        write_outbox(&mut store, &outbox)?;
+        ctx.triggers.settle_one();
+        return Ok(());
+    }
     let key = batch_key(&mut store, &store_id, events.len())?;
-    let directives = store.directives(archon_core::now())?;
+    let directives = directives::for_batch(&mut store, generation, archon_core::now())?;
     outbox.in_flight = Some(Batch {
         key,
         events,
@@ -402,7 +643,8 @@ async fn key_pending(ctx: &DaemonContext) -> Result<(), ArchonError> {
     write_outbox(&mut store, &outbox)
 }
 
-/// `held` as a batch: compacted when a fresh orchestrator inherits it
+/// `held` as a batch: its quiet item outcomes as one short list behind the
+/// rest, which is compacted when a fresh orchestrator inherits it
 /// (`collapse`) or it is too long or too old to replay in full.
 fn batch_events(
     store: &mut Store,
@@ -411,37 +653,71 @@ fn batch_events(
 ) -> Result<Vec<TriggerEvent>, ArchonError> {
     assert!(!held.is_empty(), "only held news makes a batch");
     let now = archon_core::now();
-    if !collapse && !compact::needs_compaction(&held, now) {
-        return Ok(held.into_iter().map(|news| news.event).collect());
-    }
     let facts = Facts::gather(store, &held)?;
+    let (finished, held) = routine::fold(held, &facts);
     let before = held.len();
-    let events: Vec<TriggerEvent> = compact::compact(held, &facts, now)
-        .into_iter()
-        .map(|news| news.event)
-        .collect();
-    assert!(!events.is_empty(), "compaction keeps at least a digest");
-    tracing::info!(
-        before,
-        after = events.len(),
-        collapse,
-        "compacted held news"
+    let compacting = before > 0 && (collapse || compact::needs_compaction(&held, now));
+    let kept = match compacting {
+        true => compact::compact(held, &facts, now),
+        false => held,
+    };
+    assert!(
+        !compacting || !kept.is_empty(),
+        "compaction keeps at least a digest"
     );
+    if compacting {
+        tracing::info!(before, after = kept.len(), collapse, "compacted held news");
+    }
+    let mut events: Vec<TriggerEvent> = kept
+        .into_iter()
+        .map(|news| facts.with_settled_cost(news.event))
+        .collect();
+    events.extend(finished);
     Ok(events)
 }
 
-/// A fresh orchestrator generation has none of its predecessor's context:
-/// compact the news it inherits, pending now, when it is next keyed,
-/// whatever its size. A batch already keyed goes out as it is, and news
-/// pushed after this is news to the new generation, compacted only as usual.
+/// A new generation lacks its predecessor's context: compact the pending news
+/// it inherits when next keyed, and state every directive to it.
 pub async fn collapse_for_new_orchestrator(ctx: &DaemonContext) -> Result<(), ArchonError> {
-    let mut store = ctx.store.lock().await;
-    let mut outbox = read_outbox(&store)?;
-    if outbox.pending.is_empty() {
-        return Ok(());
+    let generation = supervisor::generation(ctx).await?;
+    {
+        let mut store = ctx.store.lock().await;
+        // It runs this Archon's prompt, which reads `directive_changes`.
+        directives::teach_changes(&mut store, generation)?;
+        let mut outbox = read_outbox(&store)?;
+        if !outbox.pending.is_empty() {
+            outbox.collapse = true;
+            write_outbox(&mut store, &outbox)?;
+        }
+        // The batch in flight reaches the new generation: what it states is told.
+        let stated = outbox
+            .in_flight
+            .and_then(|batch| batch.directives.directives);
+        if let Some(stated) = stated {
+            return directives::record_told(&mut store, generation, stated);
+        }
     }
-    outbox.collapse = true;
-    write_outbox(&mut store, &outbox)
+    restate_directives(ctx, "a new orchestrator generation started").await
+}
+
+/// The orchestrator lost the directives (new, or compacted): the next trigger
+/// states all in force, and is sent now when any is.
+pub async fn restate_directives(ctx: &DaemonContext, reason: &str) -> Result<(), ArchonError> {
+    assert!(!reason.is_empty(), "the orchestrator is told why");
+    {
+        let mut store = ctx.store.lock().await;
+        if !directives::forget_told(&mut store, archon_core::now())? {
+            return Ok(());
+        }
+        let restated = |news: &Held| matches!(news.event, TriggerEvent::DirectivesRestated { .. });
+        // One already waits: the trigger it leaves in states them all.
+        if !read_outbox(&store)?.pending.iter().any(restated) {
+            let reason = reason.to_owned();
+            hold(&mut store, TriggerEvent::DirectivesRestated { reason })?;
+        }
+    }
+    ctx.triggers.news.notify_one();
+    Ok(())
 }
 
 /// Drop the batch the orchestrator now has; news pushed meanwhile stays.
@@ -453,7 +729,9 @@ async fn forget_delivered(ctx: &DaemonContext, key: &str) -> Result<(), ArchonEr
         delivered.is_some_and(|batch| batch.key == key),
         "only the batch in flight is delivered"
     );
-    write_outbox(&mut store, &outbox)
+    write_outbox(&mut store, &outbox)?;
+    ctx.triggers.settle_one();
+    Ok(())
 }
 
 fn read_outbox(store: &Store) -> Result<Outbox, ArchonError> {
@@ -482,6 +760,13 @@ pub async fn held(ctx: &DaemonContext) -> Result<Vec<TriggerEvent>, ArchonError>
     let mut events = outbox.in_flight.map_or_else(Vec::new, |batch| batch.events);
     events.extend(outbox.pending.into_iter().map(|news| news.event));
     Ok(events)
+}
+
+/// Whether held news is sent without waiting for more: a batch is in flight,
+/// or some of it wakes the orchestrator. Quiet news alone is not due.
+pub async fn due(ctx: &DaemonContext) -> Result<bool, ArchonError> {
+    let outbox = read_outbox(&*ctx.store.lock().await)?;
+    Ok(outbox.in_flight.is_some() || outbox.is_due(archon_core::now()))
 }
 
 /// How many news events wait for the orchestrator (see [`held`]).
@@ -518,7 +803,9 @@ async fn deliver(ctx: &DaemonContext, batch: &Batch) -> Result<(), ArchonError> 
     let payload = serde_json::to_value(TriggerPayload {
         archon: PAYLOAD_VERSION,
         events: batch.events.clone(),
-        directives: batch.directives.clone(),
+        directives: batch.directives.directives.clone(),
+        directive_changes: batch.directives.directive_changes.clone(),
+        directives_in_force: batch.directives.in_force(),
     })?;
     let payload = &payload;
     let mut orchestrator = ctx.supervisor.watch();
@@ -587,6 +874,41 @@ async fn attempt(
 mod tests {
     use super::*;
 
+    fn success() -> TriggerEvent {
+        TriggerEvent::ItemFinished {
+            item: QueueItemId::new(),
+            title: "a routine change".into(),
+            state: "succeeded".into(),
+            summary: "done".into(),
+            pr_url: None,
+            cost_usd: 0.0,
+            origin: None,
+            lesson_hint: None,
+        }
+    }
+
+    #[test]
+    fn deferred_news_comes_due_at_its_time_or_with_news_that_wakes_now() {
+        let now = archon_core::now();
+        let until = now + chrono::TimeDelta::minutes(5);
+        let deferred = Held {
+            defer_until: Some(until),
+            ..Held::new(success(), now, false)
+        };
+        let mut outbox = Outbox {
+            pending: vec![deferred, Held::new(success(), now, true)],
+            ..Outbox::default()
+        };
+        assert!(!outbox.is_due(now), "deferred and quiet news wait");
+        assert_eq!(outbox.next_due(), Some(until), "quiet news never comes due");
+        assert!(outbox.is_due(until), "deferred news wakes at its time");
+        outbox.pending.push(Held::new(success(), now, false));
+        assert!(outbox.is_due(now), "news waking now carries the rest along");
+        outbox.pending.truncate(2);
+        outbox.flush = true;
+        assert!(outbox.is_now(now), "a turn starting takes it at once");
+    }
+
     #[test]
     fn payload_matches_the_documented_shape() {
         let directive = archon_core::autonomy::Directive::new(
@@ -602,13 +924,44 @@ mod tests {
                 item: QueueItemId::new(),
                 reason: "dependency failed".into(),
             }],
-            directives: vec![directive],
+            directives: Some(vec![directive.clone()]),
+            directive_changes: None,
+            directives_in_force: 1,
         };
         let value = serde_json::to_value(&payload).unwrap();
         assert_eq!(value["archon"], 1);
+        assert_eq!(value["directives_in_force"], 1);
         assert_eq!(value["events"][0]["type"], "item_blocked");
         assert_eq!(value["directives"][0]["text"], "merge docs fixes yourself");
         assert_eq!(value["directives"][0]["source"], "operator");
+        assert!(value.get("directive_changes").is_none(), "{value}");
+
+        let later = TriggerPayload {
+            directives: None,
+            directive_changes: Some(DirectiveChanges {
+                set: Vec::new(),
+                cleared: vec![directive],
+            }),
+            directives_in_force: 0,
+            ..payload.clone()
+        };
+        let value = serde_json::to_value(&later).unwrap();
+        assert!(
+            value.get("directives").is_none(),
+            "only the change: {value}"
+        );
+        let cleared = &value["directive_changes"]["cleared"];
+        assert_eq!(cleared[0]["text"], "merge docs fixes yourself");
+        assert!(value["directive_changes"].get("set").is_none(), "{value}");
+
+        let unchanged = TriggerPayload {
+            directives: None,
+            directive_changes: None,
+            ..payload
+        };
+        let value = serde_json::to_value(&unchanged).unwrap();
+        assert!(value.get("directives").is_none() && value.get("directive_changes").is_none());
+        assert_eq!(value["directives_in_force"], 1, "said in every trigger");
     }
 
     #[test]
@@ -643,6 +996,16 @@ mod tests {
                 dropped: BTreeMap::from([("budget".to_owned(), 2)]),
                 note: "n".into(),
             },
+            TriggerEvent::ItemsFinished {
+                items: Vec::new(),
+                more: 2,
+            },
+            TriggerEvent::Mirror {
+                repo: "alpha".into(),
+                state: "stale".into(),
+                detail: "d".into(),
+            },
+            TriggerEvent::DirectivesRestated { reason: "r".into() },
         ];
         for event in events {
             let value = serde_json::to_value(&event).unwrap();

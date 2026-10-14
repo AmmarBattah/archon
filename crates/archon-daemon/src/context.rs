@@ -17,6 +17,7 @@ use crate::disk::DiskWatch;
 use crate::executor::RunTable;
 use crate::feed::ReplyTracker;
 use crate::github::GithubState;
+use crate::mirror::MirrorQueue;
 use crate::supervisor::Supervisor;
 use crate::triggers::TriggerQueue;
 
@@ -69,6 +70,7 @@ pub struct DaemonContext {
     /// Poked on enqueue, settle, caps or pause change, and when a gc mark
     /// goes.
     pub dispatch: Arc<Notify>,
+    pub coordination: crate::executor::coordination::Coordination,
     /// Active run drivers and their pending spawns.
     pub runs: Mutex<RunTable>,
     /// Orchestrator chat reply detection.
@@ -83,6 +85,11 @@ pub struct DaemonContext {
     /// Serializes edits of Aether's GitHub watcher config.
     pub github: GithubState,
     pub triggers: TriggerQueue,
+    /// Wakes the worker that keeps the orchestrator's repository mirrors.
+    pub mirrors: MirrorQueue,
+    /// Signalled when a spawn's outcome is recorded, for a fleet event of the
+    /// new agent that arrived before it (`pump::fleet`).
+    pub spawn_recorded: Notify,
     /// Runtime override from `SetCaps`; `None` uses `config.limits`.
     pub caps_override: Mutex<Option<Caps>>,
     pub lavish: Option<Lavish>,

@@ -1,6 +1,7 @@
 //! `archon doctor` checks the pieces Archon depends on; in shared mode
 //! `archon setup` registers the MCP server and then runs the MCP checks.
 
+mod mcp_tools;
 mod registry;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +31,8 @@ use crate::style::{Palette, Style};
 use registry::{COMMAND_TIMEOUT, Registry, run_bounded};
 
 const AETHER_TIMEOUT: Duration = Duration::from_secs(5);
+/// The oldest git `archond` runs: restacking merges with `merge-tree --write-tree`.
+const MIN_GIT: (u32, u32) = (2, 38);
 /// The check-name column; the longest name is `mcp registered`.
 const NAME_WIDTH: usize = 14;
 
@@ -59,7 +62,9 @@ pub async fn run(json: bool) -> anyhow::Result<ExitCode> {
     let (config_check, config) = check_config();
     let instance = Instance::resolve()?;
     let dedicated = config.aether.mode == AetherMode::Dedicated;
-    let mut checks = vec![config_check, check_mode(&config, &instance)];
+    let mut checks = vec![config_check];
+    checks.extend(check_legacy_config(&archon_core::paths::config_dir()));
+    checks.push(check_mode(&config, &instance));
     let aether = connect_aether(&effective_aether(&config.aether, &instance)).await;
     checks.push(match &aether {
         Ok(client) => aether_ok(client.welcome(), config.aether.mode),
@@ -76,12 +81,17 @@ pub async fn run(json: bool) -> anyhow::Result<ExitCode> {
         AetherMode::Dedicated => instance.config_path(),
         AetherMode::Shared => setup::aether_config_path(),
     };
-    checks.push(check_registration(&registered_in, &archon_bin()?));
+    checks.push(check_registration(
+        &registered_in,
+        &archon_bin()?,
+        config.aether.mode,
+    ));
     if dedicated {
         checks.push(check_links(&operator_config_dir()?, &instance));
         checks.push(check_calm(&instance));
     }
     checks.push(check_mcp_health(aether.as_ref().ok()).await);
+    checks.extend(mcp_tools::check_mcp_tools(aether.as_ref().ok(), config.aether.mode).await);
     let archond = connect_existing().await;
     checks.push(check_archond(&archond));
     let registry = Registry::read(&archond, config.aether.mode).await;
@@ -132,7 +142,7 @@ pub(super) async fn setup_shared(config: &Config, json: bool) -> anyhow::Result<
         Registration::Added => println!("Registered the archon MCP server in {}.", path.display()),
         Registration::AlreadyPresent(server) => {
             println!("{} already declares an archon MCP server.", path.display());
-            if let Some((_, problem)) = command_problem(server.command.as_deref(), &bin) {
+            if let Some((_, problem)) = registration_problem(&server, &bin, AetherMode::Shared) {
                 println!("Left unchanged, but {problem}.");
             }
         }
@@ -316,6 +326,13 @@ fn check_config() -> (Check, Config) {
     }
 }
 
+/// An `archon.toml` from before 1.0, which the operator may believe
+/// configures Archon. `None` when there is none.
+fn check_legacy_config(config_dir: &Path) -> Option<Check> {
+    archon_core::config_files::legacy_config_notice(config_dir)
+        .map(|notice| check("legacy config", Level::Warn, notice))
+}
+
 pub(super) async fn connect_aether(
     config: &archon_core::config::AetherConfig,
 ) -> Result<AetherClient, String> {
@@ -389,7 +406,7 @@ fn watcher_gap(protocol: u32) -> Option<String> {
     ))
 }
 
-fn check_registration(path: &Path, archon_bin: &Path) -> Check {
+fn check_registration(path: &Path, archon_bin: &Path, mode: AetherMode) -> Check {
     const NAME: &str = "mcp registered";
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -413,10 +430,37 @@ fn check_registration(path: &Path, archon_bin: &Path) -> Check {
             return check(NAME, Level::Fail, detail);
         }
     };
-    match command_problem(server.command.as_deref(), archon_bin) {
+    match registration_problem(&server, archon_bin, mode) {
         None => check(NAME, Level::Ok, path.display().to_string()),
         Some((level, problem)) => check(NAME, level, format!("{}: {problem}", path.display())),
     }
+}
+
+/// What is wrong with the registered server, if anything. A command that
+/// cannot run comes first: nothing else matters until it does.
+fn registration_problem(
+    server: &setup::ArchonServer,
+    archon_bin: &Path,
+    mode: AetherMode,
+) -> Option<(Level, String)> {
+    let command = command_problem(server.command.as_deref(), archon_bin);
+    if server.names_callers || matches!(command, Some((Level::Fail, _))) {
+        return command;
+    }
+    let fix = match mode {
+        AetherMode::Dedicated => {
+            "the next archon command that starts Archon (`archon status`) repairs it and \
+             restarts Archon's aetherd"
+        }
+        AetherMode::Shared => {
+            "add it to that server, then restart aetherd, which reads it only as it starts"
+        }
+    };
+    let problem = format!(
+        "its `archon` server lacks `send_caller_meta = true`, so archond cannot tell its \
+         orchestrator from other agents: {fix}"
+    );
+    Some((Level::Fail, problem))
 }
 
 /// What is wrong with the registered `command`, if anything: a command that
@@ -541,11 +585,7 @@ fn disk_verdict(reading: Result<DiskReading, ArchonError>, min_free_bytes: u64) 
 
 async fn check_git() -> Check {
     match run_bounded(Path::new("git"), &["--version"], None, COMMAND_TIMEOUT).await {
-        Ok(out) if out.status.success() => check(
-            "git",
-            Level::Ok,
-            String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-        ),
+        Ok(out) if out.status.success() => git_verdict(String::from_utf8_lossy(&out.stdout).trim()),
         Ok(out) => check(
             "git",
             Level::Fail,
@@ -553,6 +593,30 @@ async fn check_git() -> Check {
         ),
         Err(e) => check("git", Level::Fail, e),
     }
+}
+
+/// The git check for what `git --version` `printed`.
+fn git_verdict(printed: &str) -> Check {
+    let (major, minor) = MIN_GIT;
+    let needed = format!("archond needs git {major}.{minor} or later");
+    match git_version(printed) {
+        Some(version) if version >= MIN_GIT => check("git", Level::Ok, printed),
+        Some(_) => check("git", Level::Fail, format!("{printed}: {needed}")),
+        None => check(
+            "git",
+            Level::Warn,
+            format!("{printed:?} names no version Archon reads; {needed}"),
+        ),
+    }
+}
+
+/// `(major, minor)` of `git version 2.43.0` and its vendors' variants.
+fn git_version(printed: &str) -> Option<(u32, u32)> {
+    let number = printed.strip_prefix("git version ")?;
+    let mut parts = number.split_whitespace().next()?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 fn check_lavish(config: &Config) -> Check {
@@ -617,6 +681,27 @@ mod tests {
         assert!(mcp_verdict(&failed).detail.contains("exit 1"));
         assert_eq!(mcp_verdict(&McpHealth::Unknown).level, Level::Warn);
         assert_eq!(mcp_verdict(&McpHealth::NotLoaded).level, Level::Fail);
+    }
+
+    #[test]
+    fn git_older_than_2_38_fails_and_an_unread_version_warns() {
+        for printed in [
+            "git version 2.38.0",
+            "git version 2.39.3 (Apple Git-146)",
+            "git version 2.45.1.windows.1",
+            "git version 3.0.0",
+        ] {
+            assert_eq!(git_verdict(printed).level, Level::Ok, "{printed}");
+        }
+        let old = git_verdict("git version 2.34.1");
+        assert_eq!(old.level, Level::Fail);
+        assert!(
+            old.detail.contains("needs git 2.38 or later"),
+            "{}",
+            old.detail
+        );
+        assert_eq!(git_verdict("git version 1.99.9").level, Level::Fail);
+        assert_eq!(git_verdict("hub version 2.14.2").level, Level::Warn);
     }
 
     #[test]
@@ -731,6 +816,47 @@ mod tests {
         let missing = command_problem(Some("/nonexistent/archon"), &sh).unwrap();
         assert_eq!(missing.0, Level::Fail);
         assert_eq!(command_problem(None, &sh).unwrap().0, Level::Fail);
+    }
+
+    #[test]
+    fn a_registration_that_does_not_name_callers_fails_with_the_fix_for_its_mode() {
+        let sh = Path::new("/bin/sh").canonicalize().unwrap();
+        let server = |names_callers| setup::ArchonServer {
+            command: Some("/bin/sh".into()),
+            names_callers,
+        };
+        for mode in [AetherMode::Dedicated, AetherMode::Shared] {
+            assert_eq!(registration_problem(&server(true), &sh, mode), None);
+        }
+        let (level, own) =
+            registration_problem(&server(false), &sh, AetherMode::Dedicated).unwrap();
+        assert_eq!(level, Level::Fail);
+        assert!(
+            own.contains("send_caller_meta = true") && own.contains("repairs it"),
+            "{own}"
+        );
+        let (level, shared) =
+            registration_problem(&server(false), &sh, AetherMode::Shared).unwrap();
+        assert_eq!(level, Level::Fail);
+        assert!(shared.contains("restart aetherd"), "{shared}");
+        let broken = setup::ArchonServer {
+            command: None,
+            names_callers: false,
+        };
+        let (_, first) = registration_problem(&broken, &sh, AetherMode::Shared).unwrap();
+        assert!(first.contains("no `command`"), "{first}");
+    }
+
+    #[test]
+    fn a_legacy_config_file_is_a_warning_that_names_the_file_read() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(check_legacy_config(dir.path()).is_none());
+        std::fs::write(dir.path().join("archon.toml"), "[steward]\n").unwrap();
+        let found = check_legacy_config(dir.path()).expect("a finding");
+        assert_eq!(found.level, Level::Warn);
+        assert!(found.detail.contains("archon.toml is ignored"), "{found:?}");
+        let read = dir.path().join("config.toml").display().to_string();
+        assert!(found.detail.contains(&read), "{found:?}");
     }
 
     #[test]

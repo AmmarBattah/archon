@@ -8,7 +8,9 @@ mod daemon;
 mod doctor;
 mod gc;
 mod github_watcher;
+mod initiatives;
 mod instance;
+pub(crate) mod lessons;
 mod log;
 mod pipelines;
 mod queue;
@@ -60,7 +62,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Resume(args) => control::pause(args, false, json).await,
         Command::Orchestrator(command) => control::orchestrator(command, json).await,
         Command::Repo(command) => repo::run(command, json).await,
+        Command::Initiatives { command } => initiatives::run(command, json).await,
         Command::Queue(command) => queue::run(command, json).await,
+        Command::Lessons(args) => lessons::run(args, json).await,
         Command::Pipelines(command) => pipelines::run(command, json).await,
         Command::Reports { command } => reports::run(command, json).await,
         Command::Setup { print, resync } => instance::setup(print, resync, json).await,
@@ -111,7 +115,9 @@ fn json_refusal(command: Option<&Command>) -> Option<&'static str> {
         | Command::ModelEvidence { .. }
         | Command::Log { .. }
         | Command::Repo(_)
+        | Command::Initiatives { .. }
         | Command::Queue(_)
+        | Command::Lessons(_)
         | Command::Pipelines(_)
         | Command::Reports { .. }
         | Command::Autonomy(_)
@@ -139,6 +145,39 @@ fn emit(
         println!("{text}");
     }
     Ok(())
+}
+
+/// The text of `path`, the `what` it holds; `-` reads stdin.
+fn read_text(path: &std::path::Path, what: &str) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use std::io::Read as _;
+    if path == std::path::Path::new("-") {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .with_context(|| format!("reading {what} from stdin"))?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("reading {what} {}", path.display()))
+}
+
+/// `path` decoded by its extension, `.json` or `.toml`.
+fn read_map<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> anyhow::Result<T> {
+    use anyhow::Context as _;
+    use archon_core::error::ArchonError;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    match path.extension().and_then(|s| s.to_str()) {
+        Some("json") => serde_json::from_str(&text)
+            .map_err(|e| ArchonError::Invalid(format!("{}: {e}", path.display())).into()),
+        Some("toml") => toml::from_str(&text)
+            .map_err(|e| ArchonError::Invalid(format!("{}: {e}", path.display())).into()),
+        _ => Err(ArchonError::Invalid(format!(
+            "{} must have a .json or .toml extension",
+            path.display()
+        ))
+        .into()),
+    }
 }
 
 fn to_json(value: &impl serde::Serialize) -> anyhow::Result<serde_json::Value> {

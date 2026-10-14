@@ -693,12 +693,12 @@ pub fn problems(listing: &CatalogListing) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use archon_core::autonomy::{AutonomyConfig, AutonomyPolicy};
 
     use super::*;
 
-    fn status_with(aether: AetherLinkStatus) -> DaemonStatus {
+    pub(crate) fn status_with(aether: AetherLinkStatus) -> DaemonStatus {
         DaemonStatus {
             waiting_items: vec![],
             daemon_version: "0.1.0".into(),
@@ -998,7 +998,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("queue: 2 queued"));
-        assert!(text.contains("caps: 3 agents, unlimited per repo"));
+        assert!(text.contains("caps: 8 agents, unlimited per repo"));
         assert!(text.contains("pause: nothing paused"));
         assert!(text.contains("\nautonomy default: review=standard, proposal=off,"));
         assert!(text.contains("questions: 1 open, 2 gates waiting for approval"));
