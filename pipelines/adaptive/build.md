@@ -77,9 +77,10 @@ read again.
    committed. Leave advisory and style findings open and list them.
    A second look is owed after a failed verdict and for any commit after a
    pass: Archon delivers only commits a passing reviewer read, so batch
-   fixes. Delegate only the missing passes as your contract defines, each a
-   NEW agent with the previous verdict, the reviewed commit and the new one, each
-   finding beside its fix, and the regression evidence. It reads that delta
+   fixes. Delegate the missing passes as your contract defines, each a NEW
+   agent. A delta reviewer gets the previous verdict, the reviewed commit and
+   the new one, each finding beside its fix, and the regression evidence. It
+   reads that delta
    (`base` the reviewed commit) and the callers it affects, and widens only
    by naming the assumption the delta broke. If the operator adds scope
    while a review runs, let it finish, keep its verdict for the commit it

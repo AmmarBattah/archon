@@ -408,10 +408,10 @@ commits it read; `base` is where the diff it read starts:\n\n\
 const REVIEW_CHECK_RULES: &str = "\
 - Delegate with `wait: false`, then use `wait_for` with `any: true`. On a blocking \
 fail, `cancel_agent` the reviewers still reading before you edit: they share your \
-workspace, and cancelled reviews do not count. Then fix and commit. Delegate only \
-the missing passes, at least one for the fix, with `base` = the previous reviewed \
-head. A named whole-change read, even a fail, anchors \
-deltas; an amend or rebase needs whole-change re-review.\n\
+workspace, and cancelled reviews do not count. Then fix and commit. Replace each \
+cancelled reviewer with a new whole-change read at the new head. Each completed read, \
+even a fail, needs only a delta pass with `base` = the head it read, and the fix at \
+least one; an amend or rebase needs whole-change re-review.\n\
 - Archon checks a pass against Aether and the branch. Each agent named must be a \
 different one you delegated to yourself that completed with that verdict, and as many \
 as the review asks must have passed the branch head, or an earlier head whose later \
@@ -500,10 +500,10 @@ is wrong, why it matters, and what a fix looks like.\n";
 
 const REVIEW_BOUNDS: &str = "\
 - Reviewers: read the code and run the checks the review needs. Run each ad-hoc \
-experiment (a mutant, a probe, a repro) under `timeout 30s` (`timeout 30s sh -c '…'` \
-for pipelines): one that hangs or times out counts as detected. Never run long hang \
-proofs or background waits. Report incomplete checks; never pass without the \
-evidence the review requires.\n";
+experiment (mutant, probe, repro) under `timeout 30s` (`timeout 30s sh -c '…'` for \
+pipelines), not the project's build or tests; a hang or timeout counts as detected. \
+No long hang proofs or background waits. Report incomplete checks; never pass \
+without the evidence the review requires.\n";
 
 const TEST_RULES: &str = "\n## Test stage\n\n\
 - Verify by running things, not by reading alone. Do not edit tracked files to make a \
@@ -643,10 +643,11 @@ mod tests {
         for text in [&review, &delegated] {
             for said in [
                 "read the code and run the checks the review needs",
-                "Run each ad-hoc experiment (a mutant, a probe, a repro) under `timeout 30s`",
+                "Run each ad-hoc experiment (mutant, probe, repro) under `timeout 30s`",
                 "timeout 30s sh -c",
-                "one that hangs or times out counts as detected",
-                "Never run long hang proofs or background waits",
+                "not the project's build or tests",
+                "a hang or timeout counts as detected",
+                "No long hang proofs or background waits",
                 "never pass without the evidence the review requires",
             ] {
                 assert!(text.contains(said), "missing {said:?} in {text}");
@@ -664,9 +665,9 @@ mod tests {
                 "use `wait_for` with `any: true`",
                 "On a blocking fail, `cancel_agent` the reviewers still reading before you edit",
                 "cancelled reviews do not count. Then fix and commit",
-                "Delegate only the missing passes, at least one for the fix",
-                "`base` = the previous reviewed head",
-                "A named whole-change read, even a fail, anchors deltas",
+                "Replace each cancelled reviewer with a new whole-change read at the new head",
+                "Each completed read, even a fail, needs only a delta pass with `base` = the head it read",
+                "and the fix at least one",
                 "an amend or rebase needs whole-change re-review",
                 "a passing reviewer read with `base` at or before it",
                 "A fail stands until such a pass",

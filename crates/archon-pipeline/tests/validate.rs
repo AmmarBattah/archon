@@ -595,7 +595,7 @@ fn adaptive_prices_what_it_delegates_and_records_what_ships() {
         "never because a tree that passed was committed",
         "for any commit after a pass: Archon delivers only commits a passing reviewer read",
         "It reads that delta (`base` the reviewed commit) and the callers it affects",
-        "Delegate only the missing passes as your contract defines",
+        "Delegate the missing passes as your contract defines, each a NEW agent",
         "Pass on your contract's bounds for reviewers",
         "Use leaf workers unless a bounded subproblem benefits from another level allowed by the contract",
         "Continue while fixes make progress within the item's time and spending limits; \

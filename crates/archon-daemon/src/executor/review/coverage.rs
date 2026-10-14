@@ -540,14 +540,15 @@ mod tests {
         let missing = count(&fixed[..3], "c4", 3).unwrap_err();
         assert!(missing.starts_with("2 of the reviewers named"), "{missing}");
 
+        // Two reviewers cancelled at c3 are replaced by whole-change reads at c4.
         let fail_anchored = [
             read("agt_fail", false, "c3", None),
-            read("agt_delta_a", true, "c4", Some("c3")),
-            read("agt_delta_b", true, "c4", Some("c3")),
-            read("agt_delta_c", true, "c4", Some("c3")),
+            read("agt_delta", true, "c4", Some("c3")),
+            read("agt_whole_a", true, "c4", None),
+            read("agt_whole_b", true, "c4", None),
         ];
         assert_eq!(count(&fail_anchored, "c4", 3).unwrap(), [1, 2, 3]);
-        let unanchored = count(&fail_anchored[1..], "c4", 3).unwrap_err();
+        let unanchored = count(&fail_anchored[1..2], "c4", 1).unwrap_err();
         assert!(
             unanchored.contains("no reviewer named read the change up to it"),
             "{unanchored}"
