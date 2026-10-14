@@ -7,6 +7,7 @@ mod cost;
 mod initiatives;
 mod item_views;
 mod items;
+mod learning;
 mod lessons;
 mod model_evidence;
 mod operator;
@@ -131,7 +132,7 @@ async fn route(
     }
 }
 
-/// Initiatives, steering and lessons.
+/// Initiatives, steering, lessons and operator corrections.
 async fn handle_adaptive(
     ctx: &DaemonContext,
     client: ClientKind,
@@ -153,6 +154,13 @@ async fn handle_adaptive(
         Request::UpdateLesson { lesson, patch } => lessons::update(ctx, &lesson, patch).await,
         Request::LessonsWhy { item } => lessons::why(ctx, &item).await,
         Request::LessonStats { repo } => lessons::stats(ctx, repo.as_ref()).await,
+        Request::LearningCorrect(correction) => learning::correct(ctx, correction).await,
+        Request::LearningWhy { item } => learning::why(ctx, &item).await,
+        Request::LearningUndo { feedback } => learning::undo(ctx, &feedback).await,
+        Request::LearningRestoreMemory { feedback } => {
+            learning::restore_memory(ctx, &feedback).await
+        }
+        Request::LearningRetryMemory { feedback } => learning::retry_memory(ctx, &feedback).await,
         request => handle_queue(ctx, request).await,
     }
 }

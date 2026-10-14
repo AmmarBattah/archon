@@ -64,6 +64,8 @@ pub(super) fn reply(tool: &str, reply: &Reply) -> String {
         | Reply::Lessons(_)
         | Reply::LessonsWhy(_)
         | Reply::LessonStats(_)
+        | Reply::Feedback(_)
+        | Reply::LearningWhy(_)
         | Reply::Reports(_)
         | Reply::Welcome(_)
         | Reply::Subscribed { .. }
