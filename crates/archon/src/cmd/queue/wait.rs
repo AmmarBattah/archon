@@ -12,7 +12,7 @@ use archon_core::queue::QueueItem;
 use tokio::time::{Instant, timeout_at};
 
 use crate::cmd::emit;
-use crate::connect::{connect_existing, unexpected};
+use crate::connect::{connect_running, unexpected};
 use crate::views;
 
 pub async fn run(items: Vec<String>, timeout: &str, json: bool) -> anyhow::Result<ExitCode> {
@@ -72,9 +72,7 @@ async fn observe(
 ) -> anyhow::Result<()> {
     // Dedicated autostart takes blocking process/file locks that cannot be
     // cancelled by the deadline. Waiting only observes an existing daemon.
-    let client = connect_existing().await?.ok_or_else(|| {
-        ArchonError::Unavailable("archond is not running; run `archon daemon start` first".into())
-    })?;
+    let client = connect_running().await?;
     let mut ids = Vec::with_capacity(items.len());
     for item in items {
         ids.push(views::resolve_item(&client, item).await?);

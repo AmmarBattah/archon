@@ -365,7 +365,10 @@ async fn archond_report(new: &Version) -> (Option<bool>, String) {
             (Some(true), line)
         }
         Ok(None) => {
-            let line = format!("archond is not running; the next archon command starts {new}.");
+            let line = format!(
+                "archond is not running; `archon daemon start`, or the next command that \
+                 needs it, starts {new}."
+            );
             (Some(false), line)
         }
         Err(error) => {

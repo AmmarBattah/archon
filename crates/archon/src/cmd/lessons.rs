@@ -251,7 +251,10 @@ async fn send(request: Request) -> anyhow::Result<Reply> {
         request,
         Request::Lessons(_) | Request::LessonsWhy { .. } | Request::LessonStats { .. }
     ) {
-        return Ok(crate::connect::connect().await?.request(request).await?);
+        return Ok(crate::connect::connect_or_start()
+            .await?
+            .request(request)
+            .await?);
     }
     if let Some(client) = crate::connect::connect_existing().await? {
         return Ok(client.request(request).await?);

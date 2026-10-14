@@ -46,7 +46,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
             kind,
             follow,
         } => log::log(limit, item.as_deref(), kind, follow, json).await,
-        Command::Status { no_start } => control::status(json, no_start).await,
+        Command::Status { no_start: _ } => control::status(json).await,
         Command::Cost { since, until, by } => {
             cost::run(since.as_deref(), until.as_deref(), by, json).await
         }

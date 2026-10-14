@@ -6,18 +6,22 @@ use archon_core::protocol::{ErrorCode, PauseTarget, Reply, RepoRef, Request};
 
 use super::{emit, to_json};
 use crate::cli::{OrchestratorCommand, PauseArgs};
-use crate::connect::{connect, connect_existing, unexpected};
+use crate::connect::{
+    connect_existing, connect_or_start, connect_running, not_running_text, unexpected,
+};
 use crate::format;
 use crate::ops;
 use crate::views;
 
-pub async fn status(json: bool, no_start: bool) -> anyhow::Result<ExitCode> {
-    let client = if no_start {
-        connect_existing().await?.ok_or_else(|| archon_core::error::ArchonError::Unavailable(
-            "archond is not running; aether: disconnected (cannot observe its link without archond)".into()
-        ))?
-    } else {
-        connect().await?
+/// Never starts archond or Aether: without archond, its link to Aether
+/// cannot be observed either.
+pub async fn status(json: bool) -> anyhow::Result<ExitCode> {
+    let Some(client) = connect_existing().await? else {
+        return Err(archon_core::error::ArchonError::Unavailable(format!(
+            "{}; aether: disconnected (cannot observe its link without archond)",
+            not_running_text()
+        ))
+        .into());
     };
     if json {
         let status = views::fetch_status(&client).await?;
@@ -50,7 +54,7 @@ pub fn pause_target(args: PauseArgs) -> anyhow::Result<PauseTarget> {
 pub async fn pause(args: PauseArgs, pause: bool, json: bool) -> anyhow::Result<ExitCode> {
     let target = pause_target(args)?;
     let what = format::pause_target(&target);
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     ops::pause(&client, target, pause).await?;
     let verb = if pause { "Paused" } else { "Resumed" };
     emit(
@@ -62,7 +66,10 @@ pub async fn pause(args: PauseArgs, pause: bool, json: bool) -> anyhow::Result<E
 }
 
 pub async fn orchestrator(command: OrchestratorCommand, json: bool) -> anyhow::Result<ExitCode> {
-    let client = connect().await?;
+    let client = match command {
+        OrchestratorCommand::Status => connect_running().await?,
+        OrchestratorCommand::Restart => connect_or_start().await?,
+    };
     let reply = match command {
         OrchestratorCommand::Status => client.call(Request::OrchestratorStatus).await?,
         OrchestratorCommand::Restart => client.call(Request::OrchestratorRestart).await?,

@@ -6,7 +6,7 @@ use archon_core::protocol::{EnqueueRequest, Reply, RepoRef, Request};
 
 use crate::cli::QueueAddArgs;
 use crate::cmd::{emit, read_map, read_text};
-use crate::connect::{connect, reply_data, unexpected};
+use crate::connect::{connect_or_start, reply_data, unexpected};
 use crate::views;
 
 pub async fn run(args: QueueAddArgs, json: bool) -> anyhow::Result<()> {
@@ -21,7 +21,7 @@ pub async fn run(args: QueueAddArgs, json: bool) -> anyhow::Result<()> {
     let priority = serde_json::from_value(serde_json::Value::String(args.priority))
         .map_err(|e| ArchonError::Invalid(format!("--priority: {e}")))?;
     archon_core::queue::check_enqueue(&args.title, &brief, &args.tag, args.budget_usd)?;
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let mut depends_on = Vec::with_capacity(args.depends_on.len());
     for dependency in args.depends_on {
         depends_on.push(views::resolve_item(&client, &dependency).await?);

@@ -10,17 +10,19 @@ use archon_core::protocol::{Reply, Request};
 
 use super::{emit, to_json};
 use crate::cli::GithubWatcherCommand;
-use crate::connect::{connect, unexpected};
+use crate::connect::{connect_or_start, connect_running, unexpected};
 use crate::format;
 
 pub async fn run(command: Option<GithubWatcherCommand>, json: bool) -> anyhow::Result<ExitCode> {
     let change = change(command)?;
     let warning = change.as_ref().and_then(operators_warning);
-    let request = match change {
-        None => Request::GithubWatcher,
-        Some(change) => Request::ConfigureGithubWatcher { change },
+    let (request, client) = match change {
+        None => (Request::GithubWatcher, connect_running().await?),
+        Some(change) => (
+            Request::ConfigureGithubWatcher { change },
+            connect_or_start().await?,
+        ),
     };
-    let client = connect().await?;
     let view: Box<GithubWatcherView> = match client.request(request).await? {
         Reply::GithubWatcher(view) => view,
         other => return Err(unexpected(&other, "github_watcher")),

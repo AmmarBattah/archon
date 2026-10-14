@@ -66,7 +66,8 @@ invalid stage plan and `policy` for a disallowed model.
 `archon queue wait <item>...` accepts one or more full ids or unambiguous
 prefixes. It waits until **every** item is succeeded, failed or cancelled.
 A blocked item is still pending. Waiting requires an already running archond
-(and never starts Aether); `queue add` uses the usual CLI autostart path.
+and never starts it or Aether, as no command that only reads does; `queue add`
+starts archond when it is not running, and says so on stderr.
 The default timeout is **30m**; override it
 with a positive whole number and `s`, `m`, `h`, `d` or `w`, e.g. `90s` or `2h`.
 The deadline covers connection, subscription and daemon requests as well as

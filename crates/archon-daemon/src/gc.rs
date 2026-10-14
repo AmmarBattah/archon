@@ -310,15 +310,15 @@ fn held_by_a_sweep(item: &plan::ItemPlan) -> GcReport {
     }
 }
 
-/// One pass without archond, for a disk too full to start it: holding the
-/// daemon lock, so none runs meanwhile and no run is live, and reading the
-/// store without writing to it. Fails while an archond holds the lock.
+/// One read-only pass without archond, for a disk too full to start it, holding the daemon lock
+/// and the data dir's lock shared so none runs meanwhile. Fails while an archond holds either.
 pub fn collect_offline(
     config: &WorktreeConfig,
     paths: &DaemonPaths,
     older_than: Option<Age>,
     force: bool,
 ) -> Result<GcReport, ArchonError> {
+    let _data = archon_queue::DataLock::share(&paths.data_dir)?;
     let _lock = crate::server::lock_daemon(&paths.socket)?;
     let store = Store::open_read_only(&paths.store)?;
     let policy = Policy::new(config, archon_core::now(), older_than, force)?;

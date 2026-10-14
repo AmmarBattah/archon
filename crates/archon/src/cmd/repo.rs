@@ -9,7 +9,7 @@ use archon_core::repo::ShipMode;
 
 use super::{emit, to_json};
 use crate::cli::{RepoCommand, Ship};
-use crate::connect::{connect, unexpected};
+use crate::connect::{connect_or_start, connect_running, unexpected};
 use crate::format;
 use crate::views;
 
@@ -38,11 +38,11 @@ pub async fn run(command: RepoCommand, json: bool) -> anyhow::Result<ExitCode> {
             add_repo(add, json).await?;
         }
         RepoCommand::List => {
-            let repos = views::fetch_repos(&connect().await?).await?;
+            let repos = views::fetch_repos(&connect_running().await?).await?;
             emit(json, || to_json(&repos), &format::repos(&repos))?;
         }
         RepoCommand::Remove { repo } => {
-            let client = connect().await?;
+            let client = connect_or_start().await?;
             let request = Request::RepoRemove {
                 repo: RepoRef(repo.clone()),
             };
@@ -69,7 +69,7 @@ pub async fn run(command: RepoCommand, json: bool) -> anyhow::Result<ExitCode> {
 }
 
 async fn add_repo(add: RepoAdd, json: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let repo = match client.request(Request::RepoAdd(add)).await? {
         Reply::Repo(repo) => repo,
         other => return Err(unexpected(&other, "repo")),
@@ -79,7 +79,7 @@ async fn add_repo(add: RepoAdd, json: bool) -> anyhow::Result<()> {
 }
 
 async fn set(repo: String, patch: RepoPatch, json: bool) -> anyhow::Result<()> {
-    let client = connect().await?;
+    let client = connect_or_start().await?;
     let request = Request::RepoUpdate {
         repo: RepoRef(repo),
         patch,
@@ -108,7 +108,7 @@ async fn ceiling(
     let Some(auto) = auto_merge else {
         return Ok(None);
     };
-    let repos = views::fetch_repos(&connect().await?).await?;
+    let repos = views::fetch_repos(&connect_or_start().await?).await?;
     let current = repos
         .iter()
         .find(|r| r.name == repo || r.id.to_string() == repo)

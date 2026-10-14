@@ -49,7 +49,7 @@ struct Chat {
 
 pub async fn run(progress: bool) -> anyhow::Result<ExitCode> {
     let config = Config::load_default()?;
-    let client = crate::connect::connect().await?;
+    let client = crate::connect::connect_or_start().await?;
     let socket = archon_client::default_socket();
     let history = archon_core::paths::data_dir().join(HISTORY_FILE);
     let history = std::path::absolute(&history)?;
