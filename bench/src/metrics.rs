@@ -96,6 +96,18 @@ pub struct TrialResult {
     /// Captured queue work; absent means unknown, an empty list means no work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archon_work: Option<Vec<ArchonItem>>,
+    /// Timed-out trials only: the grader's result with the last committed
+    /// branch of each timed-out item added. It never changes `success`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graded_on_timeout: Option<TimeoutGrade>,
+}
+
+/// The grader's verdict on a timed-out trial's committed work, kept apart
+/// from the trial's own verdict so it is never counted as a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TimeoutGrade {
+    pub success: bool,
+    pub score: Option<f64>,
 }
 
 /// Routing observed at capture time, without attributing the trial verdict to items.
@@ -182,6 +194,7 @@ pub(crate) mod tests {
             finished_at: None,
             note: None,
             archon_work: None,
+            graded_on_timeout: None,
         }
     }
 
@@ -213,6 +226,23 @@ pub(crate) mod tests {
         let parsed: TrialResult = serde_json::from_str(line).unwrap();
         assert_eq!(parsed.arm, Arm::Codex);
         assert!(!parsed.timed_out && parsed.cached_input_tokens.is_none());
-        assert!(parsed.archon_work.is_none());
+        assert!(parsed.archon_work.is_none() && parsed.graded_on_timeout.is_none());
+    }
+
+    #[test]
+    fn graded_on_timeout_round_trips_and_stays_absent_when_unused() {
+        let plain = serde_json::to_string(&result(None, None)).unwrap();
+        assert!(!plain.contains("graded_on_timeout"), "{plain}");
+        let mut late = result(None, None);
+        late.success = false;
+        late.timed_out = true;
+        late.graded_on_timeout = Some(TimeoutGrade {
+            success: true,
+            score: Some(1.0),
+        });
+        let parsed: TrialResult =
+            serde_json::from_str(&serde_json::to_string(&late).unwrap()).unwrap();
+        assert_eq!(parsed, late);
+        assert!(!parsed.success, "the verdict is untouched");
     }
 }

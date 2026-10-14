@@ -15,7 +15,8 @@ use archon_core::run::{PipelineRun, RunState};
 use serde_json::json;
 
 use super::archon::{
-    Daemon, Observation, SETTLE_WINDOW, Settle, answer_text, operator_messages, result_branches,
+    Daemon, Observation, SETTLE_WINDOW, Settle, TIMEOUT_REASON, answer_text, operator_messages,
+    result_branches, timeout_branches,
 };
 use super::*;
 use crate::task::BenchTask;
@@ -490,6 +491,83 @@ fn result_branches_skip_answer_only_runs() {
     assert_eq!(branches["lib"], ["archon/fix"]);
     let answer_only = result_branches(&details[..1], &repos);
     assert!(answer_only.is_empty(), "{answer_only:?}");
+}
+
+/// An item the bench cancelled at the deadline; its runs keep the branches.
+fn timed_out(repo: &RepoId, branches: &[&str], minute: i64) -> ItemDetail {
+    let mut detail = succeeded(repo, "", minute);
+    detail.item.state = QueueState::Cancelled {
+        reason: Some(TIMEOUT_REASON.into()),
+    };
+    detail.runs = branches
+        .iter()
+        .enumerate()
+        .map(|(n, branch)| PipelineRun {
+            branch: (*branch).into(),
+            state: RunState::Cancelled { reason: None },
+            started_at: detail.item.created_at + chrono::Duration::seconds(n as i64),
+            ..detail.runs[0].clone()
+        })
+        .collect();
+    detail
+}
+
+#[test]
+fn timeout_branches_add_the_last_committed_branch_after_the_verdict_branches() {
+    let repo = RepoId::new();
+    let repos: BTreeMap<RepoId, String> = [(repo.clone(), "lib".into())].into();
+    let details = [
+        timed_out(&repo, &["archon/try1", "archon/try2", ""], 3),
+        succeeded(&repo, "archon/done", 5),
+    ];
+    let verdict = result_branches(&details, &repos);
+    assert_eq!(
+        verdict["lib"],
+        ["archon/done"],
+        "the verdict ignores timeouts"
+    );
+    let late = timeout_branches(&details, &repos, |_, _| true).unwrap();
+    assert_eq!(late["lib"], ["archon/done", "archon/try2"]);
+}
+
+#[test]
+fn timeout_branches_skip_a_newer_run_that_never_committed() {
+    let repo = RepoId::new();
+    let repos: BTreeMap<RepoId, String> = [(repo.clone(), "lib".into())].into();
+    let details = [timed_out(&repo, &["archon/try1", "archon/try2"], 3)];
+    let committed = |name: &str, branch: &str| {
+        assert_eq!(name, "lib", "checked in the item's repository");
+        branch != "archon/try2"
+    };
+    let late = timeout_branches(&details, &repos, committed).unwrap();
+    assert_eq!(late["lib"], ["archon/try1"], "the retry holds no work");
+    assert_eq!(timeout_branches(&details, &repos, |_, _| false), None);
+}
+
+#[test]
+fn timeout_branches_need_a_timed_out_item_with_a_branch() {
+    let repo = RepoId::new();
+    let repos: BTreeMap<RepoId, String> = [(repo.clone(), "lib".into())].into();
+    let mut other_cancel = timed_out(&repo, &["archon/x"], 1);
+    other_cancel.item.state = QueueState::Cancelled {
+        reason: Some("operator".into()),
+    };
+    let details = [
+        succeeded(&repo, "archon/done", 5),
+        timed_out(&repo, &["", ""], 2),
+        other_cancel,
+    ];
+    assert_eq!(
+        timeout_branches(&details, &repos, |_, _| true),
+        None,
+        "nothing committed, or not cancelled by the deadline"
+    );
+    let stray = timed_out(&RepoId::new(), &["archon/y"], 1);
+    assert_eq!(
+        timeout_branches(&[stray], &repos, |_, _| true),
+        None,
+        "unknown repository"
+    );
 }
 
 #[test]

@@ -21,7 +21,7 @@ a time limit, and a grader the agent never sees.
 | `long-backlog` | Work through four independent tickets in one repository, one commit each (Python). | Hidden acceptance tests for every ticket. | 60 min |
 | `ask-cache-invalidation` | Answer a debugging question about stale prices without changing code (Node). | Keyword rubric on the answer. | 15 min |
 | `review-seeded-bug` | Review an HMAC token module and find its seeded forgery bug (Node). | Keyword rubric on the answer. | 15 min |
-| `quality-ledger-transfer` | Atomic bounded transfers, failed-operation rollback, account validation and concurrent conservation (Python). | Hidden state and boundary tests. | 12 min |
+| `quality-ledger-transfer` | Atomic bounded transfers, failed-operation rollback, account validation and concurrent conservation (Python). | Hidden state and boundary tests. | 20 min |
 | `quality-safe-extract` | Batch validation before writes, traversal and symlink rejection, duplicate and ancestor conflicts (Python). | Hidden filesystem tests. | 12 min |
 | `quality-retry-budget` | Deadline arithmetic, capped exponential delay, Retry-After semantics and input validation (Python). | Hidden numerical and policy tests. | 12 min |
 
@@ -41,8 +41,9 @@ files and bounded synchronization, with no network or wall-clock sleeps.
 | `claude` | `claude -p … --dangerously-skip-permissions`. Claude Code keeps its built-in Task subagents. |
 | `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox` on `gpt-6-luna` by default. |
 
-Every arm gets the same prompt, effort and time limit, with tool permission
-prompts bypassed. `archon`, `aether` and `claude` use the same model.
+Every arm gets the same prompt, effort and time limit (the task's
+`timeout_minutes`, which `archon` and `aether` both apply from the same value),
+with tool permission prompts bypassed. `archon`, `aether` and `claude` use the same model.
 `archon` and `aether` run on the same Aether daemon.
 
 Live test and benchmark runs use `claude-code/claude-haiku-5-5` or
@@ -74,6 +75,13 @@ below describe earlier runs, not the current test defaults.
 - **Success** is the hidden grader's verdict. For `aether`, `claude` and
   `codex` it grades the workspace, including uncommitted changes. For
   `archon` it grades each work item's run branch merged onto `bench-base`.
+- **Timeouts** keep the verdict above, deadline included. `archon` leaves its
+  cancelled items out of it, so the last committed branch of each item
+  cancelled at the deadline is also graded in a separate copy and reported as
+  *graded on timeout* (`graded_on_timeout` in `results.jsonl`, its own table
+  in `summary.md`, a CSV column in the history). It shows a slow but correct
+  solution and is never counted in success, pass@k or the score. The other
+  arms already grade the workspace as it stands at the deadline.
 - **Infrastructure failures** are trials that failed with a harness error: a
   provider limit, a crash or a grading failure. They say nothing about the
   model or the arm, so they are left out of every number and listed on their

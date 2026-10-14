@@ -14,6 +14,13 @@
   or `…`, such as `"head": "5d240fa..."`, is now accepted. Before, a passing
   review written that way failed the stage. The id must still name a commit
   in the run's workspace.
+- A `model_reasons` key that is the pipeline name, such as `direct`, instead of
+  a stage id such as `implement`, is still refused. The error now says that
+  keys are stage ids of the chosen pipeline and lists them.
+- A benchmark trial that hits its deadline keeps its verdict. For Archon, its
+  last committed branches are now graded as well and reported apart as
+  "graded on timeout", never as a pass. `quality-ledger-transfer` now has 20
+  minutes for every arm.
 
 ## 1.2.1
 

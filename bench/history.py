@@ -28,10 +28,15 @@ def read_rows(directories):
             if (arm["trials"] <= 0 or cost is None
                     or cost["n"] != arm["trials"] or cost["mean"] is None):
                 raise ValueError(f"{directory} has empty or partly unpriced trials")
+            # Timed-out trials graded on their committed work stay out of pass_rate.
+            late_passes = arm.get("timeout_graded_passes", 0)
+            if not 0 <= late_passes <= arm.get("timeout_graded", 0) <= arm["timeouts"]:
+                raise ValueError(f"{directory} has inconsistent graded-on-timeout counts")
             row = dict(version=directory.name.removeprefix("results-"), arm=arm["arm"],
                        trials=arm["trials"], tasks=len(data["tasks"]),
                        pass_rate=100 * arm["success_rate"],
-                       cost_usd=cost["mean"], wall_secs=arm["wall_secs"]["mean"])
+                       cost_usd=cost["mean"], wall_secs=arm["wall_secs"]["mean"],
+                       graded_on_timeout_passes=late_passes)
             if any(not math.isfinite(row[key]) or row[key] < 0 for key, _ in METRICS):
                 raise ValueError(f"{directory} has invalid metrics")
             rows.append(row)

@@ -120,6 +120,30 @@ fn dry_run_prints_every_arm_command_without_touching_disk() {
     assert!(!Path::new("/data/work").exists());
 }
 
+/// Archon and plain Aether run under one `timeout_for` value per task.
+#[test]
+fn ledger_transfer_has_one_twenty_minute_deadline_for_both_arms() {
+    let task = bundled()
+        .into_iter()
+        .find(|t| t.file.id == "quality-ledger-transfer")
+        .unwrap();
+    let mut opts = options(vec![Arm::Archon, Arm::Aether], 1);
+    assert_eq!(opts.timeout_for(&task), Duration::from_secs(20 * 60));
+    opts.timeout_factor = 0.5;
+    assert_eq!(opts.timeout_for(&task), Duration::from_secs(10 * 60));
+    let specs = plan(1, &opts.arms, 1);
+    let text = render_dry_run(&[task], &specs, &settings(), &opts, &[]).unwrap();
+    let section = text.split("\n== ").nth(1).unwrap();
+    assert!(section.contains("timeout 600s"), "{section}");
+    let (archon, aether) = (section.find("[archon]"), section.find("[aether]"));
+    assert!(archon.is_some() && aether.is_some(), "{section}");
+    assert_eq!(
+        text.matches("timeout ").count(),
+        1,
+        "one shared deadline: {text}"
+    );
+}
+
 #[test]
 fn the_default_work_dir_is_outside_the_checkout() {
     let dir = |xdg: Option<&str>, home: Option<&str>| {

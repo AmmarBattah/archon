@@ -72,6 +72,7 @@ async fn drive(input: &TrialInput<'_>) -> anyhow::Result<ArmOutcome> {
         timed_out,
         error,
         source: ResultSource::Workspace,
+        timeout_source: None,
     })
 }
 

@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 
 use crate::arms::{self, ArmOutcome, ArmSettings, TrialInput};
 use crate::grade::{self, GradeOutcome, ResultSource};
-use crate::metrics::{Arm, RunManifest, TrialResult};
+use crate::metrics::{Arm, RunManifest, TimeoutGrade, TrialResult};
 use crate::plan::{Budget, RunOptions, TrialSpec, check_plan, plan};
 use crate::process::{redact_home, version_of};
 use crate::task::BenchTask;
@@ -150,8 +150,13 @@ fn progress_line(r: &TrialResult) -> String {
         .as_deref()
         .map(|e| format!(" error: {e}"))
         .unwrap_or_default();
+    let late = match r.graded_on_timeout {
+        Some(g) if g.success => " (graded on timeout: pass)",
+        Some(_) => " (graded on timeout: fail)",
+        None => "",
+    };
     format!(
-        "{} {} #{}: {verdict} {:.0}s {cost}{problem}",
+        "{} {} #{}: {verdict}{late} {:.0}s {cost}{problem}",
         r.arm, r.task, r.trial, r.wall_secs
     )
 }
@@ -174,7 +179,17 @@ async fn run_trial(shared: &Shared, spec: TrialSpec) -> TrialResult {
         Some(layout) => grade_trial(task, layout, spec.arm, &outcome).await,
         None => Err(anyhow::anyhow!("no workspace to grade")),
     };
+    let late = match &layout {
+        Some(layout) => grade_on_timeout(task, layout, spec.arm, &outcome).await,
+        None => None,
+    };
     let mut result = trial_result(shared, task, spec, outcome, graded);
+    if let Some(late) = late {
+        result.graded_on_timeout = late.grade;
+        if let Some(problem) = late.note {
+            result.note = Some(join_notes(result.note.take(), problem));
+        }
+    }
     if let Some(layout) = &layout {
         capture_routing(&mut result, &layout.logs);
     }
@@ -267,6 +282,51 @@ async fn grade_trial(
     grade::grade(task, layout, arm.name(), &outcome.source).await
 }
 
+/// What grading a timed-out trial's committed work produced.
+struct LateGrade {
+    grade: Option<TimeoutGrade>,
+    note: Option<String>,
+}
+
+/// Grade the last committed branches of a timed-out trial's items, apart
+/// from the verdict. A failure here is a note, never an error: the verdict
+/// and the trial's infrastructure status do not depend on this extra grade.
+async fn grade_on_timeout(
+    task: &BenchTask,
+    layout: &TrialLayout,
+    arm: Arm,
+    outcome: &ArmOutcome,
+) -> Option<LateGrade> {
+    let source = outcome.timeout_source.as_ref()?;
+    assert!(
+        outcome.timed_out,
+        "only a timed-out trial has a timeout source"
+    );
+    if layout.grade.exists() {
+        return Some(LateGrade {
+            grade: None,
+            note: Some("grading on timeout skipped: the verdict's grading copy remains".into()),
+        });
+    }
+    let graded = match layout.late_grade() {
+        Ok(late) => grade::grade(task, &late, arm.name(), source).await,
+        Err(e) => Err(e),
+    };
+    Some(match graded {
+        Ok(g) => LateGrade {
+            grade: Some(TimeoutGrade {
+                success: g.success,
+                score: g.score,
+            }),
+            note: g.note.map(|n| format!("graded on timeout: {n}")),
+        },
+        Err(e) => LateGrade {
+            grade: None,
+            note: Some(format!("grading on timeout failed: {e:#}")),
+        },
+    })
+}
+
 fn trial_result(
     shared: &Shared,
     task: &BenchTask,
@@ -305,6 +365,7 @@ fn trial_result(
         finished_at: None,
         note,
         archon_work: None,
+        graded_on_timeout: None,
     }
 }
 

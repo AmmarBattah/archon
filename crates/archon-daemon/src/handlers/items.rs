@@ -559,7 +559,9 @@ pub(super) fn check_reasons(
     if let Some(extra) = reasons.keys().find(|id| spec.stage(id).is_none()) {
         let ids: Vec<&str> = spec.file.stages.iter().map(|s| s.id.as_str()).collect();
         return Err(ArchonError::Invalid(format!(
-            "model_reasons names stage {extra:?}; valid ids: {}",
+            "model_reasons key {extra:?} is not a stage id: keys are the stage ids of pipeline \
+             {:?}, not the pipeline name; valid ids: {}",
+            spec.name(),
             ids.join(", ")
         )));
     }
@@ -605,4 +607,32 @@ pub(super) async fn check_runs_here(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use archon_pipeline::Catalog;
+
+    fn reasons(key: &str) -> ModelReasons {
+        [(key.to_owned(), "why".to_owned())].into()
+    }
+
+    #[test]
+    fn a_pipeline_name_as_a_reasons_key_is_refused_with_the_stage_ids() {
+        let direct = Catalog::builtin().get("direct").expect("built-in").clone();
+        let message = check_reasons(&direct, Some(&reasons("direct")))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("not the pipeline name"), "{message}");
+        assert!(message.contains("valid ids: implement"), "{message}");
+        assert!(message.contains("\"direct\""), "{message}");
+    }
+
+    #[test]
+    fn stage_ids_and_no_reasons_are_accepted() {
+        let direct = Catalog::builtin().get("direct").expect("built-in").clone();
+        assert!(check_reasons(&direct, Some(&reasons("implement"))).is_ok());
+        assert!(check_reasons(&direct, None).is_ok());
+    }
 }

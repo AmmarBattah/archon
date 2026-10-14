@@ -10,7 +10,7 @@ import history
 
 class HistoryTests(unittest.TestCase):
     def write_chart(self, root, priced=1):
-        arms = [dict(arm=arm, trials=1, success_rate=1.0,
+        arms = [dict(arm=arm, trials=1, success_rate=1.0, timeouts=0,
                      cost_usd=dict(n=priced, mean=0.1), wall_secs=dict(mean=2.0))
                 for arm in history.ARMS]
         (root / "chart.json").write_text(json.dumps(dict(arms=arms, tasks=[{}])))
@@ -25,6 +25,24 @@ class HistoryTests(unittest.TestCase):
             svg = history.render(rows)
             self.assertIn("different models, task mixes", svg)
             self.assertIn("Smoke uses Haiku", svg)
+
+    def test_graded_on_timeout_passes_stay_apart_from_the_pass_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_chart(root)
+            data = json.loads((root / "chart.json").read_text())
+            slow = data["arms"][0]
+            slow.update(success_rate=0.0, timeouts=1, timeout_graded=1,
+                        timeout_graded_passes=1)
+            (root / "chart.json").write_text(json.dumps(data))
+            rows = history.read_rows([root])
+            self.assertEqual([row["pass_rate"] for row in rows], [0, 100])
+            self.assertEqual([row["graded_on_timeout_passes"] for row in rows], [1, 0])
+            self.assertNotIn("graded", history.render(rows).replace("graded-trial", ""))
+            slow["timeout_graded_passes"] = 2
+            (root / "chart.json").write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "graded-on-timeout"):
+                history.read_rows([root])
 
     def test_incomplete_costs_and_duplicate_snapshots_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

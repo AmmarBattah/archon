@@ -68,6 +68,12 @@ pub struct Aggregate {
     /// Infrastructure failures left out of every other field.
     pub infra: u32,
     pub timeouts: u32,
+    /// Timed-out trials whose committed work was graded separately, and how
+    /// many of those passed. Never part of `successes`, rates or pass@k.
+    #[serde(default)]
+    pub timeout_graded: u32,
+    #[serde(default)]
+    pub timeout_graded_passes: u32,
     pub success_rate: f64,
     /// Mean over tasks of per-task pass@1 and pass@k.
     pub pass_at_1: f64,
@@ -116,6 +122,15 @@ impl Aggregate {
         let trials = results.len() as u32;
         let successes = count(&|r| r.success);
         assert!(successes <= trials, "more passes than graded trials");
+        let timeout_graded = count(&|r| r.graded_on_timeout.is_some());
+        let timeout_graded_passes = count(&|r| r.graded_on_timeout.is_some_and(|g| g.success));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.graded_on_timeout.is_none() || r.timed_out),
+            "only a timed-out trial is graded on timeout"
+        );
+        assert!(timeout_graded_passes <= timeout_graded);
         Some(Self {
             arm,
             model: first.model.clone(),
@@ -123,6 +138,8 @@ impl Aggregate {
             successes,
             infra: (all.len() - results.len()) as u32,
             timeouts: count(&|r| r.timed_out),
+            timeout_graded,
+            timeout_graded_passes,
             success_rate: f64::from(successes) / f64::from(trials),
             pass_at_1: pass(1),
             pass_at_k: pass(k),
@@ -389,12 +406,35 @@ pub fn render_markdown(summary: &Summary) -> anyhow::Result<String> {
             a.timeouts
         )?;
     }
+    render_timeout_table(&mut out, &summary.arms)?;
     render_task_table(&mut out, summary)?;
     render_routing_table(&mut out, "Per pipeline", &summary.pipelines)?;
     render_routing_table(&mut out, "Per review level", &summary.reviews)?;
     render_infra(&mut out, &summary.infra)?;
     out.push_str(METHOD_NOTES);
     Ok(out)
+}
+
+/// Timed-out trials whose committed work was graded on its own. These are
+/// failures in every table above; this one only shows what the deadline cost.
+fn render_timeout_table(out: &mut String, arms: &[Aggregate]) -> anyhow::Result<()> {
+    if arms.iter().all(|a| a.timeout_graded == 0) {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "\n## Graded on timeout\n\n{TIMEOUT_NOTES}\n\n\
+         | Arm | Timeouts | Graded on timeout | Passed when graded on timeout |\n|---|---:|---:|---:|"
+    )?;
+    for a in arms.iter().filter(|a| a.timeout_graded > 0) {
+        assert!(a.timeout_graded <= a.timeouts, "graded more than timed out");
+        writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            a.arm, a.timeouts, a.timeout_graded, a.timeout_graded_passes
+        )?;
+    }
+    Ok(())
 }
 
 fn render_manifest(out: &mut String, m: &RunManifest) -> anyhow::Result<()> {
@@ -545,6 +585,8 @@ fn cell_text(c: &Aggregate) -> String {
 const INFRA_ERROR_CHARS: usize = 200;
 
 pub(crate) const ROUTING_NOTES: &str = "Archon whole-trial observations: each trial appears once per table. Mixed buckets retain all selected and attempted pipelines or selected review levels. Pass rate is the trial grader verdict; cost and wall time cover the whole trial, including orchestration. These are not per-item outcomes or causal comparisons. Review levels are captured policy, not proof of completed review; historical policy changes are unavailable. Unknown means missing metadata; no work means a captured empty queue. Infrastructure failures are excluded from metrics.";
+
+const TIMEOUT_NOTES: &str = "A trial that hit its deadline keeps the grader verdict and score of its succeeded items only; what its cancelled items had committed counts for nothing in the success, pass@k and score columns. Here the last committed branch of each timed-out Archon item was graded as well, which shows a slow but correct solution. These results are never counted as passes.";
 
 fn percent(x: f64) -> String {
     format!("{:.0}%", x * 100.0)

@@ -261,6 +261,41 @@ mod tests {
         assert!(patch.contains("+agent work"), "{patch}");
     }
 
+    #[tokio::test]
+    async fn a_second_grading_keeps_its_own_logs_beside_the_verdicts() {
+        let tmp = scratch();
+        let task = bundled("fix-off-by-one");
+        let layout = TrialLayout::under(&tmp.path().join("t"));
+        workspace::prepare(&task, &layout).unwrap();
+        let repo = layout.agent_cwd(&task);
+        std::fs::write(layout.answer_file(), "").unwrap();
+        let verdict = grade(&task, &layout, "archon", &ResultSource::Workspace)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("late.txt"), "committed late\n").unwrap();
+        std::fs::write(layout.answer_file(), "the final answer\n").unwrap();
+        let late_layout = layout.late_grade().unwrap();
+        let answer = std::fs::read_to_string(late_layout.answer_file()).unwrap();
+        assert_eq!(answer, "the final answer\n", "graders read the same answer");
+        let late = grade(&task, &late_layout, "archon", &ResultSource::Workspace)
+            .await
+            .unwrap();
+        assert!(!verdict.success && !late.success);
+        let (logs, late_logs) = (&layout.logs, &late_layout.logs);
+        assert_eq!(late_logs, &logs.join(workspace::TIMEOUT_LOG_DIR));
+        for dir in [logs, late_logs] {
+            assert!(
+                dir.join("grade.stdout").is_file(),
+                "{} lacks grade.stdout",
+                dir.display()
+            );
+        }
+        let first = std::fs::read_to_string(logs.join("fix-off-by-one.result.patch")).unwrap();
+        let second =
+            std::fs::read_to_string(late_logs.join("fix-off-by-one.result.patch")).unwrap();
+        assert!(!first.contains("late.txt") && second.contains("+committed late"));
+    }
+
     #[test]
     fn archon_branches_are_merged_onto_the_base() {
         let tmp = scratch();
