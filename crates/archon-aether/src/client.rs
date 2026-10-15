@@ -359,6 +359,26 @@ impl AetherClient {
                 "Aether lacks host_context; negotiate full before creating an agent".into(),
             ));
         }
+        assert!(
+            request.repository_root.is_none()
+                || request
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.repository.is_none()),
+            "repository_root and scope.repository are exclusive"
+        );
+        assert!(
+            request
+                .repository_root
+                .as_ref()
+                .is_none_or(|root| root.is_absolute()),
+            "repository_root is a registered absolute checkout"
+        );
+        if request.repository_root.is_some() && !self.welcome.supports_repository_root() {
+            return Err(ArchonError::Unavailable(
+                "Aether lacks repository_root required by the frozen creation request".into(),
+            ));
+        }
         let agent: Agent = self
             .typed(Command::CreateAgent(Box::new(request)), "agent")
             .await?;

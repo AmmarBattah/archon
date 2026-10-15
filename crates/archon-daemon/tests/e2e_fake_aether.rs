@@ -6,6 +6,8 @@
 //! may not widen its parent's network.
 
 mod common;
+#[path = "e2e_fake_aether/repository_root.rs"]
+mod repository_root;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

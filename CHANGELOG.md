@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Agents in registered repositories share memory with direct Aether sessions using
+  the registered checkout (requires Aether 1.0.6). Old memories under the short
+  name can be moved with `aether memory alias <name> --root <checkout>`.
+
 ### Fixes
 
 - Review rounds are faster without being weaker. Reviewers run each ad-hoc

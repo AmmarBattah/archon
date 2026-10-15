@@ -81,6 +81,9 @@ pub async fn run(json: bool) -> anyhow::Result<ExitCode> {
         config.aether.host_context,
         aether.as_ref().ok().map(|client| client.welcome()),
     ));
+    checks.push(check_repository_identity(
+        aether.as_ref().ok().map(|client| client.welcome()),
+    ));
     let registered_in = match config.aether.mode {
         AetherMode::Dedicated => instance.config_path(),
         AetherMode::Shared => setup::aether_config_path(),
@@ -431,6 +434,21 @@ fn check_host_context(
             "configured lean; effective context unknown until Aether connects",
         ),
     }
+}
+
+fn check_repository_identity(welcome: Option<&Welcome>) -> Check {
+    let (level, mode) = match welcome {
+        Some(welcome) if welcome.supports_repository_root() => (
+            Level::Ok,
+            "repository_root from the registered checkout for new runs; existing runs keep their frozen identity",
+        ),
+        Some(_) => (
+            Level::Ok,
+            "scope.repository with the registered name for new runs; repository_root needs Aether 1.0.6",
+        ),
+        None => (Level::Warn, "identity mode unknown until Aether connects"),
+    };
+    check("repo identity", level, mode)
 }
 
 /// What Archon's GitHub watcher cannot store at `protocol`, with the fix.
@@ -804,6 +822,26 @@ mod tests {
             "instance_id": "i-1", "schema_version": 1, "pid": 7,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn doctor_reports_repository_identity_for_new_runs() {
+        let mut welcome = welcome(17);
+        let old = check_repository_identity(Some(&welcome));
+        assert_eq!(old.level, Level::Ok);
+        assert!(old.detail.contains("scope.repository"));
+        welcome.features.push("repository_root".into());
+        let new = check_repository_identity(Some(&welcome));
+        assert_eq!(new.level, Level::Ok);
+        assert!(
+            new.detail
+                .contains("repository_root from the registered checkout")
+        );
+        assert!(
+            new.detail
+                .contains("existing runs keep their frozen identity")
+        );
+        assert_eq!(check_repository_identity(None).level, Level::Warn);
     }
 
     #[test]
