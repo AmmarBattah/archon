@@ -416,7 +416,8 @@ and the fix at least one; an amend or rebase needs whole-change re-review.\n\
 different one you delegated to yourself that completed with that verdict, and as many \
 as the review asks must have passed the branch head, or an earlier head whose later \
 commits a passing reviewer read with `base` at or before it. A fail stands until such \
-a pass, or after an amend or rebase until a pass of the whole change. Anything else \
+a pass, or after an amend or rebase until a pass of the whole change. Name every \
+reviewer that coverage rests on, earlier whole-change passes included. Anything else \
 fails the run, and nothing ships. Never report `pass` for a \
 review that did not run or did not pass: with a blocking finding open, call \
 `fail_task` and say which.\n\
@@ -1040,6 +1041,7 @@ mod tests {
             "{\"verdict\": \"pass\" or \"fail\", \"head\": \"<commit>\", \"base\": \"<commit>\"",
             "Each agent named must be a different one you delegated to yourself",
             "a passing reviewer read with `base` at or before it",
+            "Name every reviewer that coverage rests on, earlier whole-change passes included",
             "write no `REVIEW:` line yourself",
         ] {
             assert!(rules.contains(said), "missing {said:?} in {rules}");

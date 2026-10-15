@@ -21,6 +21,12 @@
   last committed branches are now graded as well and reported apart as
   "graded on timeout", never as a pass. `quality-ledger-transfer` now has 20
   minutes for every arm.
+- The bench's grading on timeout failed every time: the verdict's grading left
+  its git worktree registered, so the second checkout at the same path was
+  refused. Grading now prunes it.
+- A review holder is told to name every reviewer its coverage rests on,
+  earlier whole-change passes included. Naming only the last delta reviewers
+  was refused and cost a retry.
 
 ## 1.2.1
 

@@ -66,9 +66,9 @@ pub async fn grade(
     if run.timed_out {
         notes.push("the grader timed out".to_owned());
     }
-    if let Err(e) = std::fs::remove_dir_all(&layout.grade) {
+    if let Err(e) = remove_grading_copy(task, layout) {
         notes.push(format!(
-            "the grading copy {} was not removed: {e}",
+            "cleaning up the grading copy {} failed: {e:#}",
             layout.grade.display()
         ));
     }
@@ -123,6 +123,18 @@ pub fn assemble(
         }
     }
     Ok((!notes.is_empty()).then(|| notes.join("; ")))
+}
+
+/// Delete `layout.grade`, then prune the worktrees it held from each fixture,
+/// so a later grading of the same trial can check out at the same path.
+fn remove_grading_copy(task: &BenchTask, layout: &TrialLayout) -> anyhow::Result<()> {
+    std::fs::remove_dir_all(&layout.grade)?;
+    for fixture in task.fixtures() {
+        let repo = layout.repo(&fixture);
+        ensure!(repo.is_dir(), "{} is missing", repo.display());
+        workspace::git(&repo, &["worktree", "prune"])?;
+    }
+    Ok(())
 }
 
 /// A detached worktree at `bench-base` with each branch merged in order.
@@ -325,5 +337,33 @@ mod tests {
         );
         assert!(!graded.join("stray.txt").exists());
         assert!(note.unwrap().contains("archon/b"));
+    }
+
+    /// The late grade checks the branches out where the verdict's did.
+    #[tokio::test]
+    async fn branches_can_be_graded_twice_in_one_trial() {
+        let tmp = scratch();
+        let task = bundled("fix-off-by-one");
+        let layout = TrialLayout::under(&tmp.path().join("t"));
+        workspace::prepare(&task, &layout).unwrap();
+        let repo = layout.agent_cwd(&task);
+        workspace::git(&repo, &["checkout", "-q", "-b", "archon/a", BASE_TAG]).unwrap();
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        workspace::git(&repo, &["add", "-A"]).unwrap();
+        workspace::git(&repo, &["commit", "-q", "-m", "a"]).unwrap();
+        std::fs::write(layout.answer_file(), "").unwrap();
+        let source = ResultSource::Branches(BTreeMap::from([(
+            "fix-off-by-one".to_owned(),
+            vec!["archon/a".to_owned()],
+        )]));
+        let verdict = grade(&task, &layout, "archon", &source).await.unwrap();
+        assert!(verdict.note.is_none(), "{:?}", verdict.note);
+        assert!(!layout.grade.exists(), "the copy is gone");
+        let late = grade(&task, &layout.late_grade().unwrap(), "archon", &source)
+            .await
+            .unwrap();
+        assert!(late.note.is_none(), "{:?}", late.note);
+        let worktrees = workspace::git(&repo, &["worktree", "list"]).unwrap();
+        assert_eq!(worktrees.lines().count(), 1, "pruned: {worktrees}");
     }
 }
