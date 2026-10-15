@@ -13,6 +13,12 @@
   level. It looks only for an agent that ran no other attempt of the run, once
   none of its reviewers is still running, and refuses when Aether cannot show
   one of their results.
+- Reviewers run each experiment's repeats under one 30-second limit, not one
+  limit per repeat. Their scratch copies hold tracked files only (no build
+  outputs), come from `mktemp -d` instead of a literal `/tmp` path, and are
+  deleted afterwards. The contract now says outright that the project's own
+  build and tests run uncapped. In a benchmark, one reviewer's 40 capped runs
+  outlasted the whole task, and agents kept filling the shared `/tmp`.
 
 ## 1.2.2
 

@@ -501,8 +501,10 @@ is wrong, why it matters, and what a fix looks like.\n";
 
 const REVIEW_BOUNDS: &str = "\
 - Reviewers: read the code and run the checks the review needs. Run each ad-hoc \
-experiment (mutant, probe, repro) in a `${TMPDIR:-/tmp}` copy under `timeout 30s` \
-(`timeout 30s sh -c '…'` for pipelines), not the project's build or tests; a hang or timeout counts as detected. \
+experiment (mutant, probe, repro) in a `mktemp -d` copy of tracked files only \
+(no build outputs, no literal /tmp; delete it after) under one `timeout 30s` for all its repeats (`timeout 30s sh -c '…'` for loops \
+and pipes); a hang or timeout counts as detected. Run the project's own build and \
+tests normally, uncapped. \
 No long hang proofs or background waits. Report incomplete checks; never pass \
 without the evidence the review requires.\n";
 
@@ -644,10 +646,10 @@ mod tests {
         for text in [&review, &delegated] {
             for said in [
                 "read the code and run the checks the review needs",
-                "Run each ad-hoc experiment (mutant, probe, repro) in a `${TMPDIR:-/tmp}` copy",
-                "copy under `timeout 30s`",
-                "timeout 30s sh -c",
-                "not the project's build or tests",
+                "`mktemp -d` copy of tracked files only",
+                "no build outputs, no literal /tmp; delete it after) under one `timeout 30s` for all its repeats",
+                "Run the project's own build and tests normally, uncapped.",
+                "`timeout 30s sh -c '…'` for loops and pipes",
                 "a hang or timeout counts as detected",
                 "No long hang proofs or background waits",
                 "never pass without the evidence the review requires",
