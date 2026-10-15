@@ -18,6 +18,7 @@ pub mod github;
 pub mod link;
 pub mod mcp;
 pub mod memory;
+pub mod memory_feedback;
 mod resumed;
 pub mod wire;
 

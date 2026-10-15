@@ -4166,6 +4166,30 @@ excluded from model quality samples. Each `StageRun` records the `kind` its stag
 had in the run's frozen pipeline when it was spawned; `archon learning` credits
 a model only for a stage recorded as `work`, never by the current catalog.
 
+**Memory feedback.** When Aether advertises `memory_feedback` and
+`memory_context`, `archon learning correct` also records `hurt` evidence for the
+corrected stage's recorded Aether tasks, including retries and fan-out slots.
+With `--forget-memory`, it sends `operator` evidence only when that memory appears
+in the task's context; otherwise the receipt explains the skip. The requested
+forget proceeds independently. Without a named memory, it sends `outcome`
+evidence for each distinct memory in each task's context. Truncated context is
+marked partial and the listed memories still receive feedback. Older Aether
+instances receive no feedback commands.
+
+The correction's JSON `data` stores a delivery ledger bound to the known Aether
+instance and the stage's tasks when the correction is recorded. Migration 12
+marks older corrections as having no ledger. Context discovery, memory/task
+pairs, errors, attempted submissions and Aether `mfb_` receipts are durable; memory
+text is never stored. Calls run outside the store lock, serialized with undo.
+Each write first persists its intent and uses `archon:<feedback>:<memory>:<task>`
+as its idempotency key. Replaying `correct` or running `learning retry-memory`
+resumes pending discovery and delivery. `undo` drops unattempted entries and
+retracts recorded evidence; uncertain submissions replay their key to recover a
+receipt before retraction. Failed retractions remain pending and retry through
+`undo` or `retry-memory`. Undo still leaves a forgotten memory forgotten.
+`learning why` and JSON show sent, pending, skipped and retracted counts, partial
+tasks and errors; pending counts include tasks awaiting context discovery.
+
 **Routing.** Evidence is keyed by repository, pipeline and content revision,
 review level, task class (`task:<class>`, otherwise `general`), stage, and known diff
 size. Without a size hint, the same context pools sizes. Each query is capped at

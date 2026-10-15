@@ -27,6 +27,8 @@ pub struct CorrectionFacts {
     /// The Aether instance a requested forget is bound to; required with one.
     pub aether_instance: Option<String>,
     pub observed_at: Timestamp,
+    /// Delivery intent frozen before the correction's first external call.
+    pub memory_feedback: Option<archon_core::feedback::MemoryFeedback>,
 }
 
 impl Store {
@@ -112,6 +114,38 @@ impl Store {
         feedback.check()?;
         update(&tx, &feedback)?;
         tx.commit().ctx("commit correction undo")?;
+        Ok(feedback)
+    }
+
+    /// Updates the delivery ledger without changing curation or revocation.
+    pub fn update_memory_feedback(
+        &self,
+        id: &FeedbackId,
+        ledger: &archon_core::feedback::MemoryFeedback,
+    ) -> Result<OperatorFeedback, ArchonError> {
+        ledger.check()?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .ctx("begin memory feedback")?;
+        let mut feedback =
+            load(&tx, id)?.ok_or_else(|| ArchonError::NotFound(format!("feedback {id}")))?;
+        let current = feedback.memory_feedback.as_ref().ok_or_else(|| {
+            ArchonError::Invalid("correction has no memory feedback ledger".into())
+        })?;
+        assert_eq!(
+            current.instance_id, ledger.instance_id,
+            "instance binding is immutable"
+        );
+        assert_eq!(
+            current.tasks.iter().map(|t| &t.task).collect::<Vec<_>>(),
+            ledger.tasks.iter().map(|t| &t.task).collect::<Vec<_>>(),
+            "task bindings are immutable"
+        );
+        feedback.memory_feedback = Some(ledger.clone());
+        feedback.check()?;
+        update(&tx, &feedback)?;
+        tx.commit().ctx("commit memory feedback")?;
         Ok(feedback)
     }
 

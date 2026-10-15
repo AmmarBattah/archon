@@ -473,6 +473,7 @@ pub fn context(
         runs: Mutex::new(RunTable::default()),
         replies: Mutex::new(ReplyTracker::default()),
         answering: Mutex::new(()),
+        learning_memory: Mutex::new(()),
         report_files: Arc::new(Mutex::new(())),
         triggers: TriggerQueue::default(),
         mirrors: archon_daemon::mirror::MirrorQueue::default(),

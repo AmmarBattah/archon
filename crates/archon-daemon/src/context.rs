@@ -78,6 +78,8 @@ pub struct DaemonContext {
     /// Held while an operator answer is delivered and then recorded, so a
     /// question is delivered at most once (see `handlers::operator`).
     pub answering: Mutex<()>,
+    /// Serializes correction delivery and undo, without holding the store lock.
+    pub learning_memory: Mutex<()>,
     /// Serializes report snapshot refreshes with pruning.
     pub report_files: Arc<Mutex<()>>,
     /// Serializes orchestrator create/revive and announces its id.

@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use archon_core::Timestamp;
-use archon_core::aether_ids::{AetherAgentId, AetherMemoryId, AetherRunId, AetherTaskId};
+use archon_core::aether_ids::{
+    AetherAgentId, AetherMemoryFeedbackId, AetherMemoryId, AetherRunId, AetherTaskId,
+};
 use archon_core::error::ArchonError;
 use archon_core::model::{Effort, ModelRef};
 use serde::{Deserialize, Serialize};
@@ -134,6 +136,14 @@ pub enum Command {
         id: AetherMemoryId,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    MemoriesInContext {
+        task: AetherTaskId,
+    },
+    RecordMemoryFeedback(crate::memory_feedback::RecordMemoryFeedback),
+    RetractMemoryFeedback {
+        feedback: AetherMemoryFeedbackId,
+        reason: String,
     },
     RestoreMemory {
         id: AetherMemoryId,

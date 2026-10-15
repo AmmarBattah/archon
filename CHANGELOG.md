@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Operator corrections now tell Aether which recalled memories concerned the
+  corrected stage. Memory feedback survives interrupted delivery, can be retried
+  with `archon learning retry-memory`, and is retracted by `undo`. `learning why`
+  shows sent, pending and skipped feedback, including partial context results.
+
 ### Fixes
 
 - A review holder that named only its latest delta reviewers no longer fails

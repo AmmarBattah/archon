@@ -76,6 +76,9 @@ fn variant_name(command: &Command) -> &'static str {
         Command::Memories { .. } => "memories",
         Command::ForgetMemory { .. } => "forget_memory",
         Command::RestoreMemory { .. } => "restore_memory",
+        Command::MemoriesInContext { .. } => "memories_in_context",
+        Command::RecordMemoryFeedback(_) => "record_memory_feedback",
+        Command::RetractMemoryFeedback { .. } => "retract_memory_feedback",
     }
 }
 
@@ -615,4 +618,39 @@ fn lean_context_matches_the_feature_schema_without_changing_protocol() {
         current["$defs"]["HostContext"]["enum"],
         json!(["full", "lean"])
     );
+}
+
+#[test]
+fn optional_memory_commands_match_aethers_feature_schema() {
+    use archon_aether::memory_feedback::{MemoryEvidence, RecordMemoryFeedback};
+    use archon_core::aether_ids::AetherMemoryFeedbackId;
+
+    let schema: Value =
+        serde_json::from_str(include_str!("fixtures/aether-memory-feedback.schema.json")).unwrap();
+    let commands = [
+        Command::MemoriesInContext { task: task() },
+        Command::RecordMemoryFeedback(RecordMemoryFeedback {
+            memory: memory(),
+            verdict: "hurt".into(),
+            evidence: MemoryEvidence::Outcome,
+            task: task(),
+            reason: "archon fb_1: correction".into(),
+            idempotency_key: "archon:fb_1:mem:task".into(),
+        }),
+        Command::RetractMemoryFeedback {
+            feedback: AetherMemoryFeedbackId::parse("mfb_1").unwrap(),
+            reason: "undo".into(),
+        },
+    ];
+    assert_eq!(
+        schema["$defs"]["ClientFrame"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .len(),
+        commands.len()
+    );
+    for command in commands {
+        let problems = violations(&schema, &command);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
 }

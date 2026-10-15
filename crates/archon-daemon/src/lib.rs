@@ -257,6 +257,7 @@ fn build_context(options: DaemonOptions) -> Result<DaemonContext, ArchonError> {
         runs: Mutex::new(executor::RunTable::default()),
         replies: Mutex::new(feed::ReplyTracker::default()),
         answering: Mutex::new(()),
+        learning_memory: Mutex::new(()),
         report_files: Arc::new(Mutex::new(())),
         triggers: TriggerQueue::default(),
         mirrors: mirror::MirrorQueue::default(),

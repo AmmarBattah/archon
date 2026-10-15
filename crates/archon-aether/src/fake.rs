@@ -639,3 +639,29 @@ pub fn memory(id: &str, repo: &str, text: &str) -> Value {
         "pinned": false, "tags": [], "retrieval_count": 3,
     })
 }
+
+/// A feedback receipt for a record command, reusable for keyed replay tests.
+pub fn memory_feedback(command: &Value, id: &str) -> Value {
+    assert!(
+        id.starts_with("mfb_"),
+        "feedback receipts have their own ids"
+    );
+    assert_eq!(command["cmd"], "record_memory_feedback");
+    json!({
+        "id": id, "memory": command["memory"], "task": command["task"],
+        "verdict": command["verdict"], "evidence": command["evidence"],
+        "reason": command["reason"], "actor": {"actor": "user"},
+        "created_at": "2026-10-15T09:00:00Z"
+    })
+}
+
+/// One stored snapshot in Aether's context reply; no memory text is exposed.
+pub fn memory_context(task: &str, memories: &[&str], truncated: bool) -> Value {
+    assert!(task.starts_with("tsk_"), "context belongs to a task");
+    assert!(memories.iter().all(|m| m.starts_with("mem_")));
+    json!({"snapshots": [{
+        "snapshot": "snp_01ARZ3NDEKTSV4RRFFQ69G5FAV", "invocations": [],
+        "agent": "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV", "task": task,
+        "turn": 1, "at": "2026-10-15T09:00:00Z", "memories": memories
+    }], "truncated": truncated})
+}
