@@ -184,10 +184,11 @@ pub(crate) async fn request(
     item: &QueueItemId,
     reason: Option<&str>,
 ) -> Result<MergeRequest, ArchonError> {
+    // One line, so it cannot pose as the daemon's own lines in the question.
     let reason = reason
-        .map(str::trim)
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|r| !r.is_empty())
-        .map(|r| clip(r, MAX_REASON_CHARS));
+        .map(|r| clip(&r, MAX_REASON_CHARS));
     let (shipped, base) = {
         let store = ctx.store.lock().await;
         let shipped = shipped(&store, item)?;

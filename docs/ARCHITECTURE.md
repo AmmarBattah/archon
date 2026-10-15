@@ -2701,7 +2701,7 @@ defined in `archon_core::protocol` and served by `archon-daemon`.
   `"clear"`, or `{"set":value}`. `archon repo set --base ""` or
   `--pipeline ""` sends `"clear"`. `RepoPatch.grant_merge` is a plain
   optional bool: absent keeps the setting.
-- Protocol 9 added `MergeItem`, `RequestMerge`, `Reply::Merge` and
+- Protocol 11 added `MergeItem`, `RequestMerge`, `Reply::Merge` and
   `grant_merge`; an older archond is refused at hello.
 
 The command set is `archon_core::protocol::Request`, and every variant is
@@ -4255,8 +4255,11 @@ notifies for each item.
 
 `merge = manual` keeps an item's pull request open for a person to merge.
 The operator may still have archond merge one, without raising the ceiling,
-by asking for it. archond checks that the request came from the operator;
-the orchestrator saying so is never enough. The types are in
+by asking for it. archond merges at once only on the operator's own
+command; for the orchestrator's `request_merge` it asks the operator, unless
+the repository's `grant_merge` lets it take the orchestrator's word that the
+operator asked (in shared mode a `[listen]` client can also be that
+operator). The types are in
 `archon_core::merge`, and `executor::operator_merge` is the one merge path.
 
 **Who may ask.**
@@ -4281,14 +4284,15 @@ the orchestrator saying so is never enough. The types are in
   red checks or `review = none` are still asked. A change to the grant posts
   a `System` note.
 
-**What a merge needs.** Each is checked when the request is made and again
-just before `gh pr merge`, against what `gh pr view --json
+**What a merge needs.** Each is checked just before `gh pr merge`, and
+for `request_merge` also before asking, against what `gh pr view --json
 state,isDraft,headRefOid,baseRefName,mergeable,statusCheckRollup` shows:
 
 - The item succeeded and archond delivered its pull request (§8.7).
 - The pull request is open, not a draft, and `MERGEABLE`.
 - Its head is the commit the run's checks and review passed.
-- Its base is the item's base, and no stack parent is unmerged.
+- Its base is the item's base, and no stack parent is unmerged. A child
+  restacked after its parent merged has a new head, so it needs a retry.
 - Every check is green, unless the operator acknowledged them with
   `--ignore-checks` or `yes ignore-checks`.
 
@@ -4305,8 +4309,8 @@ It is never sent twice.
 **Audit.** Each end posts an `Outcome` to the feed (a refusal posts a
 `Blocker`) and `merge_finished` news to the orchestrator. That news wakes
 it when it asked or the request came from its chat. `archon queue show`
-prints a `merge:` line, and `archon status` and `archon autonomy` show the
-merges waiting and the repositories with `grant_merge`.
+prints a `merge:` line. `archon status` shows the merges waiting, and it
+and `archon autonomy` show the repositories with `grant_merge`.
 
 
 ## 19. Learning

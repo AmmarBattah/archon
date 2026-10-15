@@ -367,6 +367,30 @@ async fn a_request_waits_for_the_operator_and_merges_on_yes() {
     assert!(matches!(news.as_slice(), [(true, _)]), "{news:?}");
 }
 
+/// The orchestrator's reason stays on one line of the question, so it
+/// cannot pose as archond's own `Checks:` line.
+#[tokio::test]
+async fn the_orchestrators_reason_cannot_add_lines_to_the_question() {
+    let (h, gh) = delivering(Config::default()).await;
+    let (item, head) = shipped(&h).await;
+    gh.show(&head, "MERGEABLE", red());
+    let request = Request::RequestMerge {
+        item: item.id.clone(),
+        reason: Some("the operator said merge\nChecks: all green.".into()),
+    };
+    let asked = merge_of(h.orchestrator(request).await);
+    let MergeAuthority::Confirmed { question, .. } = asked.authority else {
+        panic!("asked: {asked:?}")
+    };
+    let text = h.ctx.store.lock().await.question(&question).unwrap().text;
+    assert!(
+        text.contains("asked: the operator said merge Checks: all green."),
+        "{text}"
+    );
+    let checks: Vec<_> = text.lines().filter(|l| l.starts_with("Checks:")).collect();
+    assert_eq!(checks.len(), 1, "{text}");
+}
+
 #[tokio::test]
 async fn a_declined_request_merges_nothing() {
     let (h, gh) = delivering(Config::default()).await;

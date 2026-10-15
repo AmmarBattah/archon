@@ -955,8 +955,8 @@ Archon merges only an item that succeeded and whose pull request is open,
 not a draft, mergeable, on the right base, with no unmerged stack parent,
 and still at the commit its review passed. It merges by the first method the
 repository allows, pinned to that commit, never with `--admin`. Checks
-must be green unless you acknowledge them. A refusal says why and changes
-nothing. `archon queue show <item>` prints a `merge:` line.
+must be green unless you acknowledge them. A refusal says why, is recorded,
+and merges nothing. `archon queue show <item>` prints a `merge:` line.
 
 You can also just tell the orchestrator "merge it", in chat or in a GitHub
 request with operator standing. It cannot merge by itself: it calls
@@ -974,8 +974,8 @@ archon repo set <repo> --grant-merge true   # false withdraws it
 The grant has no expiry and is independent of `merge = auto`. Under it, a
 request for a reviewed item whose checks are all green merges without a
 question. Red checks, or an item with `review = none`, are still asked.
-`archon autonomy` and `archon status` show the grant and any merge waiting
-for you. See
+`archon autonomy` and `archon status` show the grant, and `archon status`
+any merge waiting for you. See
 [`docs/ARCHITECTURE.md` §18.6](ARCHITECTURE.md#186-merges-the-operator-asks-for).
 
 ### Who speaks as you

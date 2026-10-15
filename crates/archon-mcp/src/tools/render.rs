@@ -413,10 +413,10 @@ fn merge_text(request: &MergeRequest) -> String {
     if let Some(number) = request.waiting_on() {
         let _ = write!(
             text,
-            "\nTell the operator: Q{number} asks them to confirm; they answer `/answer {number} \
-             yes` (or `yes ignore-checks`, or `no`) in this chat, `/a {number} yes` in archon \
-             chat, or `archon answer {number} yes`. You cannot answer it. Its outcome comes as \
-             merge_finished."
+            "\nTell the operator: Q{number} asks them to confirm; they answer `archon answer \
+             {number} yes` (or `yes ignore-checks`, or `no`), `/a {number} yes` in archon chat, \
+             or `/answer {number} yes` in this chat when it is dedicated. You cannot answer it. \
+             Its outcome comes as merge_finished."
         );
     }
     text
