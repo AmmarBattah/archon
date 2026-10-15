@@ -151,8 +151,12 @@ async fn merge_news(h: &Harness) -> Vec<(bool, String)> {
 }
 
 async fn grant_merge(h: &Harness) {
+    set_grant(h, true).await;
+}
+
+async fn set_grant(h: &Harness, on: bool) {
     let patch = RepoPatch {
-        grant_merge: Some(true),
+        grant_merge: Some(on),
         ..RepoPatch::default()
     };
     let request = Request::RepoUpdate {
@@ -495,4 +499,88 @@ async fn an_interrupted_merge_is_settled_from_github() {
     };
     assert!(method.contains("lost track"), "{method}");
     assert_eq!(merge_calls(&gh).len(), 1, "never sent twice");
+}
+
+/// A grant covers no red checks and ends when it is turned off: either way
+/// the operator is asked and nothing is sent to GitHub.
+#[tokio::test]
+async fn a_grant_asks_for_red_checks_and_not_at_all_once_off() {
+    let (h, gh) = delivering(Config::default()).await;
+    grant_merge(&h).await;
+    let (item, head) = reviewed(&h).await;
+    gh.show(&head, "MERGEABLE", red());
+    let red_checks = merge_of(h.orchestrator(request_merge(&item)).await);
+    assert_eq!(red_checks.state, MergeState::AwaitingOperator);
+    assert!(matches!(
+        red_checks.authority,
+        MergeAuthority::Confirmed { .. }
+    ));
+    assert!(merge_calls(&gh).is_empty() && !gh.merged());
+
+    let (h, gh) = delivering(Config::default()).await;
+    grant_merge(&h).await;
+    set_grant(&h, false).await;
+    let (item, head) = reviewed(&h).await;
+    gh.show(&head, "MERGEABLE", green());
+    let revoked = merge_of(h.orchestrator(request_merge(&item)).await);
+    assert_eq!(revoked.state, MergeState::AwaitingOperator);
+    assert!(merge_calls(&gh).is_empty() && !gh.merged());
+}
+
+/// A head that moved after the operator was asked is refused on `yes`:
+/// what merges is what was reviewed, never what was pushed since.
+#[tokio::test]
+async fn a_head_moved_after_the_question_is_refused_on_yes() {
+    let (h, gh) = delivering(Config::default()).await;
+    let (item, head) = shipped(&h).await;
+    gh.show(&head, "MERGEABLE", green());
+    let asked = merge_of(h.orchestrator(request_merge(&item)).await);
+    let MergeAuthority::Confirmed { question, .. } = asked.authority else {
+        panic!("asked: {asked:?}")
+    };
+    gh.show(&"0".repeat(40), "MERGEABLE", green());
+    let yes = Request::Answer {
+        question,
+        text: "yes".into(),
+    };
+    h.cli(yes).await.expect("the answer is recorded");
+    let [merge] = merges(&h, &item).await.try_into().expect("one request");
+    let MergeState::Refused { reason } = &merge.state else {
+        panic!("refused: {merge:?}")
+    };
+    assert!(reason.to_lowercase().contains("head"), "{reason}");
+    assert!(merge_calls(&gh).is_empty() && !gh.merged());
+    let news = merge_news(&h).await;
+    assert!(matches!(news.as_slice(), [(false, _)]), "{news:?}");
+}
+
+/// A stage agent and the agents it delegated to cannot request a merge,
+/// even of an item that could merge.
+#[tokio::test]
+async fn a_stage_agent_or_its_child_cannot_request_a_merge() {
+    let (h, gh) = delivering(Config::default()).await;
+    let (item, head) = shipped(&h).await;
+    gh.show(&head, "MERGEABLE", green());
+    enqueue(&h, "adaptive", ReviewLevel::Standard).await;
+    h.dispatch().await;
+    let lead = h
+        .running()
+        .await
+        .remove(0)
+        .aether_agent
+        .expect("a lead agent");
+    let child = h.backend.delegate(&lead, REVIEW_MODEL);
+    for caller in [lead, child] {
+        let request = Request::ForAgent {
+            caller: caller.clone(),
+            request: Box::new(request_merge(&item)),
+        };
+        let refused = handlers::handle(&h.ctx, ClientKind::ArchonMcp, request).await;
+        assert!(
+            matches!(refused, Err(ArchonError::Forbidden(_))),
+            "{caller}: {refused:?}"
+        );
+    }
+    assert!(merges(&h, &item).await.is_empty());
+    assert!(merge_calls(&gh).is_empty() && !gh.merged());
 }

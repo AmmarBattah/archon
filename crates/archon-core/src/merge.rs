@@ -69,7 +69,11 @@ pub enum MergeState {
     /// The operator answered no.
     Declined,
     /// A precondition failed or GitHub refused; nothing was merged.
-    Refused { reason: String },
+    Refused {
+        // Flattened beside the request's own `reason`, so named apart.
+        #[serde(rename = "refusal")]
+        reason: String,
+    },
 }
 
 impl MergeState {
@@ -496,5 +500,14 @@ mod tests {
         };
         assert_eq!(merged.waiting_on(), None);
         assert!(merged.line().contains("merged at a1b2c3d (squash)"));
+        let refused = MergeRequest {
+            state: MergeState::Refused {
+                reason: "the head moved".into(),
+            },
+            ..merged
+        };
+        let back: MergeRequest =
+            serde_json::from_value(serde_json::to_value(&refused).unwrap()).unwrap();
+        assert_eq!(back, refused, "a refusal keeps the orchestrator's reason");
     }
 }
