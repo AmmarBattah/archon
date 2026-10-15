@@ -67,6 +67,7 @@ pub const TOOLS: &[ToolName] = &[
     tool("update_initiative", ToolClass::Mutation),
     tool("steer_item", ToolClass::Mutation),
     tool("record_lesson", ToolClass::Mutation),
+    tool("refresh_item", ToolClass::Mutation),
     tool("publish_artifact", ToolClass::Mutation),
     tool("list_artifacts", ToolClass::ReadOnly),
     tool("read_artifact", ToolClass::ReadOnly),

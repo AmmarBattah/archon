@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use super::{Harness, git};
 
 /// A `gh` keeping a file per head branch's pull request and logging calls;
-/// `fail-<command>` fails it once, `lose-create-reply` loses a create's reply.
+/// `fail-<command>` fails it once, `lose-create-reply` loses a create's reply,
+/// `checks` and `annotations` are what `pr checks` and the annotations API say.
 /// `pr view` shows the `view-*` files; a merge at that head marks it merged.
 const STATEFUL_GH: &str = r#"#!/bin/sh
 state="$(dirname "$0")/gh-state"
@@ -92,6 +93,15 @@ case "$1 $2" in
         echo "HTTP 502: Bad Gateway" > "$state/fail-pr-view"
     fi
     ;;
+"pr checks")
+    [ "$4 $5" = "--json name,bucket,startedAt,link" ] || exit 2
+    [ -f "$state/checks" ] || { echo "no checks reported on the 'b' branch" >&2; exit 1; }
+    cat "$state/checks"
+    ;;
+"api --hostname")
+    case "$4" in repos/*/check-runs/*/annotations) ;; *) exit 2 ;; esac
+    cat "$state/annotations" 2>/dev/null || printf '[]'
+    ;;
 *)
     exit 2
     ;;
@@ -164,6 +174,17 @@ impl FakeGh {
     /// The next merge goes through, but GitHub cannot be read just after.
     pub fn lose_next_merge_reply(&self) {
         std::fs::write(self.state.join("lose-merge-reply"), "").expect("marker");
+    }
+
+    /// What `gh pr checks --json` prints from now on.
+    pub fn set_checks(&self, checks: &Value) {
+        std::fs::write(self.state.join("checks"), checks.to_string()).expect("checks");
+    }
+
+    /// What the annotations of any check run are from now on.
+    pub fn set_annotations(&self, annotations: &Value) {
+        let raw = annotations.to_string();
+        std::fs::write(self.state.join("annotations"), raw).expect("annotations");
     }
 
     /// The title and body of the pull request last created.

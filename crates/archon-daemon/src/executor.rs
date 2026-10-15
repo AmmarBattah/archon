@@ -22,6 +22,7 @@ pub(crate) mod operator_merge;
 mod pages;
 pub mod pull_requests;
 mod recover;
+pub(crate) mod refresh;
 pub(crate) mod repo_identity;
 pub(crate) mod restack;
 mod resume;

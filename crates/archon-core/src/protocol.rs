@@ -43,9 +43,10 @@ use crate::steer::Steer;
 /// 8: `archon learning` corrections, their receipts and memory curation.
 /// 9: `[limits] budgets_enabled`; `Caps` carries it, and a change that sets an
 /// item's budget while budgets are off answers `ItemBudgetsOff`.
-/// 10: merging on the operator's request (`merge_item`, `request_merge`) and
+/// 10: `refresh_item`; an older archond knows no such request.
+/// 11: merging on the operator's request (`merge_item`, `request_merge`) and
 /// a repository's `grant_merge`, which an older archond would drop.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Said beside an item whose `budget_usd` was set while budgets are off.
 pub const BUDGETS_OFF_NOTE: &str = "Dollar budgets are globally off ([limits] budgets_enabled = \
@@ -188,6 +189,11 @@ pub enum Request {
         /// Appended to the brief under a dated "Amendment" heading.
         #[serde(default)]
         brief_append: Option<String>,
+    },
+    /// Merge the finished item's base branch, fetched afresh, into its branch:
+    /// a new item on the same branch and pull request (ARCHITECTURE §13).
+    RefreshItem {
+        item: QueueItemId,
     },
     Pause(PauseTarget),
     Resume(PauseTarget),

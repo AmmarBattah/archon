@@ -47,6 +47,7 @@ pub(super) fn all() -> Vec<ToolDefinition> {
         initiatives::update_initiative(),
         steer::steer_item(),
         lessons::record_lesson(),
+        refresh_item(),
         publish_artifact(),
         list_artifacts(),
         read_artifact(),
@@ -556,6 +557,17 @@ fn retry_item() -> ToolDefinition {
             }),
             &["item"],
         ),
+        false,
+    )
+}
+
+fn refresh_item() -> ToolDefinition {
+    define(
+        "refresh_item",
+        "Refresh item onto its base",
+        "Merge fresh base into a stale or conflicting item's branch and same pull request. \
+         Review reads from the new merge base, conflict fixes included.",
+        object(json!({"item": item_id("")}), &["item"]),
         false,
     )
 }

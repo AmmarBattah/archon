@@ -72,6 +72,7 @@ pub async fn reconcile(ctx: &DaemonContext) -> Result<(), ArchonError> {
     super::initiative_ship::reconcile(ctx, &mut pass).await?;
     super::restack::reconcile(ctx, &mut pass).await?;
     super::ship::pay_owed_merges(ctx).await?;
+    super::ship::look_at_checks(ctx).await?;
     super::operator_merge::settle_stale(ctx).await?;
     ctx.dispatch.notify_one();
     Ok(())
