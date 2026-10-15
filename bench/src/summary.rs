@@ -151,7 +151,7 @@ impl Aggregate {
             input_tokens: Stat::of(&values(&|r| r.input_tokens.map(|t| t as f64))),
             output_tokens: Stat::of(&values(&|r| r.output_tokens.map(|t| t as f64))),
             cost_usd: Stat::of(&values(&TrialResult::effective_cost_usd)),
-            cost_floor: results.iter().any(|r| r.cost_gap.is_some()),
+            cost_floor: results.iter().any(|r| r.cost_is_floor()),
             operator_messages: Stat::of(&values(&|r| Some(f64::from(r.operator_messages))))?,
         })
     }
@@ -470,10 +470,11 @@ fn render_manifest(out: &mut String, m: &RunManifest) -> anyhow::Result<()> {
     }
     writeln!(
         out,
-        "- Trials: {} planned, {} completed, {} skipped; spent ${:.2} of ${:.2}{}",
+        "- Trials: {} planned, {} completed, {} skipped; spent {}${:.2} of ${:.2}{}",
         m.planned,
         m.completed,
         m.skipped,
+        if m.spent_floor { "≥ " } else { "" },
         m.spent_usd,
         m.max_usd,
         if m.unpriced_trials > 0 {

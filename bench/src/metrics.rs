@@ -139,6 +139,15 @@ impl TrialResult {
             (billed, None) => billed,
         }
     }
+
+    /// Aether reported this trial's billed cost as incomplete, so that cost
+    /// is a lower bound. A substituted estimate is no bound at all.
+    pub fn cost_is_floor(&self) -> bool {
+        match (self.cost_gap.as_ref(), self.cost_usd) {
+            (Some(_), Some(billed)) => self.effective_cost_usd() == Some(billed),
+            _ => false,
+        }
+    }
 }
 
 /// `run.json`: everything needed to reproduce and judge a run.
@@ -165,6 +174,9 @@ pub struct RunManifest {
     pub completed: usize,
     pub skipped: usize,
     pub spent_usd: f64,
+    /// Some counted trial's cost was reported incomplete, so the spend is at least this.
+    #[serde(default)]
+    pub spent_floor: bool,
     pub unpriced_trials: u32,
     /// Why the run ended early (budget exhausted), when it did.
     pub stopped_reason: Option<String>,
@@ -219,6 +231,21 @@ pub(crate) mod tests {
         assert_eq!(result(None, Some(1.5)).effective_cost_usd(), Some(1.5));
         assert_eq!(result(Some(0.0), None).effective_cost_usd(), Some(0.0));
         assert_eq!(result(None, None).effective_cost_usd(), None);
+    }
+
+    #[test]
+    fn only_a_reported_cost_with_a_gap_is_a_floor() {
+        let gapped = |cost, estimate| {
+            let mut r = result(cost, estimate);
+            r.cost_gap = Some("unpriced".into());
+            r
+        };
+        assert!(gapped(Some(2.0), Some(5.0)).cost_is_floor());
+        assert!(gapped(Some(0.0), None).cost_is_floor());
+        assert!(!gapped(Some(0.0), Some(5.0)).cost_is_floor());
+        assert!(!gapped(None, Some(5.0)).cost_is_floor());
+        assert!(!gapped(None, None).cost_is_floor());
+        assert!(!result(Some(2.0), None).cost_is_floor());
     }
 
     #[test]

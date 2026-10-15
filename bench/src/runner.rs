@@ -79,6 +79,7 @@ pub async fn run(
     manifest.completed = ledger.completed;
     manifest.skipped = skipped;
     manifest.spent_usd = ledger.budget.spent_usd;
+    manifest.spent_floor = ledger.budget.spent_floor;
     manifest.unpriced_trials = ledger.budget.unpriced_trials;
     if skipped > 0 {
         manifest.stopped_reason = Some(format!(
@@ -142,9 +143,10 @@ fn record(shared: &Shared, result: &TrialResult) -> anyhow::Result<()> {
 
 fn progress_line(r: &TrialResult) -> String {
     let verdict = if r.success { "pass" } else { "FAIL" };
+    let floor = if r.cost_is_floor() { "≥ " } else { "" };
     let cost = r
         .effective_cost_usd()
-        .map_or_else(|| "$?".to_owned(), |c| format!("${c:.2}"));
+        .map_or_else(|| "$?".to_owned(), |c| format!("{floor}${c:.2}"));
     let problem = r
         .error
         .as_deref()
@@ -436,6 +438,7 @@ async fn start_manifest(
         completed: 0,
         skipped: 0,
         spent_usd: 0.0,
+        spent_floor: false,
         unpriced_trials: 0,
         stopped_reason: None,
     }
@@ -506,5 +509,16 @@ mod tests {
             "aetherd not probed: no private sandbox"
         );
         assert_eq!(versions.len(), 1);
+    }
+
+    #[test]
+    fn progress_marks_only_a_gapped_reported_cost_as_a_floor() {
+        let mut gapped = result(Some(1.5), None);
+        gapped.cost_gap = Some("interrupted".into());
+        assert!(progress_line(&gapped).ends_with("1s ≥ $1.50"));
+        assert!(progress_line(&result(Some(1.5), None)).ends_with("1s $1.50"));
+        let mut estimated = result(Some(0.0), Some(2.0));
+        estimated.cost_gap = Some("unpriced".into());
+        assert!(progress_line(&estimated).ends_with("1s $2.00"));
     }
 }

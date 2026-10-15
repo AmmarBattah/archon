@@ -36,7 +36,8 @@ def read_rows(directories):
                        trials=arm["trials"], tasks=len(data["tasks"]),
                        pass_rate=100 * arm["success_rate"],
                        cost_usd=cost["mean"], wall_secs=arm["wall_secs"]["mean"],
-                       graded_on_timeout_passes=late_passes)
+                       graded_on_timeout_passes=late_passes,
+                       cost_floor=bool(arm.get("cost_floor", False)))
             if any(not math.isfinite(row[key]) or row[key] < 0 for key, _ in METRICS):
                 raise ValueError(f"{directory} has invalid metrics")
             rows.append(row)
@@ -57,10 +58,11 @@ def panel(rows, metric, title, offset):
         value = row[metric]
         width = value * scale
         label = f'{row["version"]} {row["arm"]}'
+        floor = "≥ " if metric == "cost_usd" and row["cost_floor"] else ""
         parts.extend([
             f'<text x="0" y="{y + 13}">{html.escape(label)}</text>',
             f'<rect x="108" y="{y}" width="{width:.2f}" height="19" fill="{ARMS[row["arm"]]}"/>',
-            f'<text x="{114 + width:.2f}" y="{y + 13}">{value:.2f}</text>',
+            f'<text x="{114 + width:.2f}" y="{y + 13}">{floor}{value:.2f}</text>',
         ])
     return "\n".join(parts + ["</g>"])
 
@@ -78,7 +80,7 @@ def render(rows):
 <rect width="1280" height="{height}" fill="#fff"/>
 <text x="20" y="30" style="font-size:20px;font-weight:600">Benchmark history · Archon and single-agent Aether</text>
 {''.join(panels)}
-<text x="20" y="{height - 35}">Observed graded-trial means; infrastructure failures excluded. v1/v2 are incomplete and task weights differ.</text>
+<text x="20" y="{height - 35}">Observed graded-trial means; infrastructure failures excluded. v1/v2 are incomplete and task weights differ. ≥ marks a cost Aether reported as incomplete.</text>
 <text x="20" y="{height - 15}">Smoke uses Haiku and four tasks (two new); older snapshots use Opus. Compare like configurations. Small samples do not establish reliability.</text>
 </svg>
 '''

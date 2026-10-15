@@ -115,6 +115,8 @@ pub fn check_plan(specs: &[TrialSpec], options: &RunOptions) -> anyhow::Result<(
 pub struct Budget {
     pub limit_usd: f64,
     pub spent_usd: f64,
+    /// Some counted trial's cost was reported incomplete, so `spent_usd` is a floor.
+    pub spent_floor: bool,
     pub unpriced_trials: u32,
 }
 
@@ -124,6 +126,7 @@ impl Budget {
         Self {
             limit_usd,
             spent_usd: 0.0,
+            spent_floor: false,
             unpriced_trials: 0,
         }
     }
@@ -137,6 +140,7 @@ impl Budget {
             Some(cost) => {
                 assert!(cost >= 0.0, "a trial cannot earn money");
                 self.spent_usd += cost;
+                self.spent_floor |= result.cost_is_floor();
             }
             None => self.unpriced_trials += 1,
         }

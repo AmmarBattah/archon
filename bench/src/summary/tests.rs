@@ -356,6 +356,22 @@ fn summaries_without_timeout_grades_keep_their_layout() {
 }
 
 #[test]
+fn a_floor_needs_a_reported_cost_among_the_trials_that_priced_the_arm() {
+    let mut substituted = result(Some(0.0), Some(5.0));
+    substituted.cost_gap = Some("unpriced".into());
+    let mut unpriced = result(None, None);
+    unpriced.cost_gap = Some("unreported".into());
+    let exact = trial("t", Arm::Claude, true, 1.0, 2.0);
+
+    let estimated = Summary::build(&[substituted], None).unwrap();
+    assert_eq!(estimated.arms[0].cost_usd.as_ref().unwrap().mean, 5.0);
+    assert!(!estimated.arms[0].cost_floor);
+    let with_unpriced = Summary::build(&[exact, unpriced], None).unwrap();
+    assert_eq!(with_unpriced.arms[0].cost_usd.as_ref().unwrap().n, 1);
+    assert!(!with_unpriced.arms[0].cost_floor);
+}
+
+#[test]
 fn a_cost_gap_marks_the_cost_as_a_floor_only_where_it_occurs() {
     let mut gapped = trial("a", Arm::Archon, true, 1.0, 2.0);
     gapped.cost_gap = Some("interrupted".into());
@@ -374,4 +390,18 @@ fn a_cost_gap_marks_the_cost_as_a_floor_only_where_it_occurs() {
 
     let plain = Summary::build(&[trial("a", Arm::Claude, true, 1.0, 1.0)], None).unwrap();
     assert!(!render_markdown(&plain).unwrap().contains("≥ 1.00"));
+}
+
+#[test]
+fn the_manifest_spend_is_marked_a_floor_and_old_manifests_load_exact() {
+    let mut manifest: RunManifest =
+        serde_json::from_str(include_str!("../../results-v3/run.json")).unwrap();
+    assert!(!manifest.spent_floor);
+    let mut out = String::new();
+    render_manifest(&mut out, &manifest).unwrap();
+    assert!(out.contains("spent $") && !out.contains("spent ≥"), "{out}");
+    manifest.spent_floor = true;
+    let mut floor = String::new();
+    render_manifest(&mut floor, &manifest).unwrap();
+    assert!(floor.contains("spent ≥ $"), "{floor}");
 }

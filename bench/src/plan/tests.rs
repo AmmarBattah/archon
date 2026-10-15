@@ -83,6 +83,21 @@ fn budget_stops_new_trials_once_spent() {
 }
 
 #[test]
+fn budget_spend_is_a_floor_once_a_reported_cost_has_a_gap() {
+    let mut budget = Budget::new(10.0);
+    budget.record(&result(Some(1.0), None));
+    let mut estimated = result(Some(0.0), Some(2.0));
+    estimated.cost_gap = Some("unpriced".into());
+    budget.record(&estimated);
+    assert!(!budget.spent_floor);
+    let mut gapped = result(Some(1.0), None);
+    gapped.cost_gap = Some("interrupted".into());
+    budget.record(&gapped);
+    assert!(budget.spent_floor);
+    assert!((budget.spent_usd - 4.0).abs() < 1e-9);
+}
+
+#[test]
 fn trial_logs_nest_by_stamp_task_arm_and_trial_away_from_workspaces() {
     let opts = options(vec![Arm::Codex], 1);
     assert_eq!(

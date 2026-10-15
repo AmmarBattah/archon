@@ -121,12 +121,13 @@ pub fn check_directory(dir: &Path, baseline: &Baseline, max_usd: f64) -> anyhow:
     let gate = evaluate(&results, &manifest, baseline, max_usd)?;
     std::fs::write(dir.join("gate.json"), serde_json::to_string_pretty(&gate)?)?;
     println!(
-        "smoke: {} — Archon {}/{}; baseline {}/{}; total ${:.2}",
+        "smoke: {} — Archon {}/{}; baseline {}/{}; total {}${:.2}",
         if gate.passed { "PASS" } else { "FAIL" },
         gate.archon_successes,
         gate.archon_trials,
         gate.baseline_successes,
         gate.archon_trials,
+        if manifest.spent_floor { "≥ " } else { "" },
         gate.total_cost_usd
     );
     ensure!(

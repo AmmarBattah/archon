@@ -1,9 +1,11 @@
 """Offline checks for published-snapshot history rendering."""
 
+import csv
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import history
 
@@ -25,6 +27,25 @@ class HistoryTests(unittest.TestCase):
             svg = history.render(rows)
             self.assertIn("different models, task mixes", svg)
             self.assertIn("Smoke uses Haiku", svg)
+
+    def test_floor_costs_are_marked_in_the_chart_and_csv_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_chart(root)
+            data = json.loads((root / "chart.json").read_text())
+            data["arms"][1]["cost_floor"] = True
+            (root / "chart.json").write_text(json.dumps(data))
+            rows = history.read_rows([root])
+            self.assertEqual([row["cost_floor"] for row in rows], [False, True])
+            svg = history.render(rows)
+            self.assertEqual(svg.count("≥ 0.10"), 1)
+            self.assertIn("≥ marks a cost Aether reported as incomplete", svg)
+            output = root / "history.svg"
+            with mock.patch("sys.argv", ["history.py", str(root), "--output", str(output)]):
+                history.main()
+            with output.with_suffix(".csv").open() as stream:
+                table = list(csv.DictReader(stream))
+            self.assertEqual([row["cost_floor"] for row in table], ["False", "True"])
 
     def test_graded_on_timeout_passes_stay_apart_from_the_pass_rate(self):
         with tempfile.TemporaryDirectory() as directory:
