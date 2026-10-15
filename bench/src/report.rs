@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::metrics::Arm;
+use crate::metrics::{Arm, CostBound};
 use crate::summary::{Aggregate, ROUTING_NOTES, Stat, Summary};
 
 const BAR_WIDTH: f64 = 420.0;
@@ -20,8 +20,8 @@ struct Metric {
     title: &'static str,
     unit: &'static str,
     value: fn(&Aggregate) -> Option<Stat>,
-    /// Whether the value is only a lower bound, drawn with a `≥` prefix.
-    floor: fn(&Aggregate) -> bool,
+    /// Whether the value is exact, a lower bound (`≥`) or incomplete (`*`).
+    bound: fn(&Aggregate) -> CostBound,
 }
 
 const METRICS: [Metric; 5] = [
@@ -35,19 +35,19 @@ const METRICS: [Metric; 5] = [
                 stdev: 0.0,
             })
         },
-        floor: |_| false,
+        bound: |_| CostBound::Exact,
     },
     Metric {
         title: "Wall time",
         unit: "s",
         value: |a| Some(a.wall_secs),
-        floor: |_| false,
+        bound: |_| CostBound::Exact,
     },
     Metric {
         title: "Cost",
         unit: "$",
         value: |a| a.cost_usd,
-        floor: |a| a.cost_floor,
+        bound: |a| a.cost_bound,
     },
     Metric {
         title: "Total tokens (input + output)",
@@ -60,13 +60,13 @@ const METRICS: [Metric; 5] = [
                 stdev: (input.stdev.powi(2) + output.stdev.powi(2)).sqrt(),
             })
         },
-        floor: |_| false,
+        bound: |_| CostBound::Exact,
     },
     Metric {
         title: "Operator-visible messages",
         unit: "msgs",
         value: |a| Some(a.operator_messages),
-        floor: |_| false,
+        bound: |_| CostBound::Exact,
     },
 ];
 
@@ -123,7 +123,7 @@ fn routing_table(title: &str, buckets: &BTreeMap<String, Aggregate>) -> String {
         assert_eq!(a.arm, Arm::Archon, "routing buckets contain Archon only");
         assert!(a.successes <= a.trials, "passes cannot exceed trials");
         let cost = match a.cost_usd.as_ref() {
-            Some(stat) => floor_label(stat, a.cost_floor),
+            Some(stat) => bound_label(stat, a.cost_bound),
             None => "—".into(),
         };
         out.push_str(&format!(
@@ -184,18 +184,15 @@ fn bar_chart(metric: &Metric, arms: &[Aggregate]) -> String {
             "<text x=\"{:.1}\" y=\"{}\">{}</text>",
             LABEL_WIDTH + bar.max((stat.mean + stat.stdev) * scale) + 6.0,
             y + 14.0,
-            floor_label(stat, (metric.floor)(aggregate))
+            bound_label(stat, (metric.bound)(aggregate))
         ));
     }
     svg.push_str("</svg></figure>");
     svg
 }
 
-fn floor_label(stat: &Stat, floor: bool) -> String {
-    if floor {
-        return format!("≥ {}", value_label(stat));
-    }
-    value_label(stat)
+fn bound_label(stat: &Stat, bound: CostBound) -> String {
+    format!("{}{}", bound.marker(), value_label(stat))
 }
 
 fn value_label(stat: &Stat) -> String {

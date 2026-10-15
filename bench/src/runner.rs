@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 
 use crate::arms::{self, ArmOutcome, ArmSettings, TrialInput};
 use crate::grade::{self, GradeOutcome, ResultSource};
-use crate::metrics::{Arm, RunManifest, TimeoutGrade, TrialResult};
+use crate::metrics::{Arm, CostBound, RunManifest, TimeoutGrade, TrialResult};
 use crate::plan::{Budget, RunOptions, TrialSpec, check_plan, plan};
 use crate::process::{redact_home, version_of};
 use crate::task::BenchTask;
@@ -79,7 +79,7 @@ pub async fn run(
     manifest.completed = ledger.completed;
     manifest.skipped = skipped;
     manifest.spent_usd = ledger.budget.spent_usd;
-    manifest.spent_floor = ledger.budget.spent_floor;
+    manifest.spent_bound = ledger.budget.spent_bound();
     manifest.unpriced_trials = ledger.budget.unpriced_trials;
     if skipped > 0 {
         manifest.stopped_reason = Some(format!(
@@ -438,7 +438,7 @@ async fn start_manifest(
         completed: 0,
         skipped: 0,
         spent_usd: 0.0,
-        spent_floor: false,
+        spent_bound: CostBound::Exact,
         unpriced_trials: 0,
         stopped_reason: None,
     }

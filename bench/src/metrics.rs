@@ -148,6 +148,60 @@ impl TrialResult {
             _ => false,
         }
     }
+
+    /// The effective cost is an estimate standing in for a missing or zero
+    /// billed cost, so it bounds nothing.
+    pub fn cost_is_estimate(&self) -> bool {
+        match (self.cost_usd, self.estimated_cost_usd) {
+            (Some(billed), _) if billed > 0.0 => false,
+            (billed, Some(estimate)) => estimate > billed.unwrap_or(0.0),
+            (_, None) => false,
+        }
+    }
+}
+
+/// What a sum or mean of trial costs can claim. Floors are lower bounds and
+/// estimates are not, so the two together support neither claim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostBound {
+    /// Billed or estimated figures only: no mark.
+    #[default]
+    Exact,
+    /// Billed figures where some are reported incomplete: at least this much.
+    Floor,
+    /// Reported-incomplete costs mixed with estimates: not a bound.
+    Incomplete,
+}
+
+impl CostBound {
+    pub fn of<'a>(results: impl IntoIterator<Item = &'a TrialResult>) -> Self {
+        let (mut floor, mut estimate) = (false, false);
+        for result in results {
+            floor |= result.cost_is_floor();
+            estimate |= result.cost_is_estimate();
+        }
+        Self::from_flags(floor, estimate)
+    }
+
+    /// `floor`: some cost is a reported-incomplete figure; `estimate`: some
+    /// cost is a substituted estimate.
+    pub fn from_flags(floor: bool, estimate: bool) -> Self {
+        match (floor, estimate) {
+            (true, true) => Self::Incomplete,
+            (true, false) => Self::Floor,
+            (false, _) => Self::Exact,
+        }
+    }
+
+    /// The prefix drawn before the figure.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Exact => "",
+            Self::Floor => "≥ ",
+            Self::Incomplete => "* ",
+        }
+    }
 }
 
 /// `run.json`: everything needed to reproduce and judge a run.
@@ -174,9 +228,9 @@ pub struct RunManifest {
     pub completed: usize,
     pub skipped: usize,
     pub spent_usd: f64,
-    /// Some counted trial's cost was reported incomplete, so the spend is at least this.
+    /// Whether `spent_usd` is exact, a floor or incomplete; see [`CostBound`].
     #[serde(default)]
-    pub spent_floor: bool,
+    pub spent_bound: CostBound,
     pub unpriced_trials: u32,
     /// Why the run ended early (budget exhausted), when it did.
     pub stopped_reason: Option<String>,
@@ -212,6 +266,42 @@ pub(crate) mod tests {
             archon_work: None,
             graded_on_timeout: None,
         }
+    }
+
+    #[test]
+    fn only_a_substituted_estimate_is_an_estimate() {
+        assert!(result(None, Some(2.0)).cost_is_estimate());
+        assert!(result(Some(0.0), Some(2.0)).cost_is_estimate());
+        assert!(!result(Some(1.0), Some(2.0)).cost_is_estimate());
+        assert!(!result(Some(2.0), None).cost_is_estimate());
+        assert!(!result(None, None).cost_is_estimate());
+    }
+
+    #[test]
+    fn a_floor_mixed_with_an_estimate_is_incomplete() {
+        let estimate = result(None, Some(5.0));
+        let mut gapped = result(Some(1.0), None);
+        gapped.cost_gap = Some("interrupted".into());
+        assert_eq!(CostBound::of([&estimate]), CostBound::Exact);
+        assert_eq!(
+            CostBound::of([&gapped, &result(Some(1.0), None)]),
+            CostBound::Floor
+        );
+        assert_eq!(CostBound::of([&estimate, &gapped]), CostBound::Incomplete);
+        assert_eq!(CostBound::of([]), CostBound::Exact);
+    }
+
+    #[test]
+    fn cost_bounds_serialize_lowercase_and_default_to_exact() {
+        assert_eq!(
+            serde_json::to_string(&CostBound::Incomplete).unwrap(),
+            "\"incomplete\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CostBound>("\"floor\"").unwrap(),
+            CostBound::Floor
+        );
+        assert_eq!(CostBound::default(), CostBound::Exact);
     }
 
     #[test]

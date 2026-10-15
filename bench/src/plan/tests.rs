@@ -83,18 +83,32 @@ fn budget_stops_new_trials_once_spent() {
 }
 
 #[test]
-fn budget_spend_is_a_floor_once_a_reported_cost_has_a_gap() {
+fn budget_spend_is_a_floor_only_when_every_cost_is_billed_and_one_has_a_gap() {
     let mut budget = Budget::new(10.0);
     budget.record(&result(Some(1.0), None));
-    let mut estimated = result(Some(0.0), Some(2.0));
-    estimated.cost_gap = Some("unpriced".into());
-    budget.record(&estimated);
-    assert!(!budget.spent_floor);
+    assert_eq!(budget.spent_bound(), CostBound::Exact);
     let mut gapped = result(Some(1.0), None);
     gapped.cost_gap = Some("interrupted".into());
     budget.record(&gapped);
-    assert!(budget.spent_floor);
-    assert!((budget.spent_usd - 4.0).abs() < 1e-9);
+    assert_eq!(budget.spent_bound(), CostBound::Floor);
+    assert!((budget.spent_usd - 2.0).abs() < 1e-9);
+}
+
+#[test]
+fn budget_spend_mixing_an_estimate_and_a_gapped_cost_is_incomplete_in_any_order() {
+    let estimate = result(None, Some(5.0));
+    let mut gapped = result(Some(1.0), None);
+    gapped.cost_gap = Some("interrupted".into());
+    for order in [[&estimate, &gapped], [&gapped, &estimate]] {
+        let mut budget = Budget::new(10.0);
+        budget.record(order[0]);
+        budget.record(order[1]);
+        assert_eq!(budget.spent_bound(), CostBound::Incomplete);
+        assert!((budget.spent_usd - 6.0).abs() < 1e-9);
+    }
+    let mut only_estimates = Budget::new(10.0);
+    only_estimates.record(&estimate);
+    assert_eq!(only_estimates.spent_bound(), CostBound::Exact);
 }
 
 #[test]

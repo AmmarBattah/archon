@@ -29,7 +29,9 @@
   was refused and cost a retry.
 - The bench now marks a cost with `≥` when Aether reports it incomplete
   (`cost_gap`, such as a parked Claude Code coordinator), instead of showing it
-  as exact.
+  as exact. A total or mean that also includes estimates is marked `*`, since
+  an estimate is no bound; `chart.json` and the history CSV carry it as
+  `cost_bound`.
 
 ## 1.2.1
 

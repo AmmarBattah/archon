@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::metrics::{Arm, RunManifest, TrialResult};
+use crate::metrics::{Arm, CostBound, RunManifest, TrialResult};
 use crate::summary;
 
 pub const TASKS: [&str; 4] = [
@@ -121,20 +121,25 @@ pub fn check_directory(dir: &Path, baseline: &Baseline, max_usd: f64) -> anyhow:
     let gate = evaluate(&results, &manifest, baseline, max_usd)?;
     std::fs::write(dir.join("gate.json"), serde_json::to_string_pretty(&gate)?)?;
     println!(
-        "smoke: {} — Archon {}/{}; baseline {}/{}; total {}${:.2}",
+        "smoke: {} — Archon {}/{}; baseline {}/{}; total {}",
         if gate.passed { "PASS" } else { "FAIL" },
         gate.archon_successes,
         gate.archon_trials,
         gate.baseline_successes,
         gate.archon_trials,
-        if manifest.spent_floor { "≥ " } else { "" },
-        gate.total_cost_usd
+        total_cost_text(manifest.spent_bound, gate.total_cost_usd)
     );
     ensure!(
         gate.passed,
         "Archon's pass rate fell below the stored smoke baseline"
     );
     Ok(gate)
+}
+
+/// The smoke total as printed, marked when the manifest says it is no exact figure.
+fn total_cost_text(bound: CostBound, usd: f64) -> String {
+    assert!(usd >= 0.0, "a smoke total cannot be negative");
+    format!("{}${usd:.2}", bound.marker())
 }
 
 pub fn evaluate(
