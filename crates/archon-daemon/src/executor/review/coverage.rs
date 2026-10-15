@@ -60,9 +60,8 @@ impl<'a> History<'a> {
     }
 }
 
-/// The branch head and each verdict on its commits, the `named` ones first,
-/// or why a named verdict names commits the branch does not hold. An `earlier`
-/// verdict that does is left out. `base_branch` gives the fork point.
+/// The branch head and each verdict on its commits, `named` first, or why a named one is
+/// not on the branch (an `earlier` one is left out). `base_branch` gives the fork point.
 pub(super) fn place(
     history: &mut History,
     base_branch: &str,
@@ -237,14 +236,16 @@ pub(super) fn counted(
     }))
 }
 
-/// Whether some named read in `placed` has no named read anchoring it, so
-/// the lead's earlier reviewers are worth reading.
-pub(super) fn needs_anchor(
+/// Why a named read in `placed` is refused when no named read anchors it and
+/// the lead's earlier reviewers are not read; `None` when every one is anchored.
+pub(super) fn unanchored_named(
     history: &mut impl Ancestry,
     placed: &[Placed],
-) -> Result<bool, ArchonError> {
+) -> Result<Option<String>, ArchonError> {
     let named = named_count(placed);
-    Ok(anchored(history, &placed[..named])?.contains(&false))
+    let alone = anchored(history, &placed[..named])?;
+    let stray = alone.iter().position(|held| !held);
+    Ok(stray.map(|stray| unanchored(&placed[stray], false)))
 }
 
 /// Indexes of the reads coverage rests on: the named ones, and when one of
@@ -260,7 +261,7 @@ fn in_play(
     }
     let with_earlier = anchored(history, placed)?;
     if let Some(stray) = with_earlier[..named].iter().position(|held| !held) {
-        return Ok(Err(unanchored(&placed[stray])));
+        return Ok(Err(unanchored(&placed[stray], true)));
     }
     // An earlier read nothing anchors read only part of the change: it is left out.
     let kept: Vec<usize> = (0..placed.len()).filter(|i| with_earlier[*i]).collect();
@@ -292,13 +293,17 @@ fn anchored(history: &mut impl Ancestry, reads: &[Placed]) -> Result<Vec<bool>, 
     )
 }
 
-/// Why the named `read` is unanchored, by its own or the lead's earlier reviewers.
-fn unanchored(read: &Placed) -> String {
+/// Why the named `read` is unanchored, by its own or, once `earlier_read`,
+/// the lead's earlier reviewers.
+fn unanchored(read: &Placed, earlier_read: bool) -> String {
     assert!(read.named, "only a named read is refused for its anchor");
     let base = short(read.base.as_deref().expect("a stray read has a base"));
+    let by = match earlier_read {
+        true => "no reviewer named, nor any earlier one of this attempt,",
+        false => "no reviewer named",
+    };
     format!(
-        "reviewer {} read only from {base}, and no reviewer named, nor any earlier one \
-         of this attempt, read the change up to it",
+        "reviewer {} read only from {base}, and {by} read the change up to it",
         read.agent
     )
 }
@@ -734,11 +739,17 @@ mod tests {
             named.contains("agt_d1 read only from c4, and no reviewer named"),
             "{named}"
         );
+        let stray = unanchored_named(&mut Line, &reads).unwrap().unwrap();
+        assert!(
+            stray.ends_with("no reviewer named read the change up to it"),
+            "{stray}"
+        );
         let gap = held(&[reads[0].clone(), reads[2].clone()], "c5", 1).unwrap_err();
         assert!(gap.contains("agt_d1 read only from c4"), "{gap}");
         let whole = [read("agt_a", true, "c5", None), reads[2].clone()];
         let unneeded = held(&whole, "c5", 1).unwrap();
         assert!(unneeded.implicit.is_empty(), "added only when needed");
+        assert_eq!(unanchored_named(&mut Line, &whole).unwrap(), None);
     }
 
     #[test]

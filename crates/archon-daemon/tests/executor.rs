@@ -2291,6 +2291,52 @@ async fn an_earlier_review_that_cannot_anchor_leaves_the_named_delta_refused() {
     );
 }
 
+/// The lead named only its delta reviewer, and earlier reviewers it delegated
+/// would anchor it: the stage's settled result, with the earlier pass to come.
+async fn anchored_by_an_earlier_pass(h: &Harness) -> (StageRun, StageOutcome) {
+    let lead = h.running().await.remove(0);
+    let first = h.backend.delegate(&lead_agent(&lead), REVIEW_MODEL);
+    let (fixed, first_head) = fix_named_alone(h, &lead).await;
+    let whole = serde_json::json!({"verdict": "pass", "head": first_head, "findings": []});
+    h.backend.complete_delegated(&first, whole);
+    (lead, fixed)
+}
+
+/// A result Aether could not show may be a fail of the head: it keeps the
+/// earlier reviewers from anchoring, as it refuses a named one.
+#[tokio::test]
+async fn an_earlier_reviewer_aether_cannot_show_leaves_the_named_delta_refused() {
+    let h = Harness::new().await;
+    let item = adaptive_item(&h).await;
+    let (lead, fixed) = anchored_by_an_earlier_pass(&h).await;
+    let late = h.backend.delegate(&lead_agent(&lead), REVIEW_MODEL);
+    h.backend
+        .complete_delegated(&late, verdict_on(&fixed, "fail"));
+    h.backend
+        .unreadable_delegated(&late, "internal: database is locked");
+    h.settle_running(|_| fixed.clone()).await;
+    let error = refused_review(&h, &item).await;
+    assert!(error.contains("read only from"), "{error}");
+    let unshown = format!("earlier reviewer {late} has a result Aether could not show");
+    assert!(error.contains(&unshown), "{error}");
+}
+
+/// A reviewer still running may yet fail the head, so nothing anchors on
+/// the earlier reviewers until it ends.
+#[tokio::test]
+async fn a_reviewer_still_running_keeps_earlier_ones_from_anchoring() {
+    let h = Harness::new().await;
+    let item = adaptive_item(&h).await;
+    let (lead, fixed) = anchored_by_an_earlier_pass(&h).await;
+    let running = h.backend.delegate(&lead_agent(&lead), REVIEW_MODEL);
+    h.settle_running(|_| fixed.clone()).await;
+    let error = refused_review(&h, &item).await;
+    assert!(error.contains("read only from"), "{error}");
+    let held = format!("{running} on {REVIEW_MODEL} still running");
+    assert!(error.contains(&held), "{error}");
+    assert!(error.contains("or cancel it"), "{error}");
+}
+
 /// The reviewer's agent and model are Archon's finding: what the lead wrote
 /// there itself is replaced by what Aether shows.
 #[tokio::test]

@@ -319,11 +319,13 @@ longer holds (the agent amended or rebased it away) is superseded: it is
 left out rather than failing the run, and a superseded fail stands until
 the counted passes read the whole change. When a named delta read starts
 at a commit no named reviewer read the change up to, Archon looks through
-the other reviewers the agent delegated to in the same attempt that
-completed with a verdict on a commit the branch holds; any of these that
-anchor it are held to the same rules (their fails stand until answered)
-but never count toward the level, and are recorded as
-`review.implicit_reviewer_agents`. When the stage also writes the ship
+the other reviewers the agent delegated to that completed with a verdict on
+a commit the branch holds; any of these that anchor it are held to the same
+rules (their fails stand until answered) but never count toward the level,
+and are recorded as `review.implicit_reviewer_agents`. It does so only when
+the agent ran no other attempt of the run, once every reviewer it delegated
+to has ended (wait for or cancel one still running before completing), and
+when Aether shows each of their results. When the stage also writes the ship
 record, the branch head must hold the record's `tree`. With fewer counted
 passes than the level asks for, the run fails at that stage with each reason. Archon
 records the counted reviewers as `review.reviewer_agents` and the models

@@ -427,8 +427,6 @@ pub struct Agent {
     pub successor: Option<AetherAgentId>,
     #[serde(default)]
     pub config: AgentSettings,
-    #[serde(default)]
-    pub created_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]

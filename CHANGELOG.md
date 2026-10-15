@@ -6,11 +6,13 @@
 
 - A review holder that named only its latest delta reviewers no longer fails
   its stage for not naming the earlier whole-change review they rest on.
-  Archon now finds that anchor among the reviewers the holder itself delegated
-  in the same attempt, checks them exactly as named ones (a cancelled review,
-  a commit the branch does not hold or an unanswered fail still refuses), and
-  records them as `review.implicit_reviewer_agents`. Only named passes count
-  toward the review level.
+  Archon now finds that anchor among the reviewers the holder itself delegated,
+  checks them exactly as named ones (a cancelled review, a commit the branch
+  does not hold or an unanswered fail still refuses), and records them as
+  `review.implicit_reviewer_agents`. Only named passes count toward the review
+  level. It looks only for an agent that ran no other attempt of the run, once
+  none of its reviewers is still running, and refuses when Aether cannot show
+  one of their results.
 
 ## 1.2.2
 
