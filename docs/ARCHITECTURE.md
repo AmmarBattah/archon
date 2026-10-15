@@ -3300,10 +3300,13 @@ cutoffs, and at each workspace whose runs have all finished:
   real directory, not a symlink, whose real path is still
   `<item-id>/snapshot` for its own item inside `worktrees.root`, and a
   worktree git lists for the repository.
+- An item's experiments directory (§13.5) goes in any pass once the item
+  settled or the store no longer knows it. `archond` deletes it when the
+  item settles, so a pass finds one only after a crash.
 
 Only paths inside `worktrees.root` that git lists as worktrees of the
-item's repository, scratch directories under the data dir, and what a team
-run or a fresh retry set aside are touched; the repository itself (where
+item's repository, scratch and experiments directories under the data dir,
+and what a team run or a fresh retry set aside are touched; the repository itself (where
 `repo-readonly` stages worked before they had snapshots) never is. The
 repository is the registered one. For an item whose
 repository was unregistered since, it is the common git directory the
@@ -3524,6 +3527,17 @@ directory of regular files, from inside its workspace). They are copied to
 A dependent stage's contract names its dependencies' artifact directories.
 The gc pass deletes an item's artifacts `[artifacts] keep_after` (30d) after
 the item settled.
+
+**Experiments.** Reviewers, a review stage's agents and those a delegating
+stage starts, copy tracked files for each ad-hoc experiment (mutant, probe,
+repro) into `mktemp -d -p <data>/experiments/<item>`, never the shared
+`/tmp`. The directory has its own root, so it never lies inside a scratch
+workspace (`<data>/scratch/<item>`). `archond` creates it before an agent
+that can review is created, the contract names it (shell-quoted when the
+path needs it), and `archond` deletes it when the item settles: renamed
+aside under the run table, so a retry starting meanwhile gets a fresh one,
+then removed. The gc pass deletes what a crash left (§13.2). A contract
+built without the directory, as in tests, falls back to `mktemp -d`.
 
 ## 14. Lavish plugin
 

@@ -1,6 +1,7 @@
 //! What gc collects outside a run's workspace (ARCHITECTURE §13.5): a
-//! repository's shared build cache once nobody used it for a while, and an
-//! item's published artifacts `artifacts.keep_after` it settled. Both are
+//! repository's shared build cache once nobody used it for a while, an
+//! item's published artifacts `artifacts.keep_after` it settled, and the
+//! experiments directory a settled item still has after a crash. All are
 //! claimed under the run table by renaming them aside, atomically, so a run
 //! that starts meanwhile builds into a fresh directory; the slow deletion
 //! then happens without any lock.
@@ -19,6 +20,7 @@ use archon_core::protocol::{GcReport, ItemQuery, Reclaimed};
 use archon_core::repo::Repo;
 use archon_queue::Store;
 
+use super::Roots;
 use super::cache::disk_usage;
 use crate::build_cache::USED_MARKER;
 
@@ -69,21 +71,21 @@ pub(super) struct Claimed {
 enum Kind {
     Cache,
     Artifacts,
+    Experiments,
 }
 
-/// Claim what is due under `cache_root` and `artifacts_root`, with the run
-/// table and the store held by the caller. What cannot be looked into or
-/// renamed is noted in `report`.
+/// Claim what is due under the cache, artifacts and experiments roots, with
+/// the run table and the store held by the caller. What cannot be looked
+/// into or renamed is noted in `report`.
 pub(super) fn claim(
     store: &Store,
-    cache_root: &Path,
-    artifacts_root: &Path,
+    roots: &Roots,
     extras: &Extras,
     report: &mut GcReport,
 ) -> Result<Vec<Claimed>, ArchonError> {
     let mut claimed = Vec::new();
     let live = live_repositories(store)?;
-    for dir in subdirectories(cache_root, report) {
+    for dir in subdirectories(&roots.cache(), report) {
         let name = file_name(&dir);
         let due = if name.starts_with(CLAIMED_PREFIX) {
             true
@@ -102,7 +104,7 @@ pub(super) fn claim(
             claim_dir(dir, Kind::Cache, &mut claimed, report);
         }
     }
-    for dir in subdirectories(artifacts_root, report) {
+    for dir in subdirectories(&roots.artifacts(), report) {
         let name = file_name(&dir);
         let due = if name.starts_with(CLAIMED_PREFIX) {
             true
@@ -113,7 +115,27 @@ pub(super) fn claim(
             claim_dir(dir, Kind::Artifacts, &mut claimed, report);
         }
     }
+    for dir in subdirectories(&roots.experiments(), report) {
+        let name = file_name(&dir);
+        if name.starts_with(CLAIMED_PREFIX) || orphaned(store, &name)? {
+            claim_dir(dir, Kind::Experiments, &mut claimed, report);
+        }
+    }
     Ok(claimed)
+}
+
+/// Whether an experiments directory outlived its item: the item settled, or
+/// the store no longer knows it. A name that is no item id is left alone.
+fn orphaned(store: &Store, name: &str) -> Result<bool, ArchonError> {
+    let Ok(id) = QueueItemId::parse(name) else {
+        return Ok(false);
+    };
+    assert_eq!(id.as_str(), name, "an item id names its directory");
+    match store.item(&id) {
+        Ok(item) => Ok(item.state.is_terminal()),
+        Err(ArchonError::NotFound(_)) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// The names of the registered repositories with an item not yet settled.
@@ -199,22 +221,29 @@ fn claim_dir(dir: PathBuf, kind: Kind, claimed: &mut Vec<Claimed>, report: &mut 
         });
         return;
     }
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let name = format!(
-        "{CLAIMED_PREFIX}{}-{}-{n}",
-        std::process::id(),
-        file_name(&dir)
-    );
-    let aside = dir.with_file_name(name);
-    match std::fs::rename(&dir, &aside) {
-        Ok(()) => claimed.push(Claimed {
+    match set_aside(&dir) {
+        Ok(aside) => claimed.push(Claimed {
             original: dir,
             aside,
             kind,
         }),
         Err(e) => report.failed.push((dir, format!("setting it aside: {e}"))),
     }
+}
+
+/// Rename `dir` beside itself under a claimed name, which the next pass
+/// deletes should this one stop first. Returns the new path.
+pub(crate) fn set_aside(dir: &Path) -> std::io::Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = file_name(dir);
+    assert!(
+        !name.is_empty() && !name.starts_with(CLAIMED_PREFIX),
+        "only a named, unclaimed directory is set aside"
+    );
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let aside = dir.with_file_name(format!("{CLAIMED_PREFIX}{}-{name}-{n}", std::process::id()));
+    std::fs::rename(dir, &aside)?;
+    Ok(aside)
 }
 
 /// Delete what [`claim`] set aside, counting the space each frees. Blocking.
@@ -240,6 +269,7 @@ pub(super) fn delete(claimed: Vec<Claimed>) -> GcReport {
                 match kind {
                     Kind::Cache => report.caches.push(freed),
                     Kind::Artifacts => report.artifacts.push(freed),
+                    Kind::Experiments => report.removed.push(freed.path),
                 }
                 report.bytes_freed = report.bytes_freed.saturating_add(bytes);
             }

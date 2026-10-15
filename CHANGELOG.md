@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Reviewers' experiment copies now go in a directory Archon owns on its data
+  disk, `<data>/experiments/<item>`, instead of wherever `mktemp -d` puts
+  them, which is often a small `/tmp` the whole machine shares. Archon creates
+  the directory before a stage that can review starts and names it in the
+  contract. It deletes the directory when the item finishes, and `archon gc`
+  removes any a crash left behind.
+
 ## 1.2.3
 
 Released 2026-10-15.

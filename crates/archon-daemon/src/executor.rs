@@ -141,6 +141,8 @@ pub(crate) struct FollowUp {
     /// Runs whose team roster may be owed to their running roles.
     pub roster: Vec<PipelineRunId>,
     pub cleanup: Vec<Cleanup>,
+    /// Settled items' experiments directories, set aside to delete.
+    pub discard: Vec<PathBuf>,
     /// Freshly opened operator gates to show and ask about.
     pub gates: Vec<gates::GateKey>,
     /// Completed stage runs whose listed reports to publish.
@@ -178,6 +180,7 @@ impl FollowUp {
         self.descendant_stops.extend(other.descendant_stops);
         self.roster.extend(other.roster);
         self.cleanup.extend(other.cleanup);
+        self.discard.extend(other.discard);
         self.gates.extend(other.gates);
         self.publish.extend(other.publish);
         self.merge.extend(other.merge);
@@ -199,6 +202,7 @@ impl FollowUp {
             && self.descendant_stops.is_empty()
             && self.roster.is_empty()
             && self.cleanup.is_empty()
+            && self.discard.is_empty()
             && self.gates.is_empty()
             && self.publish.is_empty()
             && self.merge.is_empty()
@@ -552,6 +556,9 @@ async fn deliver_and_tidy(ctx: &DaemonContext, round: &mut Round, follow: Follow
     let cleanups = lanes::group(follow.cleanup.into_iter().map(|c| (c.repo_path.clone(), c)));
     for removed in lanes::run(cleanups, |cleanup| remove_ended_worktree(ctx, cleanup)).await {
         round.record(removed);
+    }
+    for aside in follow.discard {
+        crate::experiments::delete(aside).await;
     }
 }
 

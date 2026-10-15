@@ -270,6 +270,10 @@ and the stage delegates that many independent reviewers:
 | `standard` | 1 |
 | `strict` | 3, each working alone |
 
+Reviewers, delegated ones and a review stage's own, try mutants and repros
+in throwaway copies under `<data>/experiments/<item>`. Archon creates that
+directory before the stage starts and deletes it when the item settles.
+
 An item that leaves `review` out gets the declared `level`, raised to the
 operator's ceiling when the ceiling asks for more. The ceiling still bounds
 what an item may ask for ([Autonomy levels](guide.md#autonomy-levels)).

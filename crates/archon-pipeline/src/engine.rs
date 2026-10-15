@@ -120,6 +120,9 @@ pub struct RunDriver {
     cancelling: BTreeSet<StageRunId>,
     /// Steered aborts by `(stage id, attempt)`; persisted by the daemon.
     aborts: BTreeMap<(String, u32), Then>,
+    /// The item's directory for reviewers' experiment copies, which the
+    /// contract names; `None` leaves them to `mktemp -d`.
+    experiments: Option<PathBuf>,
 }
 
 /// A live role of a team group another role already failed, and why it is
@@ -227,6 +230,7 @@ impl RunDriver {
             shipping: false,
             cancelling: BTreeSet::new(),
             aborts: BTreeMap::new(),
+            experiments: None,
         };
         driver.check_prompts_render()?;
         Ok(driver)
@@ -253,6 +257,18 @@ impl RunDriver {
         }
         self.gates = gates;
         Ok(self)
+    }
+
+    /// Name `dir` in review contracts as where experiment copies go. The
+    /// daemon creates it before such a stage starts.
+    pub fn with_experiments(mut self, dir: PathBuf) -> Self {
+        assert!(
+            self.emitted.is_empty() && !self.finished,
+            "the directory is set before the driver acts"
+        );
+        assert!(dir.is_absolute(), "the experiments directory is absolute");
+        self.experiments = Some(dir);
+        self
     }
 
     /// The stages that wait for the operator once they pass.
@@ -1147,7 +1163,9 @@ impl RunDriver {
                 }
                 let part = self.team_part(team.as_ref());
                 let workspace = &vars["workspace"];
-                let instructions = contract::instructions(stage, mode, workspace, part, owed);
+                let experiments = self.experiments.as_deref();
+                let instructions =
+                    contract::instructions(stage, mode, workspace, part, owed, experiments);
                 EngineAction::Spawn(SpawnPlan {
                     stage_id: stage.id.clone(),
                     kind: stage.kind,
