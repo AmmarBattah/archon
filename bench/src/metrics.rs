@@ -77,6 +77,9 @@ pub struct TrialResult {
     pub cost_usd: Option<f64>,
     /// Subscription estimates, or `--price` applied to the token counts.
     pub estimated_cost_usd: Option<f64>,
+    /// Why Aether called `cost_usd` incomplete; present means it is a floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_gap: Option<String>,
     /// Messages the operator would have had to read.
     pub operator_messages: u32,
     /// Harness failure (not a task failure): the trial did not run cleanly.
@@ -136,6 +139,69 @@ impl TrialResult {
             (billed, None) => billed,
         }
     }
+
+    /// Aether reported this trial's billed cost as incomplete, so that cost
+    /// is a lower bound. A substituted estimate is no bound at all.
+    pub fn cost_is_floor(&self) -> bool {
+        match (self.cost_gap.as_ref(), self.cost_usd) {
+            (Some(_), Some(billed)) => self.effective_cost_usd() == Some(billed),
+            _ => false,
+        }
+    }
+
+    /// The effective cost is an estimate standing in for a missing or zero
+    /// billed cost, so it bounds nothing.
+    pub fn cost_is_estimate(&self) -> bool {
+        match (self.cost_usd, self.estimated_cost_usd) {
+            (Some(billed), _) if billed > 0.0 => false,
+            (billed, Some(estimate)) => estimate > billed.unwrap_or(0.0),
+            (_, None) => false,
+        }
+    }
+}
+
+/// What a sum or mean of trial costs can claim. Floors are lower bounds and
+/// estimates are not, so the two together support neither claim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostBound {
+    /// Billed or estimated figures only: no mark.
+    #[default]
+    Exact,
+    /// Billed figures where some are reported incomplete: at least this much.
+    Floor,
+    /// Reported-incomplete costs mixed with estimates: not a bound.
+    Incomplete,
+}
+
+impl CostBound {
+    pub fn of<'a>(results: impl IntoIterator<Item = &'a TrialResult>) -> Self {
+        let (mut floor, mut estimate) = (false, false);
+        for result in results {
+            floor |= result.cost_is_floor();
+            estimate |= result.cost_is_estimate();
+        }
+        Self::from_flags(floor, estimate)
+    }
+
+    /// `floor`: some cost is a reported-incomplete figure; `estimate`: some
+    /// cost is a substituted estimate.
+    pub fn from_flags(floor: bool, estimate: bool) -> Self {
+        match (floor, estimate) {
+            (true, true) => Self::Incomplete,
+            (true, false) => Self::Floor,
+            (false, _) => Self::Exact,
+        }
+    }
+
+    /// The prefix drawn before the figure.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Exact => "",
+            Self::Floor => "≥ ",
+            Self::Incomplete => "* ",
+        }
+    }
 }
 
 /// `run.json`: everything needed to reproduce and judge a run.
@@ -162,6 +228,9 @@ pub struct RunManifest {
     pub completed: usize,
     pub skipped: usize,
     pub spent_usd: f64,
+    /// Whether `spent_usd` is exact, a floor or incomplete; see [`CostBound`].
+    #[serde(default)]
+    pub spent_bound: CostBound,
     pub unpriced_trials: u32,
     /// Why the run ended early (budget exhausted), when it did.
     pub stopped_reason: Option<String>,
@@ -186,6 +255,7 @@ pub(crate) mod tests {
             cached_input_tokens: None,
             cost_usd: cost,
             estimated_cost_usd: estimate,
+            cost_gap: None,
             operator_messages: 1,
             error: None,
             timed_out: false,
@@ -196,6 +266,42 @@ pub(crate) mod tests {
             archon_work: None,
             graded_on_timeout: None,
         }
+    }
+
+    #[test]
+    fn only_a_substituted_estimate_is_an_estimate() {
+        assert!(result(None, Some(2.0)).cost_is_estimate());
+        assert!(result(Some(0.0), Some(2.0)).cost_is_estimate());
+        assert!(!result(Some(1.0), Some(2.0)).cost_is_estimate());
+        assert!(!result(Some(2.0), None).cost_is_estimate());
+        assert!(!result(None, None).cost_is_estimate());
+    }
+
+    #[test]
+    fn a_floor_mixed_with_an_estimate_is_incomplete() {
+        let estimate = result(None, Some(5.0));
+        let mut gapped = result(Some(1.0), None);
+        gapped.cost_gap = Some("interrupted".into());
+        assert_eq!(CostBound::of([&estimate]), CostBound::Exact);
+        assert_eq!(
+            CostBound::of([&gapped, &result(Some(1.0), None)]),
+            CostBound::Floor
+        );
+        assert_eq!(CostBound::of([&estimate, &gapped]), CostBound::Incomplete);
+        assert_eq!(CostBound::of([]), CostBound::Exact);
+    }
+
+    #[test]
+    fn cost_bounds_serialize_lowercase_and_default_to_exact() {
+        assert_eq!(
+            serde_json::to_string(&CostBound::Incomplete).unwrap(),
+            "\"incomplete\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CostBound>("\"floor\"").unwrap(),
+            CostBound::Floor
+        );
+        assert_eq!(CostBound::default(), CostBound::Exact);
     }
 
     #[test]
@@ -218,6 +324,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn only_a_reported_cost_with_a_gap_is_a_floor() {
+        let gapped = |cost, estimate| {
+            let mut r = result(cost, estimate);
+            r.cost_gap = Some("unpriced".into());
+            r
+        };
+        assert!(gapped(Some(2.0), Some(5.0)).cost_is_floor());
+        assert!(gapped(Some(0.0), None).cost_is_floor());
+        assert!(!gapped(Some(0.0), Some(5.0)).cost_is_floor());
+        assert!(!gapped(None, Some(5.0)).cost_is_floor());
+        assert!(!gapped(None, None).cost_is_floor());
+        assert!(!result(Some(2.0), None).cost_is_floor());
+    }
+
+    #[test]
     fn old_result_lines_without_new_fields_still_parse() {
         let line = r#"{"task":"t","arm":"codex","trial":2,"model":"m","effort":null,
             "success":false,"score":null,"wall_secs":3.5,"input_tokens":10,
@@ -227,6 +348,18 @@ pub(crate) mod tests {
         assert_eq!(parsed.arm, Arm::Codex);
         assert!(!parsed.timed_out && parsed.cached_input_tokens.is_none());
         assert!(parsed.archon_work.is_none() && parsed.graded_on_timeout.is_none());
+        assert_eq!(parsed.cost_gap, None);
+    }
+
+    #[test]
+    fn cost_gap_round_trips_and_stays_absent_when_unused() {
+        let plain = serde_json::to_string(&result(Some(1.0), None)).unwrap();
+        assert!(!plain.contains("cost_gap"), "{plain}");
+        let mut floor = result(Some(1.0), None);
+        floor.cost_gap = Some("interrupted".into());
+        let parsed: TrialResult =
+            serde_json::from_str(&serde_json::to_string(&floor).unwrap()).unwrap();
+        assert_eq!(parsed.cost_gap.as_deref(), Some("interrupted"));
     }
 
     #[test]

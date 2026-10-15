@@ -13,7 +13,7 @@ use crate::arms::{
     ArmSettings, TrialInput, aether_request, archon_config_toml, archon_daemon_command,
     claude_command, codex_command,
 };
-use crate::metrics::{Arm, TrialResult};
+use crate::metrics::{Arm, CostBound, TrialResult};
 use crate::task::BenchTask;
 use crate::workspace::TrialLayout;
 
@@ -115,6 +115,10 @@ pub fn check_plan(specs: &[TrialSpec], options: &RunOptions) -> anyhow::Result<(
 pub struct Budget {
     pub limit_usd: f64,
     pub spent_usd: f64,
+    /// Some counted trial's cost was reported incomplete.
+    gapped: bool,
+    /// Some counted trial's cost is a substituted estimate.
+    estimated: bool,
     pub unpriced_trials: u32,
 }
 
@@ -124,6 +128,8 @@ impl Budget {
         Self {
             limit_usd,
             spent_usd: 0.0,
+            gapped: false,
+            estimated: false,
             unpriced_trials: 0,
         }
     }
@@ -132,11 +138,17 @@ impl Budget {
         self.spent_usd < self.limit_usd
     }
 
+    pub fn spent_bound(&self) -> CostBound {
+        CostBound::from_flags(self.gapped, self.estimated)
+    }
+
     pub fn record(&mut self, result: &TrialResult) {
         match result.effective_cost_usd() {
             Some(cost) => {
                 assert!(cost >= 0.0, "a trial cannot earn money");
                 self.spent_usd += cost;
+                self.gapped |= result.cost_is_floor();
+                self.estimated |= result.cost_is_estimate();
             }
             None => self.unpriced_trials += 1,
         }

@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 ARMS = {"archon": "#225ea8", "aether": "#d97706"}
+COST_MARKS = {"exact": "", "floor": "≥ ", "incomplete": "* "}
 METRICS = [("pass_rate", "Pass rate (%)"), ("cost_usd", "Mean cost / trial ($)"),
            ("wall_secs", "Mean wall / trial (s)")]
 
@@ -32,11 +33,15 @@ def read_rows(directories):
             late_passes = arm.get("timeout_graded_passes", 0)
             if not 0 <= late_passes <= arm.get("timeout_graded", 0) <= arm["timeouts"]:
                 raise ValueError(f"{directory} has inconsistent graded-on-timeout counts")
+            bound = arm.get("cost_bound", "exact")
+            if bound not in COST_MARKS:
+                raise ValueError(f"{directory} has unknown cost_bound {bound!r}")
             row = dict(version=directory.name.removeprefix("results-"), arm=arm["arm"],
                        trials=arm["trials"], tasks=len(data["tasks"]),
                        pass_rate=100 * arm["success_rate"],
                        cost_usd=cost["mean"], wall_secs=arm["wall_secs"]["mean"],
-                       graded_on_timeout_passes=late_passes)
+                       graded_on_timeout_passes=late_passes,
+                       cost_bound=bound)
             if any(not math.isfinite(row[key]) or row[key] < 0 for key, _ in METRICS):
                 raise ValueError(f"{directory} has invalid metrics")
             rows.append(row)
@@ -57,10 +62,11 @@ def panel(rows, metric, title, offset):
         value = row[metric]
         width = value * scale
         label = f'{row["version"]} {row["arm"]}'
+        mark = COST_MARKS[row["cost_bound"]] if metric == "cost_usd" else ""
         parts.extend([
             f'<text x="0" y="{y + 13}">{html.escape(label)}</text>',
             f'<rect x="108" y="{y}" width="{width:.2f}" height="19" fill="{ARMS[row["arm"]]}"/>',
-            f'<text x="{114 + width:.2f}" y="{y + 13}">{value:.2f}</text>',
+            f'<text x="{114 + width:.2f}" y="{y + 13}">{mark}{value:.2f}</text>',
         ])
     return "\n".join(parts + ["</g>"])
 
@@ -68,7 +74,7 @@ def panel(rows, metric, title, offset):
 def render(rows):
     assert len(rows) >= 2
     assert len({(row["version"], row["arm"]) for row in rows}) == len(rows)
-    height = 160 + len(rows) * 31
+    height = 180 + len(rows) * 31
     panels = [panel(rows, metric, title, 20 + index * 420)
               for index, (metric, title) in enumerate(METRICS)]
     return f'''<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="{height}" viewBox="0 0 1280 {height}" role="img">
@@ -78,7 +84,8 @@ def render(rows):
 <rect width="1280" height="{height}" fill="#fff"/>
 <text x="20" y="30" style="font-size:20px;font-weight:600">Benchmark history · Archon and single-agent Aether</text>
 {''.join(panels)}
-<text x="20" y="{height - 35}">Observed graded-trial means; infrastructure failures excluded. v1/v2 are incomplete and task weights differ.</text>
+<text x="20" y="{height - 55}">Observed graded-trial means; infrastructure failures excluded. v1/v2 are incomplete and task weights differ. ≥ marks a cost Aether reported as incomplete.</text>
+<text x="20" y="{height - 35}">* includes a cost Aether reported as incomplete together with estimates; not a bound.</text>
 <text x="20" y="{height - 15}">Smoke uses Haiku and four tasks (two new); older snapshots use Opus. Compare like configurations. Small samples do not establish reliability.</text>
 </svg>
 '''
