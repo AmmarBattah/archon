@@ -137,7 +137,7 @@ async fn stages_keep_the_nodes_name_after_aether_gains_the_feature() {
 }
 
 #[tokio::test]
-async fn a_refused_root_node_fails_without_advancing_its_generation() {
+async fn a_refused_root_node_advances_its_generation_once() {
     for code in ["invalid_argument", "not_found"] {
         let dir = tempfile::tempdir().unwrap();
         let aether = start_aether(dir.path()).await;
@@ -145,39 +145,107 @@ async fn a_refused_root_node_fails_without_advancing_its_generation() {
         script_fleet(&aether);
         aether.script(
             "create_agent",
-            Scripted::refuse(code, "registered checkout is unreadable"),
+            Scripted::refuse(code, "stale submission key"),
         );
         let h = harness(&aether).await;
-        let item = h.enqueue("refused frozen checkout").await;
+        let item = h.enqueue("replace refused root key").await;
         h.dispatch().await;
-        let QueueState::Failed { error, .. } = h.state(&item.id).await else {
-            panic!("a refused root must fail the item");
-        };
-        assert!(error.contains(&h.repo.display().to_string()), "{error}");
-        assert!(
-            error.contains("registered checkout is unreadable"),
-            "{error}"
-        );
-        assert!(
-            error.contains("re-register the repo or cancel the run"),
-            "{error}"
-        );
         let creates = aether.received_named("create_agent");
-        assert_eq!(creates.len(), 2, "creation and retirement recovery replay");
+        assert_eq!(creates.len(), 3, "two node generations and their stage");
         let run = h.run(&item.id).await;
-        for create in &creates {
+        for (index, create) in creates[..2].iter().enumerate() {
             assert_identity(create, Some(&h.repo));
-            assert_eq!(create["idempotency_key"], format!("{}:node:1", run.id));
+            assert_eq!(
+                create["idempotency_key"],
+                format!("{}:node:{}", run.id, index + 1)
+            );
         }
-        assert_eq!(
-            without_request_id(creates[0].clone()),
-            without_request_id(creates[1].clone())
-        );
+        assert_identity(&creates[2], Some(&h.repo));
+        assert_children_of(&creates[2..], &node_id(1));
+        assert_eq!(h.stages(&item.id).await[0].state, StageState::Running);
     }
 }
 
 #[tokio::test]
-async fn a_moved_frozen_checkout_fails_before_replaying_the_node() {
+async fn a_root_node_refused_twice_fails_with_the_original_reason() {
+    for code in ["invalid_argument", "not_found"] {
+        let dir = tempfile::tempdir().unwrap();
+        let aether = start_aether(dir.path()).await;
+        aether.set_features(vec!["repository_root".into()]);
+        script_fleet(&aether);
+        for _ in 0..2 {
+            aether.script("create_agent", Scripted::refuse(code, "model unavailable"));
+        }
+        let h = harness(&aether).await;
+        let item = h.enqueue("root refused twice").await;
+        h.dispatch().await;
+        let QueueState::Failed { error, .. } = h.state(&item.id).await else {
+            panic!("two refusals must fail the item");
+        };
+        assert!(error.contains("model unavailable"), "{error}");
+        assert!(!error.contains("checkout"), "{error}");
+        let creates = aether.received_named("create_agent");
+        assert_eq!(creates.len(), 2, "only one generation advance is allowed");
+        let run = h.run(&item.id).await;
+        for (index, create) in creates.iter().enumerate() {
+            assert_identity(create, Some(&h.repo));
+            assert_eq!(
+                create["idempotency_key"],
+                format!("{}:node:{}", run.id, index + 1)
+            );
+        }
+        assert!(h.kv(&format!("run_node:{}", run.id)).await.is_none());
+        h.dispatch().await;
+        assert_eq!(aether.received_named("create_agent"), creates);
+    }
+}
+
+#[tokio::test]
+async fn a_root_node_with_a_changed_lean_replay_advances_its_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let aether = start_aether(dir.path()).await;
+    aether.set_features(vec!["repository_root".into(), "host_context".into()]);
+    let fleet = script_fleet(&aether);
+    fleet.lock().unwrap().lose_next_reply = true;
+    let mut config = Config::default();
+    config.aether.host_context = archon_core::config::HostContext::Lean;
+    let options = ClientOptions {
+        request_timeout: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let h = harness_with_config(&aether, options, config).await;
+    let mut plan = common::plan();
+    plan.0.get_mut("implement").unwrap()[0] =
+        common::choice("claude-code/claude-haiku-5-5", Effort::Low);
+    let item = h
+        .enqueue_with("root replay falls back to full", plan)
+        .await
+        .unwrap();
+    h.dispatch().await;
+    assert_eq!(h.stages(&item.id).await[0].state, StageState::Spawning);
+    aether.set_features(vec!["repository_root".into()]);
+    reconnect(&h, &aether).await;
+    h.dispatch().await;
+    let creates = aether.received_named("create_agent");
+    assert_eq!(
+        creates.len(),
+        4,
+        "original, refused replay, replacement, stage"
+    );
+    assert_eq!(creates[0]["config"]["host_context"], "lean");
+    assert!(creates[1]["config"].get("host_context").is_none());
+    assert_eq!(creates[0]["idempotency_key"], creates[1]["idempotency_key"]);
+    let run = h.run(&item.id).await;
+    assert_eq!(creates[2]["idempotency_key"], format!("{}:node:2", run.id));
+    for create in &creates {
+        assert_identity(create, Some(&h.repo));
+    }
+    assert_children_of(&creates[3..], &node_id(2));
+    assert_eq!(h.stages(&item.id).await[0].state, StageState::Running);
+}
+
+#[tokio::test]
+async fn a_moved_frozen_checkout_replays_and_cancels_its_pending_node() {
     let dir = tempfile::tempdir().unwrap();
     let aether = start_aether(dir.path()).await;
     aether.set_features(vec!["repository_root".into()]);
@@ -194,18 +262,30 @@ async fn a_moved_frozen_checkout_fails_before_replaying_the_node() {
         panic!("a moved root must fail the item");
     };
     assert!(error.contains(&h.repo.display().to_string()), "{error}");
-    assert!(error.contains("moved or was removed"), "{error}");
+    assert!(error.contains("is missing"), "{error}");
     assert!(
-        error.contains("re-register the repo or cancel the run"),
+        error.contains("restore it there and retry the item"),
         "{error}"
     );
+    assert!(
+        error.contains("a re-registered path applies to new runs"),
+        "{error}"
+    );
+    assert!(!error.contains("Aether refused"), "{error}");
     let creates = aether.received_named("create_agent");
-    assert_eq!(creates.len(), 1, "the missing root was not sent again");
+    assert_eq!(creates.len(), 2, "only cleanup replays the missing root");
+    assert_eq!(
+        without_request_id(creates[0].clone()),
+        without_request_id(creates[1].clone())
+    );
+    let cancels = aether.received_named("cancel");
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0]["agent"], node_id(1));
     let run = h.run(&item.id).await;
-    let raw = h.kv(&format!("run_node:{}", run.id)).await.unwrap();
-    let stored: Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(stored["generation"], 1);
-    assert_eq!(stored["repository_identity"]["Root"], json!(h.repo));
+    assert!(h.kv(&format!("run_node:{}", run.id)).await.is_none());
+    h.dispatch().await;
+    assert_eq!(aether.received_named("create_agent"), creates);
+    assert_eq!(aether.received_named("cancel"), cancels);
 }
 
 #[tokio::test]

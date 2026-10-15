@@ -95,30 +95,14 @@ impl RepositoryIdentity {
         let problem = match std::fs::metadata(root) {
             Ok(metadata) if metadata.is_dir() => return Ok(()),
             Ok(_) => "is no longer a directory".to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "is missing".to_owned(),
             Err(error) => format!("cannot be read: {error}"),
         };
         Err(ArchonError::Invalid(format!(
-            "registered checkout {} moved or was removed, or {problem}; \
-             re-register the repo or cancel the run; its repository identity is frozen",
+            "the registered checkout {} {problem}; restore it there and retry the item \
+             (a re-registered path applies to new runs)",
             root.display()
         )))
-    }
-
-    fn refused(&self, error: ArchonError) -> ArchonError {
-        assert!(matches!(
-            error,
-            ArchonError::Invalid(_) | ArchonError::NotFound(_)
-        ));
-        let Self::Root(root) = self else {
-            return error;
-        };
-        assert!(root.is_absolute(), "a frozen checkout is absolute");
-        ArchonError::Invalid(format!(
-            "Aether refused frozen repository root {}: {error}; the registered checkout \
-             may have moved, been removed, or become unreadable; re-register the repo or \
-             cancel the run; its repository identity is frozen",
-            root.display()
-        ))
     }
 }
 
@@ -375,8 +359,7 @@ pub(super) fn runs_to_retire(store: &Store) -> Result<Vec<PipelineRunId>, Archon
     Ok(due)
 }
 
-/// Reuse a live node, replacing lost nodes or one refused name-based key.
-/// Frozen root refusals fail with operator guidance instead of advancing keys.
+/// Reuse a live node, replacing lost nodes or one refused key.
 pub(super) async fn ensure(
     ctx: &DaemonContext,
     run: &PipelineRunId,
@@ -419,7 +402,7 @@ enum Claim {
 
 enum Created {
     Agent(RunNode),
-    /// Aether refused a name-based generation's key; retry with a new key.
+    /// Aether refused a generation's key; retry with a new key.
     Refused {
         generation: u32,
         error: ArchonError,
@@ -486,11 +469,6 @@ async fn send_generation(
                 network,
                 repository,
             }))
-        }
-        Err(error @ (ArchonError::Invalid(_) | ArchonError::NotFound(_)))
-            if matches!(repository, RepositoryIdentity::Root(_)) =>
-        {
-            Err(repository.refused(error))
         }
         Err(error @ (ArchonError::Invalid(_) | ArchonError::NotFound(_))) => {
             Ok(Created::Refused { generation, error })
@@ -824,17 +802,18 @@ async fn find_agent(
     run: &PipelineRunId,
     node: StoredNode,
 ) -> Result<Found, ArchonError> {
+    node.check();
     let request = match (node.agent, node.request) {
         (Some(agent), _) => return Ok(Found::Agent(agent)),
         (None, Some(request)) => request,
         (None, None) => return Ok(Found::Nothing),
     };
     let request = prepare_replay(ctx, run, node.generation, request).await?;
+    assert_eq!(
+        request.idempotency_key,
+        idempotency_key(run, node.generation)
+    );
     let key = request.idempotency_key.clone();
-    if let Err(error) = RepositoryIdentity::from_request(&request).check_checkout() {
-        tracing::warn!(%run, key, %error, "pending node cleanup blocked; keeping its record until the checkout is restored");
-        return Ok(Found::Unanswered);
-    }
     match ctx.backend.create_run_node(request).await {
         Ok(created) => {
             index_node_agent(&mut *ctx.store.lock().await, run, &created.agent)?;
@@ -980,11 +959,12 @@ mod tests {
         let identity = RepositoryIdentity::Root(root.clone());
         let missing = identity.check_checkout().unwrap_err().to_string();
         assert!(missing.contains(&root.display().to_string()), "{missing}");
-        assert!(missing.contains("moved or was removed"), "{missing}");
+        assert!(missing.contains("is missing"), "{missing}");
         assert!(
-            missing.contains("re-register the repo or cancel the run"),
+            missing.contains("restore it there and retry the item"),
             "{missing}"
         );
+        assert!(missing.contains("a re-registered path applies to new runs"));
         std::fs::write(&root, "a file cannot be a checkout").unwrap();
         let file = identity.check_checkout().unwrap_err().to_string();
         assert!(file.contains("no longer a directory"), "{file}");

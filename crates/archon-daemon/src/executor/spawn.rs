@@ -921,15 +921,7 @@ async fn record(
         }
         error if wire::is_internal(&error) => retry_or_refuse(ctx, table, stage, error).await,
         ArchonError::Policy(_) => policy_refusal(ctx, table, stage, error).await,
-        other => {
-            refuse(
-                ctx,
-                table,
-                stage,
-                format!("Aether refused create_agent: {other}"),
-            )
-            .await
-        }
+        other => refuse(ctx, table, stage, format!("cannot create agent: {other}")).await,
     }
 }
 
