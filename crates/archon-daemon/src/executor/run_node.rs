@@ -17,6 +17,8 @@
 //! index becomes a routing tombstone after retirement and retention, so
 //! late messages still have an owner even when lifecycle bookkeeping goes.
 
+use std::path::PathBuf;
+
 use archon_core::Timestamp;
 use archon_core::aether_ids::{AetherAgentId, AetherRunId};
 use archon_core::error::ArchonError;
@@ -48,6 +50,60 @@ pub(super) struct RunNode {
     pub agent: AetherAgentId,
     /// What the node's scope states; a child may not widen it.
     pub network: NetworkPolicy,
+    pub repository: RepositoryIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum RepositoryIdentity {
+    Name(Option<String>),
+    Root(PathBuf),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepositoryMode {
+    Name,
+    Root,
+}
+
+impl RepositoryIdentity {
+    fn from_request(request: &RunNodeRequest) -> Self {
+        assert!(request.repository_root.is_none() || request.repository.is_none());
+        assert!(
+            request
+                .repository_root
+                .as_ref()
+                .is_none_or(|root| root.is_absolute())
+        );
+        match &request.repository_root {
+            Some(root) => Self::Root(root.clone()),
+            None => Self::Name(request.repository.clone()),
+        }
+    }
+
+    pub(super) fn parts(&self) -> (Option<String>, Option<PathBuf>) {
+        match self {
+            Self::Name(name) => (name.clone(), None),
+            Self::Root(root) => (None, Some(root.clone())),
+        }
+    }
+
+    fn check_checkout(&self) -> Result<(), ArchonError> {
+        let Self::Root(root) = self else {
+            return Ok(());
+        };
+        assert!(root.is_absolute(), "a frozen checkout is absolute");
+        let problem = match std::fs::metadata(root) {
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(_) => "is no longer a directory".to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "is missing".to_owned(),
+            Err(error) => format!("cannot be read: {error}"),
+        };
+        Err(ArchonError::Invalid(format!(
+            "the registered checkout {} {problem}; restore it there and retry the item \
+             (a re-registered path applies to new runs)",
+            root.display()
+        )))
+    }
 }
 
 /// The node of one pipeline run, in `kv` until `retire` forgets it.
@@ -62,6 +118,9 @@ pub(crate) struct StoredNode {
     /// create and kept: stage agents bound later state its network. `None`
     /// only for a generation left behind after Aether refused its key.
     pub request: Option<RunNodeRequest>,
+    /// Kept across refused or lost node generations; old requests use their name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository_identity: Option<RepositoryIdentity>,
 }
 
 impl StoredNode {
@@ -70,7 +129,14 @@ impl StoredNode {
             agent: None,
             generation: 1,
             request: None,
+            repository_identity: None,
         }
+    }
+
+    fn repository_identity(&self) -> Option<RepositoryIdentity> {
+        self.repository_identity
+            .clone()
+            .or_else(|| self.request.as_ref().map(RepositoryIdentity::from_request))
     }
 
     fn check(&self) {
@@ -80,6 +146,9 @@ impl StoredNode {
             "a recorded node keeps the request it was created with"
         );
         if let Some(request) = &self.request {
+            if let Some(identity) = &self.repository_identity {
+                assert_eq!(identity, &RepositoryIdentity::from_request(request));
+            }
             assert!(
                 request
                     .idempotency_key
@@ -99,6 +168,7 @@ impl StoredNode {
         Some(RunNode {
             agent,
             network: request.network,
+            repository: RepositoryIdentity::from_request(request),
         })
     }
 }
@@ -289,11 +359,7 @@ pub(super) fn runs_to_retire(store: &Store) -> Result<Vec<PipelineRunId>, Archon
     Ok(due)
 }
 
-/// The live node of `run`: the stored one when Aether still holds it, else
-/// a new generation. `model` and `network` (Aether's default now) seed a
-/// new generation's request; later callers of that generation reuse the
-/// stored request whatever they pass. One key Aether refuses is left
-/// behind for the next generation, once.
+/// Reuse a live node, replacing lost nodes or one refused key.
 pub(super) async fn ensure(
     ctx: &DaemonContext,
     run: &PipelineRunId,
@@ -336,8 +402,7 @@ enum Claim {
 
 enum Created {
     Agent(RunNode),
-    /// Aether refused the generation's key (`invalid_argument`: a request
-    /// it recorded differently; `not_found`: the work it created is gone).
+    /// Aether refused a generation's key; retry with a new key.
     Refused {
         generation: u32,
         error: ArchonError,
@@ -357,9 +422,22 @@ async fn create_generation(
         .backend
         .host_context(ctx.config.aether.host_context.for_model(model))
         .await?;
+    let repository_mode = if ctx.backend.supports_repository_root().await? {
+        RepositoryMode::Root
+    } else {
+        RepositoryMode::Name
+    };
     let claim = {
         let mut store = ctx.store.lock().await;
-        claim_generation(&mut store, run, observed, model, network, host_context)?
+        claim_generation(
+            &mut store,
+            run,
+            observed,
+            model,
+            network,
+            host_context,
+            repository_mode,
+        )?
     };
     let (generation, request) = match claim {
         Claim::Agent(node) => return Ok(Created::Agent(node)),
@@ -370,13 +448,26 @@ async fn create_generation(
     };
     assert_eq!(request.idempotency_key, idempotency_key(run, generation));
     let request = prepare_replay(ctx, run, generation, request).await?;
+    send_generation(ctx, run, generation, request).await
+}
+
+async fn send_generation(
+    ctx: &DaemonContext,
+    run: &PipelineRunId,
+    generation: u32,
+    request: RunNodeRequest,
+) -> Result<Created, ArchonError> {
+    assert_eq!(request.idempotency_key, idempotency_key(run, generation));
     let network = request.network;
+    let repository = RepositoryIdentity::from_request(&request);
+    repository.check_checkout()?;
     match ctx.backend.create_run_node(request).await {
         Ok(created) => {
             record_agent(&mut *ctx.store.lock().await, run, generation, &created)?;
             Ok(Created::Agent(RunNode {
                 agent: created.agent,
                 network,
+                repository,
             }))
         }
         Err(error @ (ArchonError::Invalid(_) | ArchonError::NotFound(_))) => {
@@ -434,6 +525,7 @@ fn claim_generation(
     model: &ModelRef,
     network: NetworkPolicy,
     host_context: archon_core::config::HostContext,
+    repository_mode: RepositoryMode,
 ) -> Result<Claim, ArchonError> {
     let current = load_node(store, run)?;
     let moved = current != *observed;
@@ -449,12 +541,26 @@ fn claim_generation(
         }
         (None, None) => current.generation,
     };
-    let mut request = request(store, run, generation, model, network)?;
+    // Only a new run can choose roots; legacy generations keep their name identity.
+    let repository_mode = match (repository_mode, current.generation) {
+        (RepositoryMode::Root, 1) => RepositoryMode::Root,
+        _ => RepositoryMode::Name,
+    };
+    let mut request = request(
+        store,
+        run,
+        generation,
+        model,
+        network,
+        current.repository_identity(),
+        repository_mode,
+    )?;
     request.host_context = host_context;
     let pending = StoredNode {
         agent: None,
         generation,
         request: Some(request.clone()),
+        repository_identity: Some(RepositoryIdentity::from_request(&request)),
     };
     save_node(store, run, &pending)?;
     Ok(Claim::Create {
@@ -528,6 +634,7 @@ async fn skip_generation(
         agent: None,
         generation: generation + 1,
         request: None,
+        repository_identity: current.repository_identity(),
     };
     save_node(&mut store, run, &next)?;
     Ok(next)
@@ -542,6 +649,8 @@ fn request(
     generation: u32,
     model: &ModelRef,
     network: NetworkPolicy,
+    identity: Option<RepositoryIdentity>,
+    repository_mode: RepositoryMode,
 ) -> Result<RunNodeRequest, ArchonError> {
     let run = store.run(run_id)?;
     let item = store.item(&run.item)?;
@@ -563,6 +672,18 @@ fn request(
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
+    let identity = identity.unwrap_or_else(|| match repo {
+        Some(repo) if repository_mode == RepositoryMode::Root && run.aether_run.is_none() => {
+            RepositoryIdentity::Root(repo.path)
+        }
+        repo => RepositoryIdentity::Name(repo.map(|repo| repo.name)),
+    });
+    let (repository, repository_root) = identity.parts();
+    assert!(
+        repository_root
+            .as_ref()
+            .is_none_or(|root| root.is_absolute())
+    );
     Ok(RunNodeRequest {
         host_context: Default::default(),
         idempotency_key: idempotency_key(run_id, generation),
@@ -570,7 +691,8 @@ fn request(
         name,
         model: model.clone(),
         workspace: run.team_root.clone().unwrap_or(run.workspace),
-        repository: repo.map(|r| r.name),
+        repository,
+        repository_root,
         network,
         labels,
         attach_run: run.aether_run,
@@ -581,7 +703,7 @@ fn request(
 enum Found {
     Agent(AetherAgentId),
     Nothing,
-    /// Aether did not answer; the entry stays for the next sweep.
+    /// Cleanup could not be confirmed; retain the entry for the next sweep.
     Unanswered,
 }
 
@@ -680,12 +802,17 @@ async fn find_agent(
     run: &PipelineRunId,
     node: StoredNode,
 ) -> Result<Found, ArchonError> {
+    node.check();
     let request = match (node.agent, node.request) {
         (Some(agent), _) => return Ok(Found::Agent(agent)),
         (None, Some(request)) => request,
         (None, None) => return Ok(Found::Nothing),
     };
     let request = prepare_replay(ctx, run, node.generation, request).await?;
+    assert_eq!(
+        request.idempotency_key,
+        idempotency_key(run, node.generation)
+    );
     let key = request.idempotency_key.clone();
     match ctx.backend.create_run_node(request).await {
         Ok(created) => {
@@ -757,6 +884,7 @@ mod tests {
             agent: Some(agent),
             generation: 3,
             request: Some(request_for(&run, 3)),
+            repository_identity: None,
         };
         save_node(&mut store, &run, &saved).unwrap();
         assert_eq!(load_node(&store, &run).unwrap(), saved);
@@ -773,10 +901,83 @@ mod tests {
             model: "claude-code/claude-sonnet-5".parse().unwrap(),
             workspace: "/w".into(),
             repository: None,
+            repository_root: None,
             network: NetworkPolicy::Denied,
             labels: Default::default(),
             attach_run: None,
         }
+    }
+
+    #[test]
+    fn old_node_records_keep_their_stored_repository_name() {
+        let run = PipelineRunId::new();
+        let mut request = request_for(&run, 1);
+        request.repository = Some("original-name".into());
+        let raw = serde_json::json!({
+            "agent": "agt_1", "generation": 1, "request": request,
+        });
+        assert!(raw["request"].get("repository_root").is_none());
+        let stored: StoredNode = serde_json::from_value(raw).unwrap();
+        stored.check();
+        assert_eq!(stored.repository_identity, None);
+        assert_eq!(
+            stored.repository_identity(),
+            Some(RepositoryIdentity::Name(Some("original-name".into())))
+        );
+        assert_eq!(
+            stored.recorded().unwrap().repository.parts(),
+            (Some("original-name".into()), None)
+        );
+    }
+
+    #[test]
+    fn a_stored_root_node_round_trips_through_json() {
+        let run = PipelineRunId::new();
+        let root = PathBuf::from("/registered/checkout");
+        let mut request = request_for(&run, 2);
+        request.repository_root = Some(root.clone());
+        let stored = StoredNode {
+            agent: Some(AetherAgentId::parse("agt_1").unwrap()),
+            generation: 2,
+            request: Some(request),
+            repository_identity: Some(RepositoryIdentity::Root(root.clone())),
+        };
+        let raw = serde_json::to_string(&stored).unwrap();
+        let restored: StoredNode = serde_json::from_str(&raw).unwrap();
+        restored.check();
+        assert_eq!(restored, stored);
+        assert_eq!(
+            restored.recorded().unwrap().repository.parts(),
+            (None, Some(root))
+        );
+    }
+
+    #[test]
+    fn a_frozen_root_must_still_be_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        let identity = RepositoryIdentity::Root(root.clone());
+        let missing = identity.check_checkout().unwrap_err().to_string();
+        assert!(missing.contains(&root.display().to_string()), "{missing}");
+        assert!(missing.contains("is missing"), "{missing}");
+        assert!(
+            missing.contains("restore it there and retry the item"),
+            "{missing}"
+        );
+        assert!(missing.contains("a re-registered path applies to new runs"));
+        std::fs::write(&root, "a file cannot be a checkout").unwrap();
+        let file = identity.check_checkout().unwrap_err().to_string();
+        assert!(file.contains("no longer a directory"), "{file}");
+        assert!(
+            RepositoryIdentity::Root(dir.path().to_owned())
+                .check_checkout()
+                .is_ok()
+        );
+        assert!(
+            RepositoryIdentity::Name(Some("legacy".into()))
+                .check_checkout()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -787,13 +988,15 @@ mod tests {
             agent: Some(agent.clone()),
             generation: 1,
             request: Some(request_for(&run, 1)),
+            repository_identity: None,
         };
         node.check();
         assert_eq!(
             node.recorded(),
             Some(RunNode {
                 agent,
-                network: NetworkPolicy::Denied
+                network: NetworkPolicy::Denied,
+                repository: RepositoryIdentity::Name(None),
             })
         );
         assert_eq!(StoredNode::fresh().recorded(), None);
@@ -859,6 +1062,7 @@ mod tests {
             agent: None,
             generation: 2,
             request: Some(request_for(&run, 1)),
+            repository_identity: None,
         }
         .check();
     }
@@ -870,6 +1074,7 @@ mod tests {
             agent: Some(AetherAgentId::parse("agt_1").unwrap()),
             generation: 1,
             request: None,
+            repository_identity: None,
         }
         .check();
     }

@@ -259,6 +259,7 @@ pub async fn spawning_stage(
         choice: choice(),
         workspace: run.workspace.clone(),
         repository: Some("alpha".into()),
+        repository_root: None,
         labels: Default::default(),
         hidden_tools: vec![],
         leaf: true,

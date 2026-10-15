@@ -53,6 +53,9 @@ pub struct SpawnRequest {
     pub choice: ModelChoice,
     pub workspace: PathBuf,
     pub repository: Option<String>,
+    /// Frozen before creation; absent on requests using the registered name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_root: Option<PathBuf>,
     pub labels: BTreeMap<String, String>,
     /// Tool names hidden from the agent: Archon's (`mcp__archon__*`) and
     /// Aether's own that no stage agent gets.
@@ -151,6 +154,9 @@ pub struct RunNodeRequest {
     /// The run's worktree: a child's scope must sit inside its parent's.
     pub workspace: PathBuf,
     pub repository: Option<String>,
+    /// Frozen before creation; absent on requests using the registered name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_root: Option<PathBuf>,
     /// Aether's default for new roots when the node was requested. A
     /// stage agent under the node may state it or narrower, never wider.
     pub network: NetworkPolicy,
@@ -227,6 +233,11 @@ pub trait AgentBackend: Send + Sync {
         _requested: crate::config::HostContext,
     ) -> Result<crate::config::HostContext, ArchonError> {
         Ok(crate::config::HostContext::Full)
+    }
+
+    /// Whether new runs can derive their memory scope from the registered checkout.
+    async fn supports_repository_root(&self) -> Result<bool, ArchonError> {
+        Ok(false)
     }
 
     /// Resolve budget enforcement before the request is persisted and sent.

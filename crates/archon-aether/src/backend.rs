@@ -162,6 +162,7 @@ pub fn stage_create_agent(request: &SpawnRequest, network: NetworkPolicy) -> Cre
             network,
             labels: request.labels.clone(),
         }),
+        repository_root: request.repository_root.clone(),
         parent: request.parent.clone(),
         config: Some(AgentConfig {
             host_context: request.host_context,
@@ -211,6 +212,7 @@ pub fn run_node_create_agent(request: &RunNodeRequest) -> CreateAgent {
             network: request.network,
             labels: request.labels.clone(),
         }),
+        repository_root: request.repository_root.clone(),
         parent: None,
         config: Some(AgentConfig {
             host_context: request.host_context,
@@ -333,6 +335,10 @@ impl AgentBackend for AetherBackend {
             "the client has an Aether store identity"
         );
         Ok(client.welcome().effective_host_context(requested))
+    }
+
+    async fn supports_repository_root(&self) -> Result<bool, ArchonError> {
+        Ok(self.link.client()?.welcome().supports_repository_root())
     }
 
     async fn prepare_spawn(
@@ -523,6 +529,7 @@ mod tests {
             },
             workspace: "/work/tree".into(),
             repository: Some("repo".into()),
+            repository_root: None,
             labels: [("archon.item".to_owned(), "qi_1".to_owned())].into(),
             hidden_tools: vec!["mcp__archon__enqueue".into()],
             leaf: true,
@@ -545,6 +552,7 @@ mod tests {
             model: "claude-code/claude-opus-5-5".parse().unwrap(),
             workspace: "/work/tree".into(),
             repository: Some("repo".into()),
+            repository_root: None,
             network: NetworkPolicy::Denied,
             labels: [("archon.item".to_owned(), "qi_1".to_owned())].into(),
             attach_run: None,

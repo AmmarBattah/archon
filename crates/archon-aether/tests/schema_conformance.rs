@@ -91,6 +91,7 @@ fn full_create_agent() -> CreateAgent {
             network: NetworkPolicy::Allowed,
             labels: [("archon.item".to_owned(), "qi_1".to_owned())].into(),
         }),
+        repository_root: None,
         parent: Some(agent()),
         config: Some(AgentConfig {
             host_context: Default::default(),

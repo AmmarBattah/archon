@@ -236,6 +236,7 @@ pub fn orchestrator_create_agent(
             network,
             labels: [("archon".to_owned(), "orchestrator".to_owned())].into(),
         }),
+        repository_root: None,
         parent: None,
         config: Some(AgentConfig {
             host_context: config

@@ -118,6 +118,7 @@ async fn backend_requires_callers_to_refreeze_unsupported_lean_requests() {
         model: "codex/gpt-6-luna".parse().unwrap(),
         workspace: "/work".into(),
         repository: None,
+        repository_root: None,
         network: NetworkPolicy::Denied,
         labels: Default::default(),
         attach_run: None,

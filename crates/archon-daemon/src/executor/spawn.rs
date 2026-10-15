@@ -511,6 +511,7 @@ fn build_request(
         choice: plan.choice.clone(),
         workspace,
         repository: target.repo.map(|repo| repo.name.clone()),
+        repository_root: None,
         labels: labels(target, plan, id),
         hidden_tools: hidden_tools(item.autonomy.tools, plan.workspace),
         leaf: !target.delegates(plan),
@@ -781,6 +782,7 @@ async fn spawn_bound(
             .backend
             .host_context(ctx.config.aether.host_context.for_model(model))
             .await?;
+        (spawn.request.repository, spawn.request.repository_root) = node.repository.parts();
         spawn.request.parent = Some(node.agent);
         spawn.request.network = Some(network);
         spawn.parent = ParentBinding::Bound;
@@ -919,15 +921,7 @@ async fn record(
         }
         error if wire::is_internal(&error) => retry_or_refuse(ctx, table, stage, error).await,
         ArchonError::Policy(_) => policy_refusal(ctx, table, stage, error).await,
-        other => {
-            refuse(
-                ctx,
-                table,
-                stage,
-                format!("Aether refused create_agent: {other}"),
-            )
-            .await
-        }
+        other => refuse(ctx, table, stage, format!("cannot create agent: {other}")).await,
     }
 }
 

@@ -26,6 +26,7 @@ pub const OPERATOR_LOGINS_PROTOCOL_VERSION: u32 = 17;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const CLIENT_NAME: &str = "archon";
 pub const HOST_CONTEXT_FEATURE: &str = "host_context";
+pub const REPOSITORY_ROOT_FEATURE: &str = "repository_root";
 
 /// One client frame: `{"req": id, "cmd": ..., ...fields}`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -180,6 +181,12 @@ pub struct Welcome {
 }
 
 impl Welcome {
+    pub fn supports_repository_root(&self) -> bool {
+        self.features
+            .iter()
+            .any(|feature| feature == REPOSITORY_ROOT_FEATURE)
+    }
+
     pub fn effective_host_context(
         &self,
         requested: archon_core::config::HostContext,
@@ -208,6 +215,8 @@ pub struct CreateAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<Scope>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_root: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<AetherAgentId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<AgentConfig>,
@@ -232,6 +241,7 @@ impl Default for CreateAgent {
             objective: None,
             model: None,
             scope: None,
+            repository_root: None,
             parent: None,
             config: None,
             approval: None,

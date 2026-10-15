@@ -270,6 +270,7 @@ pub fn aether_request(input: &TrialInput<'_>, deadline: Timestamp) -> CreateAgen
             network: NetworkPolicy::Allowed,
             labels: [("archon-bench".to_owned(), task.id.clone())].into(),
         }),
+        repository_root: None,
         parent: None,
         config: Some(AgentConfig {
             host_context: Default::default(),
