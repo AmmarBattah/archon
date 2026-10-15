@@ -38,8 +38,9 @@
   model its item's policy allows: another than its own where there is one,
   else its own. It was told to find a different priced model, which a
   single-model allowlist forbids, so such items failed or delegated reviewers
-  Archon then cancelled. The stale claim that Codex usage arrives unpriced is
-  gone.
+  Archon then cancelled. The advice follows the policy as it stands when the
+  lead spawns, so recovering a running item no longer reads the repository's
+  config. The stale claim that Codex usage arrives unpriced is gone.
 - Refreshes map steered build/implement models and reviewers onto the refresh
   pipeline, fill missing choices within model policy, and skip proposal and
   report gates while keeping review, merge and tools. Refreshing a finished

@@ -107,6 +107,7 @@ mod tests {
             team: None,
             keep: false,
             resume: None,
+            reviewers: None,
         }
     }
 
