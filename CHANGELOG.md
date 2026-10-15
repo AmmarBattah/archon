@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- Sustainable filesystem retention: detached daemon logs rotate by size and
+  age (10 MiB, three archives, 14 days by default), settled item report/Lavish
+  snapshots expire after `[storage] retention_days = 14` with live work, gates
+  and questions protected, and status / `queue_status` report bytes by storage
+  kind and the last GC's freed bytes. SQLite history and spend remain intact.
+
+### Changed
+
+- Artifact retention defaults to 14 days. Existing tighter worktree/cache
+  defaults stay unchanged; zero durations disable their configured expiry.
+
 ### Fixes
 
 - Reviewers' experiment copies now go in a directory Archon owns on its data

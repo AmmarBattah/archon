@@ -80,6 +80,8 @@ impl DaemonPaths {
 
 pub struct DaemonContext {
     pub config: Config,
+    /// Cached filesystem accounting keeps status polling from repeatedly walking trees.
+    pub storage: Mutex<Option<(std::time::Instant, Vec<archon_core::protocol::StorageUsage>)>>,
     pub paths: DaemonPaths,
     /// The only writer of `archon.db`. Held briefly; never across an await
     /// on Aether.
@@ -131,6 +133,8 @@ pub struct DaemonContext {
     pub gc: Mutex<Option<std::time::Instant>>,
     /// Items a gc pass is collecting right now; none of them is started.
     pub collecting: crate::gc::Collecting,
+    /// The operator's upgrade or restart, and the versions `status` shows.
+    pub ops: crate::ops::OpsState,
 }
 
 impl DaemonContext {
