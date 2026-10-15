@@ -503,7 +503,6 @@ fn routing_reads_a_corrections_columns_never_its_record() {
 fn memory_feedback_intent_and_receipts_survive_reopening_without_changing_attribution() {
     use archon_core::aether_ids::{AetherMemoryFeedbackId, AetherMemoryId, AetherTaskId};
     use archon_core::feedback::{MemoryFeedback, MemoryFeedbackEntry, MemoryFeedbackTask};
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("archon.db");
     let (store, _, _, cheap) = cohort(&path);
@@ -535,6 +534,9 @@ fn memory_feedback_intent_and_receipts_survive_reopening_without_changing_attrib
         memory: AetherMemoryId::parse("mem_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
         feedback: Some(AetherMemoryFeedbackId::parse("mfb_1").unwrap()),
         attempted: true,
+        submission_horizon: Some("epoch:0".into()),
+        unconfirmed: false,
+        failed: None,
         retracted: false,
         dropped: false,
         error: None,

@@ -31,6 +31,12 @@ pub struct MemoryFeedbackEntry {
     pub feedback: Option<AetherMemoryFeedbackId>,
     /// Persisted before sending: a lost reply must be recovered before undo.
     pub attempted: bool,
+    #[serde(default)]
+    pub submission_horizon: Option<String>,
+    #[serde(default)]
+    pub unconfirmed: bool,
+    #[serde(default)]
+    pub failed: Option<String>,
     pub retracted: bool,
     pub dropped: bool,
     pub error: Option<String>,
@@ -67,6 +73,17 @@ impl MemoryFeedback {
                     || (entry.feedback.is_some() && !entry.attempted)
                     || (entry.retracted && entry.feedback.is_none())
                     || (entry.dropped && entry.attempted)
+                    || (entry.unconfirmed && !entry.attempted)
+                    || entry
+                        .submission_horizon
+                        .as_ref()
+                        .is_some_and(|h| h.is_empty() || !entry.attempted)
+                    || entry.failed.as_ref().is_some_and(|reason| {
+                        reason.is_empty()
+                            || entry.dropped
+                            || entry.retracted
+                            || entry.error.is_some()
+                    })
                 {
                     return Err(ArchonError::Invalid(
                         "inconsistent memory feedback entry".into(),
@@ -88,13 +105,16 @@ impl MemoryFeedback {
         for task in &self.tasks {
             counts.partial_tasks += usize::from(task.partial);
             counts.skipped += usize::from(task.skipped.is_some());
-            counts.pending += usize::from(!task.discovered && self.skipped.is_none());
+            counts.pending +=
+                usize::from(!task.discovered && task.skipped.is_none() && self.skipped.is_none());
             for entry in &task.records {
                 counts.retracted += usize::from(entry.retracted);
-                counts.skipped += usize::from(entry.dropped);
+                counts.skipped += usize::from(entry.dropped || entry.failed.is_some());
                 counts.sent += usize::from(entry.feedback.is_some() && !entry.retracted);
                 counts.pending += usize::from(
-                    !entry.dropped
+                    self.skipped.is_none()
+                        && entry.failed.is_none()
+                        && !entry.dropped
                         && !entry.retracted
                         && (entry.feedback.is_none() || entry.error.is_some()),
                 );
@@ -160,6 +180,9 @@ mod tests {
             memory: AetherMemoryId::parse("mem_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
             feedback: None,
             attempted: false,
+            submission_horizon: None,
+            unconfirmed: false,
+            failed: None,
             retracted: false,
             dropped: false,
             error: None,
@@ -197,6 +220,9 @@ mod tests {
             memory: AetherMemoryId::parse("mem_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
             feedback: Some(AetherMemoryFeedbackId::parse("mfb_1").unwrap()),
             attempted: false,
+            submission_horizon: None,
+            unconfirmed: false,
+            failed: None,
             retracted: false,
             dropped: false,
             error: None,
@@ -206,6 +232,16 @@ mod tests {
         assert!(ledger.check().is_err(), "a receipt requires an attempt");
         ledger.tasks[0].records[0].attempted = true;
         assert!(ledger.check().is_ok());
+        ledger.tasks[0].records[0].failed = Some("not found".into());
+        assert_eq!(ledger.counts().pending, 0);
+        assert_eq!(ledger.counts().skipped, 1);
+        ledger.tasks[0].records[0].error = Some("retry".into());
+        assert!(
+            ledger.check().is_err(),
+            "terminal entries have no retry error"
+        );
+        ledger.tasks[0].records[0].error = None;
+        ledger.tasks[0].records[0].failed = None;
         ledger.tasks[0].records[0].dropped = true;
         assert!(ledger.check().is_err(), "attempted work cannot be dropped");
     }

@@ -77,6 +77,44 @@ impl Store {
         load(&self.conn, id)?.ok_or_else(|| ArchonError::NotFound(format!("feedback {id}")))
     }
 
+    /// Corrections with unfinished delivery or evidence still owed a retraction.
+    pub fn pending_memory_feedback(&self) -> Result<Vec<FeedbackId>, ArchonError> {
+        let mut statement = self.conn.prepare(
+            "SELECT data FROM operator_feedback WHERE json_type(data, '$.memory_feedback') = 'object' ORDER BY observed_at, id"
+        ).ctx("prepare pending memory feedback")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .ctx("query pending memory feedback")?;
+        let mut ids = Vec::new();
+        for raw in rows {
+            let feedback: OperatorFeedback =
+                from_json(&raw.ctx("read memory feedback")?, "feedback")?;
+            feedback.check()?;
+            let ledger = feedback
+                .memory_feedback
+                .as_ref()
+                .expect("selected a ledger");
+            assert!(ledger.check().is_ok());
+            if ledger.skipped.is_some() {
+                continue;
+            }
+            let retract = feedback.revoked_at.is_some()
+                && ledger.tasks.iter().any(|task| {
+                    task.records.iter().any(|entry| {
+                        entry.feedback.is_some() && !entry.retracted && entry.failed.is_none()
+                    })
+                });
+            if ledger.counts().pending > 0 || retract {
+                ids.push(feedback.id);
+            }
+        }
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len()
+        );
+        Ok(ids)
+    }
+
     /// Every correction of the item's runs, oldest first.
     pub fn item_feedback(&self, item: &QueueItemId) -> Result<Vec<OperatorFeedback>, ArchonError> {
         let mut statement = self

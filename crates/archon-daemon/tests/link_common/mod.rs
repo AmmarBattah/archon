@@ -69,6 +69,8 @@ impl Harness {
             replies: Mutex::new(ReplyTracker::default()),
             answering: Mutex::new(()),
             learning_memory: Mutex::new(()),
+            memory_curation: Mutex::new(()),
+            memory_feedback_ready: Notify::new(),
             report_files: Arc::new(Mutex::new(())),
             supervisor: Supervisor::default(),
             github: archon_daemon::github::GithubState::default(),

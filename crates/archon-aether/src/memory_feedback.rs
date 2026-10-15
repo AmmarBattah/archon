@@ -43,13 +43,36 @@ pub struct MemoryFeedbackRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MemoriesInContext {
     pub snapshots: Vec<MemorySnapshot>,
+    #[serde(default)]
     pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MemorySnapshot {
-    pub task: AetherTaskId,
+    pub task: Option<AetherTaskId>,
     pub memories: Vec<AetherMemoryId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FeedbackCommand {
+    pub cmd: &'static str,
+    #[serde(flatten)]
+    pub request: RecordMemoryFeedback,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum SubmissionResolution {
+    Executed { reply: crate::wire::RawReply },
+    AbsentSafe,
+    Unknown { reason: String },
+}
+
+#[derive(Debug)]
+pub enum FeedbackResolution {
+    Executed(MemoryFeedbackRecord),
+    AbsentSafe,
+    Unknown(String),
 }
 
 impl AetherClient {
@@ -83,12 +106,21 @@ impl AetherClient {
             )
             .await?;
         let context: MemoriesInContext = decode(data)?;
-        if context.snapshots.iter().any(|s| &s.task != task) {
+        if context
+            .snapshots
+            .iter()
+            .any(|s| s.task.as_ref().is_some_and(|t| t != task))
+        {
             return Err(ArchonError::Protocol(
                 "memory context answered for another task".into(),
             ));
         }
-        assert!(context.snapshots.iter().all(|s| &s.task == task));
+        assert!(
+            context
+                .snapshots
+                .iter()
+                .all(|s| s.task.as_ref().is_none_or(|t| t == task))
+        );
         assert!(self.supports_memory_feature(MEMORY_CONTEXT_FEATURE));
         Ok(context)
     }
@@ -117,7 +149,13 @@ impl AetherClient {
                 "memory_feedback",
             )
             .await?;
-        let record: MemoryFeedbackRecord = decode(data)?;
+        Self::validate_feedback(decode(data)?, &request)
+    }
+
+    fn validate_feedback(
+        record: MemoryFeedbackRecord,
+        request: &RecordMemoryFeedback,
+    ) -> Result<MemoryFeedbackRecord, ArchonError> {
         if record.memory != request.memory
             || record.task != request.task
             || record.verdict != request.verdict
@@ -131,6 +169,45 @@ impl AetherClient {
         assert_eq!(record.memory, request.memory, "receipt names its memory");
         assert_eq!(record.task, request.task, "receipt names its task");
         Ok(record)
+    }
+
+    pub async fn resolve_memory_feedback(
+        &self,
+        request: RecordMemoryFeedback,
+        horizon: Option<String>,
+    ) -> Result<FeedbackResolution, ArchonError> {
+        assert!(!request.idempotency_key.is_empty());
+        assert!(!request.reason.trim().is_empty());
+        if self.welcome().submission_horizon.is_none() {
+            return Ok(FeedbackResolution::Unknown(
+                "Aether cannot resolve lost submissions; upgrade Aether".into(),
+            ));
+        }
+        let data = self
+            .request(
+                Command::ResolveSubmission {
+                    command: FeedbackCommand {
+                        cmd: "record_memory_feedback",
+                        request: request.clone(),
+                    },
+                    horizon,
+                },
+                "submission_resolved",
+            )
+            .await?;
+        match decode(data)? {
+            SubmissionResolution::Executed { reply } => {
+                if reply.reply != "memory_feedback" {
+                    return Err(ArchonError::Protocol(
+                        "resolved receipt is not memory feedback".into(),
+                    ));
+                }
+                Self::validate_feedback(decode(reply.data)?, &request)
+                    .map(FeedbackResolution::Executed)
+            }
+            SubmissionResolution::AbsentSafe => Ok(FeedbackResolution::AbsentSafe),
+            SubmissionResolution::Unknown { reason } => Ok(FeedbackResolution::Unknown(reason)),
+        }
     }
 
     pub async fn retract_memory_feedback(

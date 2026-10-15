@@ -2,10 +2,12 @@
 
 ## Unreleased
 
-- Operator corrections now tell Aether which recalled memories concerned the
-  corrected stage. Memory feedback survives interrupted delivery, can be retried
-  with `archon learning retry-memory`, and is retracted by `undo`. `learning why`
-  shows sent, pending and skipped feedback, including partial context results.
+### Features
+
+- Quality corrections tell Aether which recalled memories hurt the corrected
+  stage. Delivery happens in the background and resumes after a restart or
+  reconnect. Undo retracts the feedback, and `learning why` shows delivery
+  progress and reasons for skipped or unconfirmed feedback.
 
 ### Fixes
 

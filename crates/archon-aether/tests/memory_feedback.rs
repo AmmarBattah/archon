@@ -163,3 +163,77 @@ async fn mismatched_receipts_stay_visible() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn snapshot_tasks_are_optional_and_missing_truncated_defaults_to_false() {
+    let (_dir, fake) = fake_aether().await;
+    fake.set_features(vec!["memory_context".into()]);
+    fake.set_default(
+        "memories_in_context",
+        Scripted::reply(
+            "memories_in_context",
+            json!({
+                "snapshots": [{"memories":[MEMORY]}, {"task":null,"memories":[]}]
+            }),
+        ),
+    );
+    let client = connect(&fake).await;
+    let context = client.memories_in_context(&request().task).await.unwrap();
+    assert!(!context.truncated);
+    assert!(
+        context
+            .snapshots
+            .iter()
+            .all(|snapshot| snapshot.task.is_none())
+    );
+    assert_eq!(context.snapshots[0].memories[0].as_str(), MEMORY);
+}
+
+#[tokio::test]
+async fn resolved_receipts_are_validated_against_the_original_submission() {
+    use archon_aether::memory_feedback::FeedbackResolution;
+    let (_dir, fake) = fake_aether().await;
+    fake.set_features(vec!["memory_feedback".into()]);
+    fake.set_submission_horizon(Some("epoch:20".into()));
+    fake.set_responder(
+        "resolve_submission",
+        Arc::new(|cmd| {
+            assert_eq!(cmd["horizon"], "epoch:0");
+            assert_eq!(cmd["command"]["cmd"], "record_memory_feedback");
+            let record = fake::memory_feedback(&cmd["command"], "mfb_resolved");
+            Scripted::reply(
+                "submission_resolved",
+                json!({"outcome":"executed", "reply":{"reply":"memory_feedback", "data":record}}),
+            )
+        }),
+    );
+    let client = connect(&fake).await;
+    let resolved = client
+        .resolve_memory_feedback(request(), Some("epoch:0".into()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(resolved, FeedbackResolution::Executed(record) if record.id.as_str() == "mfb_resolved")
+    );
+    let mut wrong = fake::memory_feedback(
+        &serde_json::to_value(archon_aether::wire::Command::RecordMemoryFeedback(request()))
+            .unwrap(),
+        "mfb_wrong",
+    );
+    wrong["reason"] = json!("another submission");
+    fake.set_default(
+        "resolve_submission",
+        Scripted::reply(
+            "submission_resolved",
+            json!({"outcome":"executed", "reply":{"reply":"memory_feedback", "data":wrong}}),
+        ),
+    );
+    assert!(
+        client
+            .resolve_memory_feedback(request(), None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("differs")
+    );
+}

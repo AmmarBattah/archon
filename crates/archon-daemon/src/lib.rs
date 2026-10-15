@@ -258,6 +258,8 @@ fn build_context(options: DaemonOptions) -> Result<DaemonContext, ArchonError> {
         replies: Mutex::new(feed::ReplyTracker::default()),
         answering: Mutex::new(()),
         learning_memory: Mutex::new(()),
+        memory_curation: Mutex::new(()),
+        memory_feedback_ready: Notify::new(),
         report_files: Arc::new(Mutex::new(())),
         triggers: TriggerQueue::default(),
         mirrors: mirror::MirrorQueue::default(),

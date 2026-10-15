@@ -1,4 +1,4 @@
-//! A Rust client for the Aether daemon protocol (v14, serving back to 13).
+//! A Rust client for the Aether daemon protocol (v18, falling back to v14).
 //!
 //! Aether ships Python and TypeScript clients only; this crate is Archon's
 //! own, covering the commands and events in ARCHITECTURE §4. `wire` holds the

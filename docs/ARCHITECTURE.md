@@ -66,7 +66,7 @@ Contents:
         ▲                  │ aether link (1 connection, 2 subscriptions) · worktrees · lavish │
         │                  │ SQLite store (archon.db)                                         │
         │                  └───────────────▲──────────────────────────────┬───────────────────┘
-        │                    archon protocol│                              │ aether protocol v17
+        │                    archon protocol│                              │ aether protocol v18
         │                                  │                              ▼
         │          ┌──── archon mcp (stdio) ◀── spawned by ──┐   ┌───────── aetherd ─────────┐
         └──────────┤                                         └───┤ orchestrator agent (root) │
@@ -101,7 +101,7 @@ archon-core ◀── archon-aether ◀──┐
 | Crate | Owns | Must not |
 | --- | --- | --- |
 | `archon-core` | Ids (Archon's and Aether's), domain records (repo, queue item, run, stage run, feed), `Config` schema and loading, `ModelPolicy`, the Archon daemon protocol (`protocol`), the `AgentBackend` port trait (`ports`), pipeline catalog vocabulary (`catalog`), and the MCP tool names (`mcp_tools`). | Do I/O beyond reading config files. |
-| `archon-aether` | Rust client for Aether protocol v17 (falls back to 16, 15 and 14): transport, handshake, request multiplexing, subscriptions, typed subset of commands and events (`wire`, `events`), the reconnecting `AetherLink`, and `AetherBackend: AgentBackend`. | Know about queues or pipelines. |
+| `archon-aether` | Rust client for Aether protocol v18 (falls back to 17, 16, 15 and 14): transport, handshake, request multiplexing, subscriptions, typed subset of commands and events (`wire`, `events`), the reconnecting `AetherLink`, and `AetherBackend: AgentBackend`. | Know about queues or pipelines. |
 | `archon-queue` | `Store` (SQLite, migrations): repos, items, dependencies, runs, stage runs, feed, questions, spend ledger, pause state, kv cursors. Pure scheduler `plan_dispatch`. | Talk to Aether. |
 | `archon-pipeline` | Pipeline discovery (built-in, user, repo), TOML parse and validation, prompt templating, and the `RunDriver` state machine (gates, loops, fan-out). | Do I/O except reading pipeline files; spawn anything. |
 | `archon-client` | Async client for the Archon daemon socket (`connect`, `connect_or_start`, `request`, `subscribe_feed`), and the NDJSON framing shared with the server. | Contain daemon logic. |
@@ -144,21 +144,21 @@ protocol 17 alone does not imply support.
 ### 4.2 Handshake
 
 ```json
-{"req":1,"cmd":"hello","protocol_version":17,"client_name":"archon",
+{"req":1,"cmd":"hello","protocol_version":18,"client_name":"archon",
  "client_version":"1.2.2","features":[]}
 ```
 
 The reply is `Welcome {protocol_version, daemon_version, instance_id,
 schema_version, pid, features, daemon_protocol_version?, min_protocol_version?,
-idle_timeout_secs?}`. If Aether refuses the handshake with `incompatible`
-and the newest protocol it serves is 16, 15 or 14, Archon reconnects and
+idle_timeout_secs?, submission_horizon?}`. If Aether refuses the handshake with `incompatible`
+and the newest protocol it serves is 17, 16, 15 or 14, Archon reconnects and
 says hello at that one: an aetherd not yet upgraded keeps working. What its
 protocol cannot store, Archon refuses to save, before anything is sent:
 GitHub operator logins below 17 (`operator_users`), and a GitHub watcher
 allowlist at 14, which would widen who may dispatch. An aetherd that
 answers a watcher read with `incompatible` because operator logins are set
 is reported as that, never as a reply that failed to decode. Any other
-refusal is reported as "Archon speaks Aether protocol 14..17; the daemon
+refusal is reported as "Archon speaks Aether protocol 14..18; the daemon
 serves {min}..{max}". A change to `instance_id` between connections means
 Aether restarted, which triggers reconciliation (§16).
 
@@ -4167,26 +4167,41 @@ had in the run's frozen pipeline when it was spawned; `archon learning` credits
 a model only for a stage recorded as `work`, never by the current catalog.
 
 **Memory feedback.** When Aether advertises `memory_feedback` and
-`memory_context`, `archon learning correct` also records `hurt` evidence for the
+`memory_context`, `archon learning correct` queues `hurt` evidence for the
 corrected stage's recorded Aether tasks, including retries and fan-out slots.
-With `--forget-memory`, it sends `operator` evidence only when that memory appears
-in the task's context; otherwise the receipt explains the skip. The requested
-forget proceeds independently. Without a named memory, it sends `outcome`
+With `--forget-memory`, it sends `operator` evidence for every correction cause,
+only when that memory appears in the task's context; otherwise the receipt
+explains the skip. The requested forget proceeds independently and still waits
+for Aether. Without a named memory, only `quality` corrections send `outcome`
 evidence for each distinct memory in each task's context. Truncated context is
 marked partial and the listed memories still receive feedback. Older Aether
 instances receive no feedback commands.
 
 The correction's JSON `data` stores a delivery ledger bound to the known Aether
 instance and the stage's tasks when the correction is recorded. Migration 12
-marks older corrections as having no ledger. Context discovery, memory/task
-pairs, errors, attempted submissions and Aether `mfb_` receipts are durable; memory
-text is never stored. Calls run outside the store lock, serialized with undo.
+blocks older Archon binaries that would deserialize and rewrite corrections
+without preserving the ledger; it also marks older corrections as having none.
+Context discovery, memory/task pairs, errors, attempted submissions, original
+submission horizons and Aether `mfb_` receipts are durable; memory text is never
+stored. A supervised background worker delivers outside the store lock under
+`learning_memory`; corrections and undo never wait for this lock or feedback.
+Explicit forgets retain their serialization under a separate curation lock.
+The worker reloads revocation before each entry, so undo during an in-flight
+send queues its retraction without waiting. Startup, every Aether reconnect,
+correction and undo wake the worker; `retry-memory` also resumes pending work.
+Store errors stop the worker and propagate through daemon supervision.
+
 Each write first persists its intent and uses `archon:<feedback>:<memory>:<task>`
-as its idempotency key. Replaying `correct` or running `learning retry-memory`
-resumes pending discovery and delivery. `undo` drops unattempted entries and
-retracts recorded evidence; uncertain submissions replay their key to recover a
-receipt before retraction. Failed retractions remain pending and retry through
-`undo` or `retry-memory`. Undo still leaves a forgotten memory forgotten.
+as its idempotency key. Protocol 18 supplies a `submission_horizon`, persisted
+before the first send and never replaced on reconnect. An attempted entry
+without a feedback id calls `resolve_submission` with the original command,
+key and horizon. `executed` adopts the validated receipt, `absent_safe` permits
+resending, and `unknown` stays pending without resending, even if a later answer
+claims safe absence. Hosts without resolution support also leave uncertain
+submissions pending. Undo drops unattempted entries and retracts known or
+recovered receipts. Transient and unknown failures remain pending; missing
+features, instance mismatches, `not_found` and `invalid_argument` are terminal
+skips with their reason. Undo still leaves a forgotten memory forgotten.
 `learning why` and JSON show sent, pending, skipped and retracted counts, partial
 tasks and errors; pending counts include tasks awaiting context discovery.
 

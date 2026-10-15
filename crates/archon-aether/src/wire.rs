@@ -1,7 +1,5 @@
-//! Aether protocol v17 wire shapes, the subset Archon uses (ARCHITECTURE §4).
-//! Checked against `aether-protocol` and `clients/protocol.schema.json`.
-//! Replies are decoded in two steps (`RawReply`, then the expected payload)
-//! so an unexpected reply kind is a named error, not a decode panic.
+//! Aether protocol v18 wire subset, checked against its published schema.
+//! Replies decode in two steps so unexpected reply kinds remain named errors.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -19,7 +17,7 @@ use crate::memory::MemoryQuery;
 
 /// Archon asks for this first, and falls back to the newest protocol an
 /// older aetherd serves, down to [`MIN_PROTOCOL_VERSION`].
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const MIN_PROTOCOL_VERSION: u32 = 14;
 /// The first protocol whose GitHub watcher stores `allowed_users`.
 pub const ALLOWLIST_PROTOCOL_VERSION: u32 = 15;
@@ -145,6 +143,11 @@ pub enum Command {
         feedback: AetherMemoryFeedbackId,
         reason: String,
     },
+    ResolveSubmission {
+        command: crate::memory_feedback::FeedbackCommand,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        horizon: Option<String>,
+    },
     RestoreMemory {
         id: AetherMemoryId,
     },
@@ -188,6 +191,8 @@ pub struct Welcome {
     pub min_protocol_version: Option<u32>,
     #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub submission_horizon: Option<String>,
 }
 
 impl Welcome {

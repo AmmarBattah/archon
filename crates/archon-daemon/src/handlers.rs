@@ -8,6 +8,10 @@ mod initiatives;
 mod item_views;
 mod items;
 mod learning;
+
+pub use learning::memory_feedback::{
+    resume as resume_memory_feedback, run as deliver_memory_feedback,
+};
 mod lessons;
 mod model_evidence;
 mod operator;

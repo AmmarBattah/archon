@@ -2,6 +2,10 @@
 
 mod common;
 mod feedback_common;
+#[path = "learning_memory_feedback/recovery.rs"]
+mod recovery;
+#[path = "learning_memory_feedback/terminal.rs"]
+mod terminal;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -29,6 +33,7 @@ async fn setup(features: bool, truncated: bool) -> (Harness, FakeAether, Pipelin
     let fake = FakeAether::start(&h.dir.path().join("aether.sock"))
         .await
         .unwrap();
+    fake.set_submission_horizon(Some("epoch:0".into()));
     if features {
         fake.set_features(vec!["memory_feedback".into(), "memory_context".into()]);
     }
@@ -66,6 +71,17 @@ async fn setup(features: bool, truncated: bool) -> (Harness, FakeAether, Pipelin
 }
 
 fn serve_feedback(fake: &FakeAether, receipts: &Receipts) {
+    let records = receipts.clone();
+    fake.set_responder("resolve_submission", Arc::new(move |cmd| {
+        assert_eq!(cmd["command"]["cmd"], "record_memory_feedback");
+        assert!(cmd["command"]["idempotency_key"].is_string());
+        let records = records.lock().unwrap();
+        let data = match records.get(cmd["command"]["idempotency_key"].as_str().unwrap()) {
+            Some(record) => json!({"outcome":"executed", "reply":{"reply":"memory_feedback", "data":record}}),
+            None => json!({"outcome":"absent_safe"}),
+        };
+        Scripted::reply("submission_resolved", data)
+    }));
     let records = receipts.clone();
     fake.set_responder(
         "record_memory_feedback",
@@ -106,6 +122,29 @@ fn ledger(receipt: &FeedbackReceipt) -> &MemoryFeedback {
         .expect("durable ledger")
 }
 
+async fn settled(h: &Harness, mut first: FeedbackReceipt) -> FeedbackReceipt {
+    archon_daemon::handlers::resume_memory_feedback(&h.ctx)
+        .await
+        .unwrap();
+    let why = learning_why(h, &first.view.feedback.item).await;
+    first.view = why
+        .feedback
+        .into_iter()
+        .find(|v| v.feedback.id == first.view.feedback.id)
+        .unwrap();
+    assert!(first.view.feedback.memory_feedback.is_some());
+    assert_eq!(first.view.memory_feedback, ledger(&first).counts());
+    first
+}
+
+async fn correct(
+    h: &Harness,
+    request: archon_core::feedback::CorrectionRequest,
+) -> Result<FeedbackReceipt, archon_core::error::ArchonError> {
+    let first = feedback_common::correct(h, request).await?;
+    Ok(settled(h, first).await)
+}
+
 async fn retry(h: &Harness, first: &FeedbackReceipt) -> FeedbackReceipt {
     receipt(
         h,
@@ -118,14 +157,15 @@ async fn retry(h: &Harness, first: &FeedbackReceipt) -> FeedbackReceipt {
 }
 
 async fn undo(h: &Harness, first: &FeedbackReceipt) -> FeedbackReceipt {
-    receipt(
+    let undone = receipt(
         h,
         Request::LearningUndo {
             feedback: first.view.feedback.id.clone(),
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    settled(h, undone).await
 }
 
 fn serve_forget(fake: &FakeAether) {
@@ -302,6 +342,7 @@ async fn undo_recovers_a_lost_receipt_and_drops_never_attempted_entries() {
     pending.tasks[0].records[0].feedback = None;
     pending.tasks[0].records[1].feedback = None;
     pending.tasks[0].records[1].attempted = false;
+    pending.tasks[0].records[1].submission_horizon = None;
     receipts
         .lock()
         .unwrap()
@@ -316,14 +357,10 @@ async fn undo_recovers_a_lost_receipt_and_drops_never_attempted_entries() {
     assert_eq!(undone.view.memory_feedback.retracted, 1);
     assert_eq!(undone.view.memory_feedback.skipped, 1);
     assert!(ledger(&undone).tasks[0].records[1].dropped);
-    let commands = fake.received_named("record_memory_feedback");
-    assert_eq!(
-        commands[0]["idempotency_key"],
-        commands[2]["idempotency_key"]
-    );
+    assert_eq!(fake.received_named("resolve_submission").len(), 1);
     assert_eq!(fake.received_named("retract_memory_feedback").len(), 1);
     assert_eq!(retry(&h, &undone).await.view.memory_feedback.pending, 0);
-    assert_eq!(fake.received_named("record_memory_feedback").len(), 3);
+    assert_eq!(fake.received_named("record_memory_feedback").len(), 2);
 }
 
 #[tokio::test]
@@ -426,11 +463,8 @@ async fn lost_transport_reply_is_recovered_with_its_original_key_before_undo() {
     assert_eq!(undone.view.memory_feedback.retracted, 1);
     assert_eq!(undone.view.memory_feedback.skipped, 1);
     let commands = fake.received_named("record_memory_feedback");
-    assert_eq!(commands.len(), 2);
-    assert_eq!(
-        commands[0]["idempotency_key"],
-        commands[1]["idempotency_key"]
-    );
+    assert_eq!(commands.len(), 1);
+    assert_eq!(fake.received_named("resolve_submission").len(), 1);
     assert_eq!(receipts.lock().unwrap().len(), 1);
 }
 
