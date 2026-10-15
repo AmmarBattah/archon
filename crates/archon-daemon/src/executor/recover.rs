@@ -15,6 +15,7 @@ use archon_queue::Store;
 
 use super::{FollowUp, RunTable, finish, frozen, settle, ship, team};
 use crate::context::DaemonContext;
+use crate::resolve::RepoEnv;
 
 const RUN_VARS_KEY_PREFIX: &str = "run_vars:";
 
@@ -257,9 +258,13 @@ pub(super) async fn driver_of(
     let gates = ctx.store.lock().await.gates_for_run(&run.id)?;
     let operator_gates = OperatorGates::for_run(&spec, &item.autonomy);
     let experiments = crate::experiments::item_dir(&ctx.paths, &item.id);
+    let models = RepoEnv::load(ctx, item.repo.as_ref())
+        .await?
+        .policy(&ctx.config);
     let mut driver = RunDriver::new(Arc::new(spec), item.model_plan, vars)?
         .with_gates(operator_gates)?
-        .with_experiments(experiments);
+        .with_experiments(experiments)
+        .with_policy(models);
     for gate in gates {
         assert_eq!(gate.run, run.id, "gates_for_run returns the run's gates");
         if let Some(decision) = gate.decision {

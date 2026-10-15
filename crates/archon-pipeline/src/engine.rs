@@ -11,6 +11,7 @@ use archon_core::catalog::{StageKind, WorkspaceMode};
 use archon_core::error::ArchonError;
 use archon_core::id::{PipelineRunId, StageRunId};
 use archon_core::model::{ModelChoice, ModelPlan};
+use archon_core::policy::ModelPolicy;
 use archon_core::run::{
     GateDecision, GateSubject, PipelineRun, RunState, StageOutcome, StageRun, StageState,
 };
@@ -123,6 +124,8 @@ pub struct RunDriver {
     /// The item's directory for reviewers' experiment copies, which the
     /// contract names; `None` leaves them to `mktemp -d`.
     experiments: Option<PathBuf>,
+    /// The item's effective model policy, which reviewer advice keeps to.
+    policy: ModelPolicy,
 }
 
 /// A live role of a team group another role already failed, and why it is
@@ -231,6 +234,7 @@ impl RunDriver {
             cancelling: BTreeSet::new(),
             aborts: BTreeMap::new(),
             experiments: None,
+            policy: ModelPolicy::default(),
         };
         driver.check_prompts_render()?;
         Ok(driver)
@@ -268,6 +272,17 @@ impl RunDriver {
         );
         assert!(dir.is_absolute(), "the experiments directory is absolute");
         self.experiments = Some(dir);
+        self
+    }
+
+    /// Keep reviewer advice within `policy` when the plan names no reviewer
+    /// models; without it any model is taken to be allowed.
+    pub fn with_policy(mut self, policy: ModelPolicy) -> Self {
+        assert!(
+            self.emitted.is_empty() && !self.finished,
+            "the policy is set before the driver acts"
+        );
+        self.policy = policy;
         self
     }
 
@@ -1164,11 +1179,13 @@ impl RunDriver {
                 let part = self.team_part(team.as_ref());
                 let workspace = &vars["workspace"];
                 let experiments = self.experiments.as_deref();
+                let choice = &choices[fan as usize % choices.len()];
                 let mut instructions =
                     contract::instructions(stage, mode, workspace, part, owed, experiments);
                 if owed.review.is_some_and(|duty| duty.reviewers > 0) {
                     let named = self.plan.reviewer_choices();
-                    instructions.push_str(&contract::reviewer_model_rules(named));
+                    let rules = contract::reviewer_model_rules(named, &choice.model, &self.policy);
+                    instructions.push_str(&rules);
                 }
                 EngineAction::Spawn(SpawnPlan {
                     stage_id: stage.id.clone(),
@@ -1176,7 +1193,7 @@ impl RunDriver {
                     attempt: at.attempt,
                     fan_index: fan,
                     fan_count: stage.fan_out,
-                    choice: choices[fan as usize % choices.len()].clone(),
+                    choice: choice.clone(),
                     prompt,
                     instructions,
                     timeout_minutes: stage.timeout_minutes,

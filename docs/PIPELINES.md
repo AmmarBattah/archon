@@ -267,7 +267,8 @@ A `model_plan` (and `model_reasons`) may name the reviewers with the key
 reviewers taking them in turn. Delegate with role exactly `reviewer`
 (case-insensitive): Archon cancels such a child on any other model, a higher
 effort, or missing or unrecognised effort. Without the key the
-lead is told to use a model other than its own whose cost Aether reports.
+lead is told to use a model the item's policy allows other than its own, or
+its own when the policy allows no other.
 
 Such a pipeline takes its review level from the item, not from its
 manifest. An item's `review` knob chooses `none`, `standard` or `strict`,

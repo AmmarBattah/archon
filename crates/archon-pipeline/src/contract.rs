@@ -5,7 +5,8 @@
 use std::path::Path;
 
 use archon_core::catalog::{Gate, StageKind, WorkspaceMode};
-use archon_core::model::ModelChoice;
+use archon_core::model::{ModelChoice, ModelRef};
+use archon_core::policy::ModelPolicy;
 use archon_core::run::StageOutcome;
 use serde::Serialize;
 
@@ -401,26 +402,71 @@ fn review_rules(duty: ReviewDuty) -> String {
     rules
 }
 
-/// Which models the review-holding stage delegates its reviewers to: the
-/// plan's, which the daemon enforces, or advice when the plan names none.
-pub fn reviewer_model_rules(named: Option<&[ModelChoice]>) -> String {
+/// Which models the review-holding stage, on `own`, delegates its reviewers to:
+/// the plan's, which the daemon enforces, or else ones `policy` allows.
+pub fn reviewer_model_rules(
+    named: Option<&[ModelChoice]>,
+    own: &ModelRef,
+    policy: &ModelPolicy,
+) -> String {
     match named {
-        Some(choices) if !choices.is_empty() => {
-            let models: Vec<String> = choices
-                .iter()
-                .map(|c| format!("{} at effort {}", c.model, c.effort))
-                .collect();
-            format!(
-                "- Delegate every reviewer with role `reviewer`, each on one of these models, \
-                 taken in turn: {}. Archon cancels a child labelled `reviewer` on any other.\n",
-                models.join("; ")
-            )
-        }
-        _ => "- Delegate every reviewer with role `reviewer`, on a model other than yours \
-              that reports its dollar cost (Claude Code models do; Codex usage is only an \
-              API-equivalent estimate, which Aether's dollar caps do not count).\n"
-            .to_owned(),
+        Some(choices) if !choices.is_empty() => named_reviewer_rules(choices),
+        _ => fallback_reviewer_rules(own, policy),
     }
+}
+
+fn named_reviewer_rules(choices: &[ModelChoice]) -> String {
+    let models: Vec<String> = choices
+        .iter()
+        .map(|c| format!("{} at effort {}", c.model, c.effort))
+        .collect();
+    format!(
+        "- Delegate every reviewer with role `reviewer`, each on one of these models, \
+         taken in turn: {}. Archon cancels a child labelled `reviewer` on any other.\n",
+        models.join("; ")
+    )
+}
+
+/// A model other than `own` where `policy` allows one, else `own`: advice
+/// that names only what the daemon lets a reviewer run on.
+fn fallback_reviewer_rules(own: &ModelRef, policy: &ModelPolicy) -> String {
+    let Some(allowed) = &policy.allow else {
+        return format!(
+            "- Delegate every reviewer with role `reviewer`, on a model other than yours \
+             within the model policy: {}.\n",
+            policy.describe()
+        );
+    };
+    let others: Vec<&ModelRef> = allowed
+        .iter()
+        .filter(|m| *m != own && policy.permits_model(m))
+        .collect();
+    debug_assert!(
+        !others.contains(&own),
+        "the lead's model is offered only alone"
+    );
+    let cap = match policy.max_effort {
+        Some(cap) => format!(", at effort at most {cap}"),
+        None => String::new(),
+    };
+    let rules = match others.is_empty() {
+        // When `own` is refused too, the spawn carrying this is refused first.
+        true => format!(
+            "- Delegate every reviewer with role `reviewer`, on your own model {own}{cap}: \
+             this item allows no other.\n"
+        ),
+        false => format!(
+            "- Delegate every reviewer with role `reviewer`, on one of {}{cap}: the models \
+             this item allows other than yours.\n",
+            others
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    debug_assert!(rules.ends_with('\n'), "sections end with a newline");
+    rules
 }
 
 const NO_REVIEW_RULES: &str = "\n## Review on record\n\n\
@@ -1176,8 +1222,12 @@ mod tests {
         )
     }
 
+    fn model(name: &str) -> ModelRef {
+        name.parse().unwrap()
+    }
+
     #[test]
-    fn reviewers_get_the_plan_s_models_or_advice_for_a_different_priced_one() {
+    fn reviewers_get_the_plan_s_models_whatever_the_policy() {
         let choice = |model: &str, effort| ModelChoice {
             model: model.parse().unwrap(),
             effort,
@@ -1187,16 +1237,62 @@ mod tests {
             choice("claude-code/opus", archon_core::model::Effort::Medium),
             choice("claude-code/haiku", archon_core::model::Effort::Low),
         ];
-        let rules = reviewer_model_rules(Some(&named));
+        let own = model("claude-code/opus");
+        let rules = reviewer_model_rules(Some(&named), &own, &ModelPolicy::default());
         assert!(rules.contains("role `reviewer`"), "{rules}");
         assert!(
             rules.contains("claude-code/opus at effort medium; claude-code/haiku at effort low")
         );
         assert!(rules.contains("Archon cancels a child labelled `reviewer` on any other"));
-        for unnamed in [reviewer_model_rules(None), reviewer_model_rules(Some(&[]))] {
-            assert!(unnamed.contains("a model other than yours"), "{unnamed}");
-            assert!(unnamed.contains("reports its dollar cost"), "{unnamed}");
+    }
+
+    /// The bench's smoke preset allows one model: a reviewer must run on it,
+    /// not be sent to one the daemon cancels.
+    #[test]
+    fn a_single_model_allowlist_keeps_reviewers_on_the_lead_s_model() {
+        let own = model("claude-code/claude-haiku-5-5");
+        let only = ModelPolicy::from_lists(
+            std::slice::from_ref(&own),
+            &[],
+            Some(archon_core::model::Effort::Medium),
+        );
+        for unnamed in [None, Some(&[][..])] {
+            let rules = reviewer_model_rules(unnamed, &own, &only);
+            assert!(
+                rules.contains(
+                    "on your own model claude-code/claude-haiku-5-5, at effort at most medium"
+                ),
+                "{rules}"
+            );
+            assert!(!rules.contains("other than yours"), "{rules}");
+            assert!(!rules.contains("Codex"), "{rules}");
         }
+        let denied = ModelPolicy::from_lists(
+            &[own.clone(), model("codex/luna")],
+            &[model("codex/luna")],
+            None,
+        );
+        let rules = reviewer_model_rules(None, &own, &denied);
+        assert!(rules.contains("on your own model"), "{rules}");
+        assert!(!rules.contains("codex/luna"), "{rules}");
+    }
+
+    #[test]
+    fn a_wider_allowlist_prefers_another_model_and_an_open_one_states_the_policy() {
+        let own = model("claude-code/opus");
+        let allow = [own.clone(), model("claude-code/haiku"), model("codex/luna")];
+        let wide = ModelPolicy::from_lists(&allow, &[model("codex/luna")], None);
+        let rules = reviewer_model_rules(None, &own, &wide);
+        assert!(rules.contains("on one of claude-code/haiku: "), "{rules}");
+        assert!(!rules.contains("claude-code/opus"), "{rules}");
+        assert!(!rules.contains("codex/luna"), "{rules}");
+        let open = ModelPolicy::from_lists(&[], &[model("codex/luna")], None);
+        let rules = reviewer_model_rules(None, &own, &open);
+        assert!(rules.contains("on a model other than yours"), "{rules}");
+        assert!(
+            rules.contains("any model Aether lists except codex/luna"),
+            "{rules}"
+        );
     }
 
     #[test]
