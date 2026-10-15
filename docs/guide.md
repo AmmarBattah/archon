@@ -574,8 +574,10 @@ number picks that option.
   already answered number, or an answer that was refused comes back with the
   reason, in the same chat and as a system notice in `archon log`.
 - Only your own message counts: one Aether authenticated as the `user`
-  actor. An agent's message, a relay, a GitHub request, and a `/answer`
-  quoted inside other text answer nothing. The orchestrator has no tool that
+  actor, or a GitHub request from a listed operator login
+  ([Operator authority](operator-authority.md)). An agent's message, a
+  relay, any other GitHub request, and a `/answer` quoted inside other text
+  answer nothing. The orchestrator has no tool that
   answers a gate.
 - A plain reply to a question the orchestrator asked itself (`ask_operator`)
   works as before, and the orchestrator now records it, so the question
@@ -673,7 +675,7 @@ progress too; also `/verbose`), `/pause` and `/resume` (optionally `hard`,
 | `archon queue wait <id>… [--timeout 30m]` | wait for every item to become terminal, bounded to 30m by default; exit 0 all succeeded, 3 failed/cancelled, 4 timeout, 5 failed/cancelled dependency |
 | `archon queue list` | one line per item: state, current stage, age, cost, title, PR URL and derived waiting reason with one next action |
 | `archon queue show <id> [--full]` | an item's runs and each stage's attempt, slot, state, verdict, model, agent, cost and summary (first lines; `--full` for all), with the PR URL, recorded plan reasons and full waiting explanation when present. A stage that delegated shows how its cost splits (its own agent, then each delegated agent with model, effort and cost), and a stage holding a declared review shows the review on record. Steers made to the item are listed with who made them |
-| `archon queue cancel <id>` / `archon queue caps` | cancel an item, or show and change runtime caps |
+| `archon queue cancel <id>` / `archon queue caps` | cancel an item, or show and change saved operator caps |
 | `archon queue retry <id> [--fresh] [--append "…"]` | queue a finished item again in its worktree and branch (a succeeded one delivers into its pull request again, and the retry counts against the run that passed); `--fresh` starts over from the base branch on a new branch and sets the old worktree aside, which worktree gc deletes, uncommitted work included, `worktrees.gc_after` (7 days) after the item's last run; `--append` adds guidance to the brief |
 | `archon queue refresh <id>` | merge a finished item's base branch, fetched from `origin`, into its branch: a new item resolves any conflicts, runs the checks, is reviewed from the new merge base and updates the same pull request (never a rebase or a second pull request) |
 | `archon queue steer <id> [--note "…"] [--stage <stage>] [--model <provider/model>] [--effort <effort>] [--budget-usd <usd>] [--extend <minutes>] [--abort [--then retry\|skip] [--goto <stage>]] [--remove <stage>] [--insert <stage> [--from <pipeline>] [--after <stage>]] [--switch <pipeline>]` | change an item without cancelling it; see [steering an item](#steering-an-item) |
@@ -757,7 +759,7 @@ means the planner would admit it on the next pass; status separately reports
 Aether disconnection, which stops dispatch.
 
 `archon queue caps --budget-daily <usd>` and `--budget-total <usd>` raise
-runtime budgets until archond restarts (0 removes the limit);
+saved budgets until the global settings overlay is reset (0 removes the limit);
 `--budgets off` stops enforcing every dollar budget until then (set
 `budgets_enabled = false` under `[limits]` to make it permanent), and
 `--budgets on` enforces them again. Spend is recorded either way. Daily budgets
@@ -1033,6 +1035,16 @@ GitHub request, agent or MCP tool can. After an upgrade, run
 while the orchestrator that takes GitHub requests runs older instructions,
 which do not know operator standing. See
 [Operator logins](github-watcher.md#operator-logins).
+
+Authority is checked by archond, not by the model. Whole-message commands
+(`/answer`, `/approve`, `/reject`, `/merge`, `/archon set --repo …`,
+`/archon pause --hard`, `/archon repo remove`, `/archon undo N`) work from
+your chat and from a listed GitHub operator. In prose, the orchestrator
+cites your message with `request_authority`; a change that loosens a limit
+comes back as a question only you can answer, and applies only if nothing
+changed meanwhile. Every use is in the feed as an Authority entry, and
+repository and caps changes can be undone. See
+[Operator authority](operator-authority.md).
 
 
 ## Schedules

@@ -460,6 +460,7 @@ pub fn context(
     };
     create_context_dirs(&paths);
     let store = Store::open(&paths.store).expect("store");
+    let operator_settings = archon_daemon::settings::SettingsBook::load(&store).expect("settings");
     let (feed, _) = broadcast::channel(1024);
     let dispatch = Arc::new(Notify::new());
     DaemonContext {
@@ -475,6 +476,7 @@ pub fn context(
         runs: Mutex::new(RunTable::default()),
         replies: Mutex::new(ReplyTracker::default()),
         answering: Mutex::new(()),
+        authority_changes: Mutex::new(()),
         learning_memory: Mutex::new(()),
         memory_curation: Mutex::new(()),
         memory_feedback_ready: Notify::new(),
@@ -482,7 +484,7 @@ pub fn context(
         triggers: TriggerQueue::default(),
         mirrors: archon_daemon::mirror::MirrorQueue::default(),
         spawn_recorded: Notify::new(),
-        caps_override: Mutex::new(None),
+        operator_settings: std::sync::Mutex::new(operator_settings),
         lavish,
         supervisor: archon_daemon::supervisor::Supervisor::default(),
         github: archon_daemon::github::GithubState::default(),

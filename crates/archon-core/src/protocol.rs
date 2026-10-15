@@ -49,7 +49,8 @@ use crate::steer::Steer;
 /// archond would register a repository and silently leave it unwatched.
 /// 12: merging on the operator's request (`merge_item`, `request_merge`) and
 /// a repository's `grant_merge`, which an older archond would drop.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13: daemon-verified operator authority requests and settings.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Said beside an item whose `budget_usd` was set while budgets are off.
 pub const BUDGETS_OFF_NOTE: &str = "Dollar budgets are globally off ([limits] budgets_enabled = \
@@ -142,6 +143,9 @@ pub enum Request {
         client_version: String,
     },
     Status,
+    Guide {
+        topic: String,
+    },
     /// CLI only.
     Shutdown,
 
@@ -200,9 +204,26 @@ pub enum Request {
     },
     Pause(PauseTarget),
     Resume(PauseTarget),
-    /// CLI only; runtime cap overrides until the daemon restarts.
+    /// Operator only; persisted in the global settings overlay.
     SetCaps {
         caps: Caps,
+    },
+    /// The operator settings stored for a repository, or globally, and the
+    /// values in force with their sources.
+    Settings {
+        #[serde(default)]
+        repo: Option<RepoRef>,
+    },
+    /// Operator only: replace the overlay stored at one scope whole.
+    SetSettings {
+        #[serde(default)]
+        repo: Option<RepoRef>,
+        settings: crate::settings::OperatorSettings,
+    },
+    /// Operator only: forget the overlay stored at one scope.
+    ResetSettings {
+        #[serde(default)]
+        repo: Option<RepoRef>,
     },
 
     ListPipelines {
@@ -401,9 +422,22 @@ pub enum Request {
         #[serde(default)]
         chat: bool,
     },
-    /// The orchestrator asks to merge an item's pull request because the
-    /// operator asked it to: archond asks the operator to confirm, unless
-    /// the repository's `grant_merge` lets it merge at once.
+    /// Whole-message command on the operator socket; never exposed over MCP.
+    OperatorCommand {
+        text: String,
+    },
+    UndoAuthority {
+        change: u64,
+    },
+    /// The orchestrator cites a message observed on archond's own stream.
+    RequestAuthority {
+        action: Box<Request>,
+        utterance: u64,
+        quote: String,
+        reason: String,
+        caller: Option<AetherAgentId>,
+    },
+    /// Request a merge; archond confirms unless `grant_merge` permits it.
     RequestMerge {
         item: QueueItemId,
         /// What the operator said, in a line.
@@ -417,10 +451,14 @@ impl Request {
     /// agent, whichever client forwards them.
     pub fn is_operator_only(&self) -> bool {
         match self {
-            Self::Shutdown
+            Self::OperatorCommand { .. }
+            | Self::UndoAuthority { .. }
+            | Self::Shutdown
             | Self::RepoRemove { .. }
             | Self::RepoUpdate { .. }
             | Self::SetCaps { .. }
+            | Self::SetSettings { .. }
+            | Self::ResetSettings { .. }
             | Self::Say { .. }
             | Self::OrchestratorRestart
             | Self::OrchestratorAttach
@@ -450,6 +488,7 @@ impl Request {
         match self {
             Self::Hello { .. }
             | Self::Status
+            | Self::Guide { .. }
             | Self::RepoList
             | Self::ListItems(_)
             | Self::ListItemSummaries(_)
@@ -466,6 +505,7 @@ impl Request {
             | Self::CostReport(_)
             | Self::ModelEvidence(_)
             | Self::Autonomy { .. }
+            | Self::Settings { .. }
             | Self::GithubWatcher
             | Self::ListInitiatives
             | Self::GetInitiative { .. }
@@ -598,6 +638,9 @@ pub struct ItemPatch {
     /// item's live agents are sent it (ARCHITECTURE §6.6).
     #[serde(default)]
     pub brief_append: Option<String>,
+    /// Knobs to change, within the item's ceiling (ARCHITECTURE §18.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy: Option<AutonomyPatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,6 +664,9 @@ pub enum PauseTarget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "reply", content = "data", rename_all = "snake_case")]
 pub enum Reply {
+    Guide {
+        text: String,
+    },
     MessageReceipt {
         receipt: crate::id::FeedItemId,
     },
@@ -676,6 +722,7 @@ pub enum Reply {
     Feedback(Box<FeedbackReceipt>),
     LearningWhy(Box<LearningWhy>),
     Merge(Box<MergeRequest>),
+    Settings(Box<crate::settings::SettingsView>),
 }
 
 /// What one gc pass did (ARCHITECTURE §13.2). Paths are real paths.

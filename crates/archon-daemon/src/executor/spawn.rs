@@ -15,7 +15,7 @@ use archon_core::error::ArchonError;
 use archon_core::id::{PipelineRunId, QueueItemId, StageRunId};
 use archon_core::lesson::CONTRACT_LESSONS;
 use archon_core::ports::{SpawnRequest, SpawnedAgent};
-use archon_core::queue::{Caps, QueueItem};
+use archon_core::queue::QueueItem;
 use archon_core::repo::Repo;
 use archon_core::run::{PipelineRun, StageOutcome, StageRun, StageState};
 use archon_pipeline::SpawnPlan;
@@ -230,12 +230,15 @@ pub(crate) fn deadline(start: Timestamp, timeout_minutes: u32) -> Timestamp {
 
 /// What is left of the item's budget (its own, else the per-item cap);
 /// `None` when neither is set or budgets are switched off.
+/// What is left of `item`'s budget under its repository's caps; `None`
+/// when nothing bounds it.
 pub(crate) fn budget_left(
+    ctx: &DaemonContext,
     store: &Store,
     item: &QueueItem,
-    caps: &Caps,
     estimates: bool,
 ) -> Result<Option<f64>, ArchonError> {
+    let caps = resolve::item_caps(ctx, item.repo.as_ref());
     if !caps.budgets_enabled {
         return Ok(None);
     }
@@ -270,10 +273,9 @@ pub(super) async fn reserve(
     if queue.is_empty() {
         table.pending.remove(run);
     }
-    let caps = resolve::caps(ctx).await;
     let reserved = {
         let mut store = ctx.store.lock().await;
-        reserve_plans(ctx, &mut store, run, plans, &caps)?
+        reserve_plans(ctx, &mut store, run, plans)?
     };
     match reserved {
         Ok(ids) => Ok(FollowUp {
@@ -292,7 +294,6 @@ fn reserve_plans(
     store: &mut Store,
     run_id: &PipelineRunId,
     plans: Vec<SpawnPlan>,
-    caps: &Caps,
 ) -> Result<Result<Vec<StageRunId>, Exhausted>, ArchonError> {
     let run = store.run(run_id)?;
     if run.state.is_terminal() || plans.is_empty() {
@@ -305,7 +306,7 @@ fn reserve_plans(
         .map(|id| store.repo(&resolve::repo_ref(id)))
         .transpose()?;
     let estimates = ctx.config.limits.count_estimated_cost;
-    let budget = budget_left(store, &item, caps, estimates)?;
+    let budget = budget_left(ctx, store, &item, estimates)?;
     if let Some(left) = budget.filter(|left| *left <= 0.0) {
         let error = format!(
             "BLOCKED: the item's budget is used up ({} over); raise it with update_item or retry",
@@ -620,7 +621,6 @@ pub(super) fn reserve_replacement(
     failed: &StageRun,
     plan: &SpawnPlan,
     retry: usize,
-    caps: &Caps,
 ) -> Result<Option<StageRunId>, ArchonError> {
     assert!(
         same_slot(failed, plan),
@@ -631,7 +631,7 @@ pub(super) fn reserve_replacement(
     assert!(!run.state.is_terminal(), "replacements join live runs only");
     let item = store.item(&run.item)?;
     let estimates = ctx.config.limits.count_estimated_cost;
-    let budget = budget_left(store, &item, caps, estimates)?;
+    let budget = budget_left(ctx, store, &item, estimates)?;
     if budget.is_some_and(|left| left <= 0.0) {
         return Ok(None);
     }
@@ -651,7 +651,7 @@ pub(super) fn reserve_replacement(
         experiments: &experiments,
     };
     // An earlier grant is not enforced once budgets are off.
-    let budget = match caps.budgets_enabled {
+    let budget = match resolve::item_caps(ctx, item.repo.as_ref()).budgets_enabled {
         true => replacement_budget(store, failed, plan, budget, estimates)?,
         false => Some(None),
     };
@@ -824,9 +824,14 @@ async fn resume_or_spawn(
 ) -> Result<Issued, ArchonError> {
     // A grant reserved while budgets were on is dropped once they are off.
     let granted = spawn.request.cost_budget_usd.is_some();
+    let repo = {
+        let store = ctx.store.lock().await;
+        let run = store.run(&stage.run)?;
+        store.item(&run.item)?.repo
+    };
     if granted
         && spawn.parent == ParentBinding::Pending
-        && !resolve::caps(ctx).await.budgets_enabled
+        && !resolve::item_caps(ctx, repo.as_ref()).budgets_enabled
     {
         spawn.request.cost_budget_usd = None;
         spawn.request.aether_cost_budget = None;

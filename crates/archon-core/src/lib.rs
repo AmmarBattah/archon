@@ -11,6 +11,7 @@
 pub mod aether_ids;
 pub mod age;
 pub mod agent_message;
+pub mod authority;
 pub mod autonomy;
 pub mod catalog;
 pub mod config;
@@ -36,6 +37,7 @@ pub mod protocol;
 pub mod queue;
 pub mod repo;
 pub mod run;
+pub mod settings;
 pub mod steer;
 #[cfg(feature = "testing")]
 pub mod testing;
