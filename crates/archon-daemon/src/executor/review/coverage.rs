@@ -2,7 +2,8 @@
 //! it: a counted pass read the head, or later passes read every commit since.
 //! A verdict on a commit the branch no longer holds (amended or rebased away)
 //! is superseded: it never counts, and a superseded fail stands until the
-//! counted passes read the whole change.
+//! counted passes read the whole change. A named delta read no named one
+//! anchors may rest on the lead's earlier reviewers, which Archon adds itself.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,10 +17,12 @@ use crate::worktree::stack::is_commit_id;
 /// Commits a refusal names, shortened past this many digits.
 const SHOWN_DIGITS: usize = 12;
 
-/// One named reviewer's verdict, its commits resolved in the run's workspace.
+/// One reviewer's verdict, its commits resolved in the run's workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Placed {
     pub agent: String,
+    /// The lead named it; an earlier reviewer it did not name only anchors.
+    pub named: bool,
     pub pass: bool,
     pub head: String,
     /// Where the diff it read starts; `None` when it read the whole change.
@@ -57,26 +60,36 @@ impl<'a> History<'a> {
     }
 }
 
-/// The branch head and each verdict on its commits, or why a verdict names
-/// commits the branch does not hold. `base_branch` gives the fork point.
+/// The branch head and each verdict on its commits, `named` first, or why a named one is
+/// not on the branch (an `earlier` one is left out). `base_branch` gives the fork point.
 pub(super) fn place(
     history: &mut History,
     base_branch: &str,
     named: &[(String, Verdict)],
+    earlier: &[(String, Verdict)],
 ) -> Result<Result<(String, Vec<Placed>), String>, ArchonError> {
     let dir = history.dir;
     let Some(head) = worktree::commit_id(dir, "HEAD")? else {
         return Ok(Err("the run's workspace has no commit to review".into()));
     };
     let fork = fork_point(dir, base_branch, &head)?;
-    let mut placed = Vec::with_capacity(named.len());
+    let mut placed = Vec::with_capacity(named.len() + earlier.len());
     for (agent, verdict) in named {
         match place_one(history, &head, fork.as_deref(), agent, verdict)? {
             Ok(read) => placed.push(read),
             Err(why) => return Ok(Err(format!("reviewer {agent} {why}"))),
         }
     }
-    assert_eq!(placed.len(), named.len(), "every verdict is placed");
+    assert_eq!(placed.len(), named.len(), "every named verdict is placed");
+    for (agent, verdict) in earlier {
+        match place_one(history, &head, fork.as_deref(), agent, verdict)? {
+            Ok(read) => placed.push(Placed {
+                named: false,
+                ..read
+            }),
+            Err(why) => tracing::debug!(%agent, %why, "an earlier reviewer anchors nothing"),
+        }
+    }
     assert!(
         placed.iter().all(|read| is_commit_id(&read.head)),
         "every placed head is a full commit id"
@@ -146,6 +159,7 @@ fn place_one(
     assert!(is_commit_id(&read), "git names the commit read in full");
     let placed = |head: String, base: Option<String>, superseded: bool| Placed {
         agent: agent.to_owned(),
+        named: true,
         pass: verdict.pass,
         head,
         base,
@@ -178,14 +192,22 @@ fn place_one(
     Ok(Ok(placed(read, (!whole).then_some(base), false)))
 }
 
-/// Indexes of the `placed` passes that hold for the branch at `head`, or
-/// why the verdicts do not make `owed` of them. A fail never counts.
+/// What makes a review: the named passes that hold, by index in the placed
+/// reads, and the earlier reviewers Archon added to anchor named delta reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Held {
+    pub passes: Vec<usize>,
+    pub implicit: Vec<String>,
+}
+
+/// The `placed` passes that hold for the branch at `head`, or why the
+/// verdicts do not make `owed` named ones. A fail never counts.
 pub(super) fn counted(
     history: &mut impl Ancestry,
     placed: &[Placed],
     head: &str,
     owed: u32,
-) -> Result<Result<Vec<usize>, String>, ArchonError> {
+) -> Result<Result<Held, String>, ArchonError> {
     assert!(owed >= 1, "only an owed review is checked");
     assert!(
         placed
@@ -193,38 +215,125 @@ pub(super) fn counted(
             .all(|read| !read.superseded || read.base.is_none()),
         "a superseded read keeps no base"
     );
+    let in_play = match in_play(history, placed)? {
+        Ok(in_play) => in_play,
+        Err(why) => return Ok(Err(why)),
+    };
+    let reads: Vec<Placed> = in_play.iter().map(|i| placed[*i].clone()).collect();
+    let passes = match judged(history, &reads, head, owed)? {
+        Ok(passes) => passes,
+        Err(why) => return Ok(Err(why)),
+    };
+    let passes: Vec<usize> = passes.into_iter().map(|i| in_play[i]).collect();
+    assert!(
+        passes.iter().all(|i| placed[*i].named),
+        "only a named pass counts toward the review"
+    );
+    let implicit = reads.into_iter().filter(|read| !read.named);
+    Ok(Ok(Held {
+        passes,
+        implicit: implicit.map(|read| read.agent).collect(),
+    }))
+}
+
+/// Why a named read in `placed` is refused when no named read anchors it and
+/// the lead's earlier reviewers are not read; `None` when every one is anchored.
+pub(super) fn unanchored_named(
+    history: &mut impl Ancestry,
+    placed: &[Placed],
+) -> Result<Option<String>, ArchonError> {
+    let named = named_count(placed);
+    let alone = anchored(history, &placed[..named])?;
+    let stray = alone.iter().position(|held| !held);
+    Ok(stray.map(|stray| unanchored(&placed[stray], false)))
+}
+
+/// Indexes of the reads coverage rests on: the named ones, and when one of
+/// those is unanchored, every earlier read anchored with them. `Err` says which is not.
+fn in_play(
+    history: &mut impl Ancestry,
+    placed: &[Placed],
+) -> Result<Result<Vec<usize>, String>, ArchonError> {
+    let named = named_count(placed);
+    let alone = anchored(history, &placed[..named])?;
+    if !alone.contains(&false) {
+        return Ok(Ok((0..named).collect()));
+    }
+    let with_earlier = anchored(history, placed)?;
+    if let Some(stray) = with_earlier[..named].iter().position(|held| !held) {
+        return Ok(Err(unanchored(&placed[stray], true)));
+    }
+    // An earlier read nothing anchors read only part of the change: it is left out.
+    let kept: Vec<usize> = (0..placed.len()).filter(|i| with_earlier[*i]).collect();
+    assert!(kept.len() > named, "an earlier read anchors a named one");
+    Ok(Ok(kept))
+}
+
+/// How many reads lead `placed`, all named: the earlier ones follow them.
+fn named_count(placed: &[Placed]) -> usize {
+    let named = placed.iter().take_while(|read| read.named).count();
+    assert!(
+        placed[named..].iter().all(|read| !read.named),
+        "named reads come first"
+    );
+    named
+}
+
+/// For each of `reads`, whether it read the whole change or from a commit
+/// another of them read the change up to.
+fn anchored(history: &mut impl Ancestry, reads: &[Placed]) -> Result<Vec<bool>, ArchonError> {
     // What a superseded read covered is not on the branch, so it anchors nothing.
-    let anchored = spread(
-        placed,
+    spread(
+        reads,
         |_, read| read.base.is_none(),
         |read, by| {
             let base = read.base.as_deref().expect("unanchored reads have a base");
             Ok(!by.superseded && history.holds(base, &by.head)?)
         },
-    )?;
-    if let Some((read, _)) = placed.iter().zip(&anchored).find(|(_, held)| !**held) {
-        let base = short(read.base.as_deref().expect("a stray read has a base"));
-        return Ok(Err(format!(
-            "reviewer {} read only from {base}, and no reviewer named read the change up to it",
-            read.agent
-        )));
-    }
+    )
+}
+
+/// Why the named `read` is unanchored, by its own or, once `earlier_read`,
+/// the lead's earlier reviewers.
+fn unanchored(read: &Placed, earlier_read: bool) -> String {
+    assert!(read.named, "only a named read is refused for its anchor");
+    let base = short(read.base.as_deref().expect("a stray read has a base"));
+    let by = match earlier_read {
+        true => "no reviewer named, nor any earlier one of this attempt,",
+        false => "no reviewer named",
+    };
+    format!(
+        "reviewer {} read only from {base}, and {by} read the change up to it",
+        read.agent
+    )
+}
+
+/// Indexes of the anchored `reads` whose named passes hold for the branch
+/// at `head`, or why they are not `owed` passes with every fail answered.
+fn judged(
+    history: &mut impl Ancestry,
+    reads: &[Placed],
+    head: &str,
+    owed: u32,
+) -> Result<Result<Vec<usize>, String>, ArchonError> {
     let current = spread(
-        placed,
+        reads,
         |_, read| read.pass && read.head == head,
         |read, by| Ok(read.pass && !read.superseded && covers(history, by, &read.head)?),
     )?;
-    let passes: Vec<usize> = (0..placed.len()).filter(|i| current[*i]).collect();
+    let passes: Vec<usize> = (0..reads.len())
+        .filter(|i| current[*i] && reads[*i].named)
+        .collect();
     assert!(
         passes
             .iter()
-            .all(|i| placed[*i].pass && !placed[*i].superseded),
+            .all(|i| reads[*i].pass && !reads[*i].superseded),
         "only a pass of a commit the branch holds counts"
     );
     if passes.len() < owed as usize {
-        return Ok(Err(short_of(placed, &current, owed)));
+        return Ok(Err(short_of(reads, &current, passes.len(), owed)));
     }
-    if let Some(why) = open_fail(history, placed, &current)? {
+    if let Some(why) = open_fail(history, reads, &current)? {
         return Ok(Err(why));
     }
     Ok(Ok(passes))
@@ -364,10 +473,10 @@ fn reads_past(
     Ok(later && covers(history, by, &earlier.head)?)
 }
 
-/// Why too few passes count, naming each that no longer holds.
-fn short_of(placed: &[Placed], current: &[bool], owed: u32) -> String {
-    let counted = current.iter().filter(|held| **held).count();
+/// Why only `counted` named passes count, naming each read that no longer holds.
+fn short_of(placed: &[Placed], current: &[bool], counted: usize, owed: u32) -> String {
     assert!(counted < owed as usize, "only a short review is refused");
+    assert_eq!(placed.len(), current.len(), "one mark per read");
     let stale: Vec<String> = placed
         .iter()
         .zip(current)
@@ -416,6 +525,7 @@ mod tests {
     fn read(agent: &str, pass: bool, head: &str, base: Option<&str>) -> Placed {
         Placed {
             agent: agent.into(),
+            named: true,
             pass,
             head: head.into(),
             base: base.map(Into::into),
@@ -431,8 +541,20 @@ mod tests {
         }
     }
 
-    fn count(placed: &[Placed], head: &str, owed: u32) -> Result<Vec<usize>, String> {
+    /// A read by a reviewer the lead delegated to earlier and did not name.
+    fn earlier(agent: &str, pass: bool, head: &str, base: Option<&str>) -> Placed {
+        Placed {
+            named: false,
+            ..read(agent, pass, head, base)
+        }
+    }
+
+    fn held(placed: &[Placed], head: &str, owed: u32) -> Result<Held, String> {
         counted(&mut Line, placed, head, owed).unwrap()
+    }
+
+    fn count(placed: &[Placed], head: &str, owed: u32) -> Result<Vec<usize>, String> {
+        held(placed, head, owed).map(|held| held.passes)
     }
 
     #[test]
@@ -550,7 +672,7 @@ mod tests {
         assert_eq!(count(&fail_anchored, "c4", 3).unwrap(), [1, 2, 3]);
         let unanchored = count(&fail_anchored[1..2], "c4", 1).unwrap_err();
         assert!(
-            unanchored.contains("no reviewer named read the change up to it"),
+            unanchored.contains("nor any earlier one of this attempt, read the change up to it"),
             "{unanchored}"
         );
     }
@@ -595,5 +717,89 @@ mod tests {
         assert_eq!(count(&chain, "c4", 1).unwrap(), [1, 2]);
         let whole = [gone("agt_a", false, "x3"), read("agt_b", true, "c4", None)];
         assert_eq!(count(&whole, "c4", 1).unwrap(), [1]);
+    }
+
+    /// The holder named only its last delta reviewers; the whole-change pass
+    /// and the delta between came from reviewers it delegated earlier.
+    #[test]
+    fn an_unnamed_earlier_review_anchors_a_named_delta_chain() {
+        let reads = [
+            read("agt_d1", true, "c5", Some("c4")),
+            read("agt_d2", true, "c5", Some("c4")),
+            earlier("agt_whole", true, "c3", None),
+            earlier("agt_mid", true, "c4", Some("c3")),
+        ];
+        let found = held(&reads, "c5", 2).unwrap();
+        assert_eq!(found.passes, [0, 1], "only named passes count");
+        assert_eq!(found.implicit, ["agt_whole", "agt_mid"]);
+        let short = count(&reads, "c5", 3).unwrap_err();
+        assert!(short.starts_with("2 of the reviewers named"), "{short}");
+        let named = held(&reads[..2], "c5", 1).unwrap_err();
+        assert!(
+            named.contains("agt_d1 read only from c4, and no reviewer named"),
+            "{named}"
+        );
+        let stray = unanchored_named(&mut Line, &reads).unwrap().unwrap();
+        assert!(
+            stray.ends_with("no reviewer named read the change up to it"),
+            "{stray}"
+        );
+        let gap = held(&[reads[0].clone(), reads[2].clone()], "c5", 1).unwrap_err();
+        assert!(gap.contains("agt_d1 read only from c4"), "{gap}");
+        let whole = [read("agt_a", true, "c5", None), reads[2].clone()];
+        let unneeded = held(&whole, "c5", 1).unwrap();
+        assert!(unneeded.implicit.is_empty(), "added only when needed");
+        assert_eq!(unanchored_named(&mut Line, &whole).unwrap(), None);
+    }
+
+    #[test]
+    fn an_earlier_fail_that_anchors_a_delta_stands_until_a_pass_covers_it() {
+        let answered = [
+            read("agt_delta", true, "c5", Some("c4")),
+            earlier("agt_fail", false, "c4", None),
+        ];
+        assert_eq!(count(&answered, "c5", 1).unwrap(), [0]);
+        let open = [
+            read("agt_delta", true, "c5", Some("c4")),
+            earlier("agt_fail", false, "c4", None),
+            earlier("agt_late", false, "c5", None),
+        ];
+        let refused = count(&open, "c5", 1).unwrap_err();
+        assert!(
+            refused.contains("agt_late failed the change at c5"),
+            "{refused}"
+        );
+    }
+
+    /// An amend took `x2` and `x3` off the branch: what read them anchors nothing,
+    /// and a fail of one stands until a pass reads the whole change since.
+    #[test]
+    fn an_earlier_read_of_an_amended_commit_anchors_nothing() {
+        let unnamed = |gone: Placed| Placed {
+            named: false,
+            ..gone
+        };
+        let amended = [
+            read("agt_delta", true, "c4", Some("c3")),
+            unnamed(gone("agt_old", true, "x3")),
+        ];
+        let refused = count(&amended, "c4", 1).unwrap_err();
+        assert!(refused.contains("agt_delta read only from c3"), "{refused}");
+        let failed = [
+            read("agt_delta", true, "c4", Some("c3")),
+            earlier("agt_whole", false, "c3", None),
+            unnamed(gone("agt_old", false, "x2")),
+        ];
+        let refused = count(&failed, "c4", 1).unwrap_err();
+        assert!(
+            refused.contains("agt_old failed x2, which the branch no longer holds"),
+            "{refused}"
+        );
+        let rereviewed = [
+            failed[0].clone(),
+            earlier("agt_rereview", true, "c3", None),
+            failed[2].clone(),
+        ];
+        assert_eq!(count(&rereviewed, "c4", 1).unwrap(), [0]);
     }
 }

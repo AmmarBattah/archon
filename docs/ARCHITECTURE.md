@@ -2026,7 +2026,15 @@ no verdict (a builder) is refused. The verdicts are then placed on the
 branch in the run's workspace (`executor/review/coverage.rs`): every `head`
 must be a commit the branch holds; a `base` at or before the fork from the
 base branch, or none, means the whole change was read; a delta's `base`
-must be a head another named reviewer read. A pass counts when it read the
+must be a head another named reviewer read. If none is, the lead's other
+direct children that completed a task are read and placed too, those not on
+the branch left out; the ones anchored with the named reads join the check,
+so their fails stand until answered, but only named passes count, and they
+are stored as `review.implicit_reviewer_agents`. Archon reads them only for
+a lead no other stage run of the run names (a kept agent's earlier reviews
+cannot be told from this attempt's), only once none of its direct children
+is still live, and a result Aether cannot show refuses the review rather
+than being left out. A pass counts when it read the
 branch head, or when a counted pass read every commit after its head
 (`base` at or before it). A fail never counts and must be followed by such
 a pass, or by a later fail that read every commit after its head and was
@@ -2036,7 +2044,8 @@ the same result is the ship record (§8.7), the branch head must hold the
 record's `tree`, the tree delivery later checks: what ships is what was read.
 
 The counted agents and the models Aether ran them on are stored as
-`review.reviewer_agents` and `review.reviewer_models`; otherwise `archond`
+`review.reviewer_agents` and `review.reviewer_models` (with
+`review.implicit_reviewer_agents` when earlier reviewers anchored them); otherwise `archond`
 stores `review.unverified` with the reason, and the engine fails the run
 at that stage with it; learning counts such a stage as no pass. These keys, and the `reviewer_model(s)` and
 `reviewer_agent` a 1.0 record held, are Archon's: whatever an agent wrote

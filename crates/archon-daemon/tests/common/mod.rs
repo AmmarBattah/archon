@@ -614,6 +614,8 @@ struct FakeState {
     failures: VecDeque<ArchonError>,
     cancel_failures: VecDeque<ArchonError>,
     outcome_failures: VecDeque<ArchonError>,
+    /// Tasks whose `task_outcome` always fails with this Aether error.
+    unreadable: BTreeMap<AetherTaskId, String>,
     lost_replies: u32,
     outcomes: BTreeMap<AetherTaskId, StageOutcome>,
     cancelled: Vec<AetherAgentId>,
@@ -923,6 +925,15 @@ impl FakeBackend {
         state.outcomes.insert(task, outcome);
     }
 
+    /// Aether answers every read of the delegated `agent`'s result with `error`.
+    pub fn unreadable_delegated(&self, agent: &AetherAgentId, error: &str) {
+        let mut state = self.state();
+        let delegated = state.delegated.iter().find(|d| d.agent == *agent);
+        let task = delegated.and_then(|d| d.task.clone());
+        let task = task.expect("a delegated agent has a task");
+        state.unreadable.insert(task, error.to_owned());
+    }
+
     /// The delegated agent ended as `ended`.
     pub fn end_delegated(&self, agent: &AetherAgentId, ended: DescendantState) {
         assert_ne!(ended, DescendantState::Live, "an ended agent is not live");
@@ -1125,6 +1136,9 @@ impl AgentBackend for FakeBackend {
         let mut state = self.state();
         if let Some(error) = state.outcome_failures.pop_front() {
             return Err(error);
+        }
+        if let Some(text) = state.unreadable.get(task) {
+            return Err(ArchonError::Aether(text.clone()));
         }
         Ok(state.outcomes.get(task).cloned())
     }

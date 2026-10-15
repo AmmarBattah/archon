@@ -2224,6 +2224,119 @@ async fn a_reviewer_of_the_fix_carries_the_first_pass_to_the_head() {
     assert!(summary.contains(&format!("(agent {delta})")), "{summary}");
 }
 
+/// The lead's change, then a fix whose result names only the reviewer of
+/// the fix, who read it from the change's head. The change's head is returned.
+async fn fix_named_alone(h: &Harness, lead: &StageRun) -> (StageOutcome, serde_json::Value) {
+    let read = shipped_by(h, lead, "Built", serde_json::json!({})).await;
+    let first_head = verdict_on(&read, "pass")["head"].clone();
+    let delta = h.backend.delegate(&lead_agent(lead), REVIEW_MODEL);
+    let named = pass_by(std::slice::from_ref(&delta));
+    let fixed = shipped_by(h, lead, "Built, then fixed", named).await;
+    let mut on_fix = verdict_on(&fixed, "pass");
+    on_fix["base"] = first_head.clone();
+    h.backend.complete_delegated(&delta, on_fix);
+    (fixed, first_head)
+}
+
+/// Earlier reviewers of the lead that cannot anchor: one cancelled after it
+/// returned a pass of `head`, one whose head the workspace does not hold.
+fn unanchoring_reviewers(h: &Harness, lead: &StageRun, head: &serde_json::Value) {
+    let cancelled = h.backend.delegate(&lead_agent(lead), REVIEW_MODEL);
+    let whole = serde_json::json!({"verdict": "pass", "head": head, "findings": []});
+    h.backend.complete_delegated(&cancelled, whole);
+    h.backend
+        .end_delegated(&cancelled, DescendantState::Stopped);
+    let unheld = h.backend.delegate(&lead_agent(lead), REVIEW_MODEL);
+    let elsewhere = serde_json::json!({"verdict": "pass", "head": "deadbeefdeadbeef"});
+    h.backend.complete_delegated(&unheld, elsewhere);
+}
+
+/// The lead named only its last delta reviewer: Archon anchors it on the
+/// whole-change pass the lead delegated earlier, and records that it did.
+#[tokio::test]
+async fn an_earlier_unnamed_whole_change_pass_anchors_the_named_delta() {
+    let h = Harness::new().await;
+    let item = adaptive_item(&h).await;
+    let lead = h.running().await.remove(0);
+    let first = h.backend.delegate(&lead_agent(&lead), REVIEW_MODEL);
+    let (fixed, first_head) = fix_named_alone(&h, &lead).await;
+    let whole = serde_json::json!({"verdict": "pass", "head": first_head, "findings": []});
+    h.backend.complete_delegated(&first, whole);
+    unanchoring_reviewers(&h, &lead, &first_head);
+    let build = h.settle_running(|_| fixed.clone()).await;
+    h.dispatch().await;
+    assert!(delivered(&h, &item).await, "{:?}", h.state(&item.id).await);
+    let stored = h.ctx.store.lock().await.stage_run(&build[0].id).unwrap();
+    let review = &stored.structured.as_ref().unwrap()["review"];
+    let implicit = serde_json::json!([first.as_str()]);
+    assert_eq!(review["implicit_reviewer_agents"], implicit);
+    assert_eq!(review["reviewer_agents"].as_array().unwrap().len(), 1);
+}
+
+/// A cancelled earlier review, or one of a commit the branch never held,
+/// anchors nothing: the named delta is refused as before.
+#[tokio::test]
+async fn an_earlier_review_that_cannot_anchor_leaves_the_named_delta_refused() {
+    let h = Harness::new().await;
+    let item = adaptive_item(&h).await;
+    let lead = h.running().await.remove(0);
+    let (fixed, first_head) = fix_named_alone(&h, &lead).await;
+    unanchoring_reviewers(&h, &lead, &first_head);
+    h.settle_running(|_| fixed.clone()).await;
+    let error = refused_review(&h, &item).await;
+    assert!(error.contains("read only from"), "{error}");
+    assert!(
+        error.contains("nor any earlier one of this attempt"),
+        "{error}"
+    );
+}
+
+/// The lead named only its delta reviewer, and earlier reviewers it delegated
+/// would anchor it: the stage's settled result, with the earlier pass to come.
+async fn anchored_by_an_earlier_pass(h: &Harness) -> (StageRun, StageOutcome) {
+    let lead = h.running().await.remove(0);
+    let first = h.backend.delegate(&lead_agent(&lead), REVIEW_MODEL);
+    let (fixed, first_head) = fix_named_alone(h, &lead).await;
+    let whole = serde_json::json!({"verdict": "pass", "head": first_head, "findings": []});
+    h.backend.complete_delegated(&first, whole);
+    (lead, fixed)
+}
+
+/// A result Aether could not show may be a fail of the head: it keeps the
+/// earlier reviewers from anchoring, as it refuses a named one.
+#[tokio::test]
+async fn an_earlier_reviewer_aether_cannot_show_leaves_the_named_delta_refused() {
+    let h = Harness::new().await;
+    let item = adaptive_item(&h).await;
+    let (lead, fixed) = anchored_by_an_earlier_pass(&h).await;
+    let late = h.backend.delegate(&lead_agent(&lead), REVIEW_MODEL);
+    h.backend
+        .complete_delegated(&late, verdict_on(&fixed, "fail"));
+    h.backend
+        .unreadable_delegated(&late, "internal: database is locked");
+    h.settle_running(|_| fixed.clone()).await;
+    let error = refused_review(&h, &item).await;
+    assert!(error.contains("read only from"), "{error}");
+    let unshown = format!("earlier reviewer {late} has a result Aether could not show");
+    assert!(error.contains(&unshown), "{error}");
+}
+
+/// A reviewer still running may yet fail the head, so nothing anchors on
+/// the earlier reviewers until it ends.
+#[tokio::test]
+async fn a_reviewer_still_running_keeps_earlier_ones_from_anchoring() {
+    let h = Harness::new().await;
+    let item = adaptive_item(&h).await;
+    let (lead, fixed) = anchored_by_an_earlier_pass(&h).await;
+    let running = h.backend.delegate(&lead_agent(&lead), REVIEW_MODEL);
+    h.settle_running(|_| fixed.clone()).await;
+    let error = refused_review(&h, &item).await;
+    assert!(error.contains("read only from"), "{error}");
+    let held = format!("{running} on {REVIEW_MODEL} still running");
+    assert!(error.contains(&held), "{error}");
+    assert!(error.contains("or cancel it"), "{error}");
+}
+
 /// The reviewer's agent and model are Archon's finding: what the lead wrote
 /// there itself is replaced by what Aether shows.
 #[tokio::test]
