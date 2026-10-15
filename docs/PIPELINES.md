@@ -272,7 +272,8 @@ and the stage delegates that many independent reviewers:
 
 Reviewers, delegated ones and a review stage's own, try mutants and repros
 in throwaway copies under `<data>/experiments/<item>`. Archon creates that
-directory before the stage starts and deletes it when the item settles.
+directory before the stage starts and deletes it once the item settled and
+all its agents have stopped.
 
 An item that leaves `review` out gets the declared `level`, raised to the
 operator's ceiling when the ceiling asks for more. The ceiling still bounds

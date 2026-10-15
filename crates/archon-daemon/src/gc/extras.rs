@@ -1,12 +1,12 @@
 //! What gc collects outside a run's workspace (ARCHITECTURE §13.5): a
 //! repository's shared build cache once nobody used it for a while, an
 //! item's published artifacts `artifacts.keep_after` it settled, and the
-//! experiments directory a settled item still has after a crash. All are
+//! experiments directory of an item nothing runs for any more. All are
 //! claimed under the run table by renaming them aside, atomically, so a run
 //! that starts meanwhile builds into a fresh directory; the slow deletion
 //! then happens without any lock.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -15,7 +15,7 @@ use archon_core::Timestamp;
 use archon_core::age::Age;
 use archon_core::config::Config;
 use archon_core::error::ArchonError;
-use archon_core::id::QueueItemId;
+use archon_core::id::{QueueItemId, StageRunId};
 use archon_core::protocol::{GcReport, ItemQuery, Reclaimed};
 use archon_core::repo::Repo;
 use archon_queue::Store;
@@ -74,11 +74,11 @@ enum Kind {
     Experiments,
 }
 
-/// Claim what is due under the cache, artifacts and experiments roots, with
-/// the run table and the store held by the caller. What cannot be looked
-/// into or renamed is noted in `report`.
+/// Claim what is due under the cache, artifacts and experiments roots, the caller holding the
+/// run table (spawns `in_flight`) and the store. What cannot be claimed is noted in `report`.
 pub(super) fn claim(
     store: &Store,
+    in_flight: &BTreeSet<StageRunId>,
     roots: &Roots,
     extras: &Extras,
     report: &mut GcReport,
@@ -115,27 +115,88 @@ pub(super) fn claim(
             claim_dir(dir, Kind::Artifacts, &mut claimed, report);
         }
     }
-    for dir in subdirectories(&roots.experiments(), report) {
+    for dir in experiment_dirs(&roots.experiments(), report) {
         let name = file_name(&dir);
-        if name.starts_with(CLAIMED_PREFIX) || orphaned(store, &name)? {
+        if is_claimed(&name) || orphaned(store, in_flight, &name)? {
             claim_dir(dir, Kind::Experiments, &mut claimed, report);
         }
     }
     Ok(claimed)
 }
 
-/// Whether an experiments directory outlived its item: the item settled, or
-/// the store no longer knows it. A name that is no item id is left alone.
-fn orphaned(store: &Store, name: &str) -> Result<bool, ArchonError> {
+/// Whether an experiments directory outlived its item: nothing of the item can run any
+/// more, or the store does not know it. A name that is no item id is left alone.
+fn orphaned(
+    store: &Store,
+    in_flight: &BTreeSet<StageRunId>,
+    name: &str,
+) -> Result<bool, ArchonError> {
     let Ok(id) = QueueItemId::parse(name) else {
         return Ok(false);
     };
-    assert_eq!(id.as_str(), name, "an item id names its directory");
     match store.item(&id) {
-        Ok(item) => Ok(item.state.is_terminal()),
-        Err(ArchonError::NotFound(_)) => Ok(true),
-        Err(error) => Err(error),
+        Ok(item) => assert_eq!(item.id, id, "the store returns the item asked for"),
+        Err(ArchonError::NotFound(_)) => return Ok(true),
+        Err(error) => return Err(error),
     }
+    crate::executor::item_stopped(store, in_flight, &id)
+}
+
+/// The real directories under the experiments `root`. A root or an entry
+/// that is a symlink is reported and left alone, as is everything under it.
+fn experiment_dirs(root: &Path, report: &mut GcReport) -> Vec<PathBuf> {
+    match crate::experiments::real_dir(root) {
+        Ok(true) => {}
+        Ok(false) => return Vec::new(),
+        Err(refused) => {
+            report
+                .failed
+                .push((root.to_path_buf(), refused.to_string()));
+            return Vec::new();
+        }
+    }
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            report
+                .failed
+                .push((root.to_path_buf(), format!("reading it: {e}")));
+            return Vec::new();
+        }
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                report
+                    .failed
+                    .push((root.to_path_buf(), format!("reading it: {e}")));
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dirs.push(entry.path()),
+            Ok(kind) if kind.is_symlink() => report
+                .skipped
+                .push((entry.path(), "a symlink, which gc does not follow".into())),
+            Ok(_) => {}
+            Err(e) => report
+                .failed
+                .push((entry.path(), format!("inspecting it: {e}"))),
+        }
+    }
+    assert!(
+        dirs.iter().all(|dir| dir.parent() == Some(root)),
+        "only entries of the root itself are claimed"
+    );
+    dirs.sort();
+    dirs
+}
+
+/// Whether `name` is one a pass or [`set_aside`] renamed a directory to.
+pub(crate) fn is_claimed(name: &str) -> bool {
+    name.starts_with(CLAIMED_PREFIX)
 }
 
 /// The names of the registered repositories with an item not yet settled.

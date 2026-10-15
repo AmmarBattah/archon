@@ -742,7 +742,8 @@ async fn issue_claimed(ctx: &DaemonContext, id: &StageRunId) -> Result<FollowUp,
     // have reached Aether, a live agent may be working in it.
     let prepare = allowed.is_ok() && !unsent && spawn.parent == ParentBinding::Pending;
     let reviews = allowed.is_ok() && !unsent && can_review(&stage, &spawn);
-    if let Err(error) = ready_to_spawn(ctx, worker.filter(|_| prepare), reviews, &item).await {
+    let ready = ready_to_spawn(ctx, id, worker.filter(|_| prepare), reviews, &item).await;
+    if let Err(error) = ready {
         let mut table = ctx.runs.lock().await;
         let was_claimed = table.in_flight.remove(id);
         assert!(was_claimed, "stage run {id} was prepared without a claim");
@@ -768,10 +769,11 @@ fn can_review(stage: &StageRun, spawn: &StoredSpawn) -> bool {
     stage.kind == Some(StageKind::Review) || !spawn.request.leaf
 }
 
-/// What must be on disk before the agent is created: a team slot's worktree,
-/// and the item's experiments directory when the agent `reviews`.
+/// What must be on disk before claimed stage run `id`'s agent is created: a team
+/// slot's worktree, and the item's experiments directory when the agent `reviews`.
 async fn ready_to_spawn(
     ctx: &DaemonContext,
+    id: &StageRunId,
     worker: Option<team::Worker>,
     reviews: bool,
     item: &QueueItemId,
@@ -782,12 +784,15 @@ async fn ready_to_spawn(
             .await
             .map_err(|e| format!("preparing the role's worktree failed: {e}"))?;
     }
-    if reviews {
-        experiments::prepare(&ctx.paths, item)
-            .await
-            .map_err(|e| format!("preparing the experiments directory failed: {e}"))?;
+    if !reviews {
+        return Ok(());
     }
-    Ok(())
+    // Made under the table while the claim keeps the item from being
+    // discarded, so a discard never comes between the check and the create.
+    let table = ctx.runs.lock().await;
+    assert!(table.in_flight.contains(id), "prepared under its claim");
+    experiments::prepare(&ctx.paths, item)
+        .map_err(|e| format!("preparing the experiments directory failed: {e}"))
 }
 
 /// What issuing a stage run gave it: a new agent with its task, or the

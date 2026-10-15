@@ -70,7 +70,6 @@ pub(super) async fn finish_run(
     table.merges.remove(&run.id);
     table.ships.remove(&run.id);
     table.ship_retries.remove(&run.id);
-    let experiments = crate::experiments::set_aside(&ctx.paths, &item.id);
     crate::feed::publish(ctx, finished.answers);
     crate::reports::close_stale_questions(ctx).await?;
     let pr_url = pr_url(ctx, &run).await?;
@@ -78,7 +77,7 @@ pub(super) async fn finish_run(
     let mut follow = FollowUp::poke();
     follow.stop.push(run.id.clone());
     follow.cleanup.extend(cleanup_for(ctx, &item, &run).await?);
-    follow.discard.extend(experiments);
+    follow.discard.push(run.id.clone());
     Ok(follow)
 }
 

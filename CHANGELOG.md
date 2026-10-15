@@ -8,8 +8,9 @@
   disk, `<data>/experiments/<item>`, instead of wherever `mktemp -d` puts
   them, which is often a small `/tmp` the whole machine shares. Archon creates
   the directory before a stage that can review starts and names it in the
-  contract. It deletes the directory when the item finishes, and `archon gc`
-  removes any a crash left behind.
+  contract. It deletes the directory once the item has finished and its
+  agents, and every agent they started, have stopped. `archon gc` removes any
+  a crash left behind, and never follows a symlink there.
 
 ## 1.2.3
 

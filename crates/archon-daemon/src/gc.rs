@@ -14,7 +14,8 @@
 //! Beside the workspaces, a pass deletes a repository's shared build cache
 //! once nothing used it for `worktrees.shared_cache_after` and no item of the
 //! repository is live, an item's published artifacts `artifacts.keep_after`
-//! it settled, and the experiments directory a settled item kept (`extras`).
+//! it settled, and the experiments directory of an item nothing runs for any
+//! more (`extras`).
 //! While dispatch is held for disk space, the ages of worktrees and caches
 //! drop to `worktrees.pressure_after` if that is shorter.
 //! A pass that freed anything leaves a note in the feed and in `archon status`.
@@ -46,7 +47,7 @@ use crate::context::{DaemonContext, DaemonPaths};
 use crate::feed;
 
 pub use extras::Extras;
-pub(crate) use extras::set_aside;
+pub(crate) use extras::{is_claimed, set_aside};
 pub use mark::{Collecting, Mark};
 
 /// The kv key of the last pass that freed anything, as a [`GcStatus`].
@@ -332,9 +333,9 @@ async fn collect_extras(
 ) -> Result<GcReport, ArchonError> {
     let mut report = GcReport::default();
     let claimed = {
-        let _table = ctx.runs.lock().await;
+        let table = ctx.runs.lock().await;
         let store = ctx.store.lock().await;
-        extras::claim(&store, roots, extras, &mut report)?
+        extras::claim(&store, &table.in_flight, roots, extras, &mut report)?
     };
     report.absorb(blocking(move || extras::delete(claimed)).await?);
     Ok(report)
@@ -471,7 +472,9 @@ fn collect_locked(
             report.absorb(sweep::sweep(item.found, roots, policy));
         }
     }
-    let claimed = extras::claim(store, roots, extras, &mut report)?;
+    // No archond runs, so no spawn is in flight.
+    let in_flight = std::collections::BTreeSet::new();
+    let claimed = extras::claim(store, &in_flight, roots, extras, &mut report)?;
     report.absorb(extras::delete(claimed));
     Ok(report)
 }

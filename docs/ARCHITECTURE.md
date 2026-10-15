@@ -3300,9 +3300,10 @@ cutoffs, and at each workspace whose runs have all finished:
   real directory, not a symlink, whose real path is still
   `<item-id>/snapshot` for its own item inside `worktrees.root`, and a
   worktree git lists for the repository.
-- An item's experiments directory (§13.5) goes in any pass once the item
-  settled or the store no longer knows it. `archond` deletes it when the
-  item settles, so a pass finds one only after a crash.
+- An item's experiments directory (§13.5) goes in any pass once nothing of
+  the item can run, or the store no longer knows it. A symlinked root or
+  entry is reported and left alone. `archond` deletes it itself, so a pass
+  finds one only after a crash.
 
 Only paths inside `worktrees.root` that git lists as worktrees of the
 item's repository, scratch and experiments directories under the data dir,
@@ -3534,9 +3535,13 @@ repro) into `mktemp -d -p <data>/experiments/<item>`, never the shared
 `/tmp`. The directory has its own root, so it never lies inside a scratch
 workspace (`<data>/scratch/<item>`). `archond` creates it before an agent
 that can review is created, the contract names it (shell-quoted when the
-path needs it), and `archond` deletes it when the item settles: renamed
-aside under the run table, so a retry starting meanwhile gets a fresh one,
-then removed. The gc pass deletes what a crash left (§13.2). A contract
+path needs it), and `archond` deletes it once the item settled and nothing
+of it can still run: no live or in-flight stage, no run node to retire, no
+descendant stop owed (§6.3). It is created under the run table while the
+spawn is claimed, and renamed aside under the table, so a retry starting
+meanwhile gets a fresh one, then removed. Neither the root nor an item's
+directory may be a symlink. The gc pass deletes what a crash left, by the
+same test (§13.2). A contract
 built without the directory, as in tests, falls back to `mktemp -d`.
 
 ## 14. Lavish plugin

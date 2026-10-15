@@ -30,9 +30,8 @@ pub enum TeamPart<'a> {
     Role(&'a TeamSlot),
 }
 
-/// The contract for one stage agent working in `workspace`, with what its
-/// stage `owed` its run on record. `experiments` is the item's directory for
-/// reviewers' experiment copies. See [`delegation_rules`] for delegators.
+/// The contract for one stage agent in `workspace`, with what its stage `owed` its run on
+/// record and the item's `experiments` directory. See [`delegation_rules`] for delegators.
 pub fn instructions(
     stage: &StageSpec,
     mode: WorkspaceMode,
@@ -69,10 +68,8 @@ pub fn instructions(
     out
 }
 
-/// The contract's section for a stage agent that can delegate. `models` is the
-/// policy its children are held to, in words (`ModelPolicy::describe`),
-/// `depth` is `[limits] max_delegation_depth`, and `experiments` as for
-/// [`instructions`].
+/// The section for an agent that can delegate: `models` is its children's policy in words,
+/// `depth` is `[limits] max_delegation_depth`, `experiments` as for [`instructions`].
 pub fn delegation_rules(
     mode: WorkspaceMode,
     models: &str,
