@@ -59,6 +59,12 @@ pub(super) enum RepositoryIdentity {
     Root(PathBuf),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepositoryMode {
+    Name,
+    Root,
+}
+
 impl RepositoryIdentity {
     fn from_request(request: &RunNodeRequest) -> Self {
         assert!(request.repository_root.is_none() || request.repository.is_none());
@@ -79,6 +85,40 @@ impl RepositoryIdentity {
             Self::Name(name) => (name.clone(), None),
             Self::Root(root) => (None, Some(root.clone())),
         }
+    }
+
+    fn check_checkout(&self) -> Result<(), ArchonError> {
+        let Self::Root(root) = self else {
+            return Ok(());
+        };
+        assert!(root.is_absolute(), "a frozen checkout is absolute");
+        let problem = match std::fs::metadata(root) {
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(_) => "is no longer a directory".to_owned(),
+            Err(error) => format!("cannot be read: {error}"),
+        };
+        Err(ArchonError::Invalid(format!(
+            "registered checkout {} moved or was removed, or {problem}; \
+             re-register the repo or cancel the run; its repository identity is frozen",
+            root.display()
+        )))
+    }
+
+    fn refused(&self, error: ArchonError) -> ArchonError {
+        assert!(matches!(
+            error,
+            ArchonError::Invalid(_) | ArchonError::NotFound(_)
+        ));
+        let Self::Root(root) = self else {
+            return error;
+        };
+        assert!(root.is_absolute(), "a frozen checkout is absolute");
+        ArchonError::Invalid(format!(
+            "Aether refused frozen repository root {}: {error}; the registered checkout \
+             may have moved, been removed, or become unreadable; re-register the repo or \
+             cancel the run; its repository identity is frozen",
+            root.display()
+        ))
     }
 }
 
@@ -335,11 +375,8 @@ pub(super) fn runs_to_retire(store: &Store) -> Result<Vec<PipelineRunId>, Archon
     Ok(due)
 }
 
-/// The live node of `run`: the stored one when Aether still holds it, else
-/// a new generation. `model` and `network` (Aether's default now) seed a
-/// new generation's request; later callers of that generation reuse the
-/// stored request whatever they pass. One key Aether refuses is left
-/// behind for the next generation, once.
+/// Reuse a live node, replacing lost nodes or one refused name-based key.
+/// Frozen root refusals fail with operator guidance instead of advancing keys.
 pub(super) async fn ensure(
     ctx: &DaemonContext,
     run: &PipelineRunId,
@@ -382,8 +419,7 @@ enum Claim {
 
 enum Created {
     Agent(RunNode),
-    /// Aether refused the generation's key (`invalid_argument`: a request
-    /// it recorded differently; `not_found`: the work it created is gone).
+    /// Aether refused a name-based generation's key; retry with a new key.
     Refused {
         generation: u32,
         error: ArchonError,
@@ -403,7 +439,11 @@ async fn create_generation(
         .backend
         .host_context(ctx.config.aether.host_context.for_model(model))
         .await?;
-    let repository_root = ctx.backend.supports_repository_root().await?;
+    let repository_mode = if ctx.backend.supports_repository_root().await? {
+        RepositoryMode::Root
+    } else {
+        RepositoryMode::Name
+    };
     let claim = {
         let mut store = ctx.store.lock().await;
         claim_generation(
@@ -413,7 +453,7 @@ async fn create_generation(
             model,
             network,
             host_context,
-            repository_root,
+            repository_mode,
         )?
     };
     let (generation, request) = match claim {
@@ -425,8 +465,19 @@ async fn create_generation(
     };
     assert_eq!(request.idempotency_key, idempotency_key(run, generation));
     let request = prepare_replay(ctx, run, generation, request).await?;
+    send_generation(ctx, run, generation, request).await
+}
+
+async fn send_generation(
+    ctx: &DaemonContext,
+    run: &PipelineRunId,
+    generation: u32,
+    request: RunNodeRequest,
+) -> Result<Created, ArchonError> {
+    assert_eq!(request.idempotency_key, idempotency_key(run, generation));
     let network = request.network;
     let repository = RepositoryIdentity::from_request(&request);
+    repository.check_checkout()?;
     match ctx.backend.create_run_node(request).await {
         Ok(created) => {
             record_agent(&mut *ctx.store.lock().await, run, generation, &created)?;
@@ -435,6 +486,11 @@ async fn create_generation(
                 network,
                 repository,
             }))
+        }
+        Err(error @ (ArchonError::Invalid(_) | ArchonError::NotFound(_)))
+            if matches!(repository, RepositoryIdentity::Root(_)) =>
+        {
+            Err(repository.refused(error))
         }
         Err(error @ (ArchonError::Invalid(_) | ArchonError::NotFound(_))) => {
             Ok(Created::Refused { generation, error })
@@ -491,7 +547,7 @@ fn claim_generation(
     model: &ModelRef,
     network: NetworkPolicy,
     host_context: archon_core::config::HostContext,
-    repository_root: bool,
+    repository_mode: RepositoryMode,
 ) -> Result<Claim, ArchonError> {
     let current = load_node(store, run)?;
     let moved = current != *observed;
@@ -507,6 +563,11 @@ fn claim_generation(
         }
         (None, None) => current.generation,
     };
+    // Only a new run can choose roots; legacy generations keep their name identity.
+    let repository_mode = match (repository_mode, current.generation) {
+        (RepositoryMode::Root, 1) => RepositoryMode::Root,
+        _ => RepositoryMode::Name,
+    };
     let mut request = request(
         store,
         run,
@@ -514,7 +575,7 @@ fn claim_generation(
         model,
         network,
         current.repository_identity(),
-        repository_root && current.generation == 1,
+        repository_mode,
     )?;
     request.host_context = host_context;
     let pending = StoredNode {
@@ -611,7 +672,7 @@ fn request(
     model: &ModelRef,
     network: NetworkPolicy,
     identity: Option<RepositoryIdentity>,
-    repository_root: bool,
+    repository_mode: RepositoryMode,
 ) -> Result<RunNodeRequest, ArchonError> {
     let run = store.run(run_id)?;
     let item = store.item(&run.item)?;
@@ -634,7 +695,7 @@ fn request(
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
     let identity = identity.unwrap_or_else(|| match repo {
-        Some(repo) if repository_root && run.aether_run.is_none() => {
+        Some(repo) if repository_mode == RepositoryMode::Root && run.aether_run.is_none() => {
             RepositoryIdentity::Root(repo.path)
         }
         repo => RepositoryIdentity::Name(repo.map(|repo| repo.name)),
@@ -664,7 +725,7 @@ fn request(
 enum Found {
     Agent(AetherAgentId),
     Nothing,
-    /// Aether did not answer; the entry stays for the next sweep.
+    /// Cleanup could not be confirmed; retain the entry for the next sweep.
     Unanswered,
 }
 
@@ -770,6 +831,10 @@ async fn find_agent(
     };
     let request = prepare_replay(ctx, run, node.generation, request).await?;
     let key = request.idempotency_key.clone();
+    if let Err(error) = RepositoryIdentity::from_request(&request).check_checkout() {
+        tracing::warn!(%run, key, %error, "pending node cleanup blocked; keeping its record until the checkout is restored");
+        return Ok(Found::Unanswered);
+    }
     match ctx.backend.create_run_node(request).await {
         Ok(created) => {
             index_node_agent(&mut *ctx.store.lock().await, run, &created.agent)?;
@@ -883,6 +948,55 @@ mod tests {
         assert_eq!(
             stored.recorded().unwrap().repository.parts(),
             (Some("original-name".into()), None)
+        );
+    }
+
+    #[test]
+    fn a_stored_root_node_round_trips_through_json() {
+        let run = PipelineRunId::new();
+        let root = PathBuf::from("/registered/checkout");
+        let mut request = request_for(&run, 2);
+        request.repository_root = Some(root.clone());
+        let stored = StoredNode {
+            agent: Some(AetherAgentId::parse("agt_1").unwrap()),
+            generation: 2,
+            request: Some(request),
+            repository_identity: Some(RepositoryIdentity::Root(root.clone())),
+        };
+        let raw = serde_json::to_string(&stored).unwrap();
+        let restored: StoredNode = serde_json::from_str(&raw).unwrap();
+        restored.check();
+        assert_eq!(restored, stored);
+        assert_eq!(
+            restored.recorded().unwrap().repository.parts(),
+            (None, Some(root))
+        );
+    }
+
+    #[test]
+    fn a_frozen_root_must_still_be_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        let identity = RepositoryIdentity::Root(root.clone());
+        let missing = identity.check_checkout().unwrap_err().to_string();
+        assert!(missing.contains(&root.display().to_string()), "{missing}");
+        assert!(missing.contains("moved or was removed"), "{missing}");
+        assert!(
+            missing.contains("re-register the repo or cancel the run"),
+            "{missing}"
+        );
+        std::fs::write(&root, "a file cannot be a checkout").unwrap();
+        let file = identity.check_checkout().unwrap_err().to_string();
+        assert!(file.contains("no longer a directory"), "{file}");
+        assert!(
+            RepositoryIdentity::Root(dir.path().to_owned())
+                .check_checkout()
+                .is_ok()
+        );
+        assert!(
+            RepositoryIdentity::Name(Some("legacy".into()))
+                .check_checkout()
+                .is_ok()
         );
     }
 

@@ -5,11 +5,14 @@
 ### Added
 
 - Agents in registered repositories share memory with direct Aether sessions using
-  the registered checkout (requires Aether 1.0.6). Old memories under the short
-  name can be moved with `aether memory alias <name> --root <checkout>`.
+  the registered checkout (with Aether versions that advertise `repository_root`).
+  Old memories under the short name can be moved with
+  `aether memory alias <name> --root <checkout>`.
 
 ### Fixes
 
+- Runs fail with the frozen checkout path and recovery guidance when that checkout
+  is missing or Aether refuses its root, without repeatedly advancing node generations.
 - Review rounds are faster without being weaker. Reviewers run each ad-hoc
   experiment, such as a mutant, under a 30-second timeout, and a hang counts as
   caught. On a blocking finding the agent cancels the reviewers still reading

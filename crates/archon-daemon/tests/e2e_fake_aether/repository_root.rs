@@ -137,24 +137,125 @@ async fn stages_keep_the_nodes_name_after_aether_gains_the_feature() {
 }
 
 #[tokio::test]
-async fn a_refused_root_node_keeps_its_identity_in_the_next_generation() {
+async fn a_refused_root_node_fails_without_advancing_its_generation() {
+    for code in ["invalid_argument", "not_found"] {
+        let dir = tempfile::tempdir().unwrap();
+        let aether = start_aether(dir.path()).await;
+        aether.set_features(vec!["repository_root".into()]);
+        script_fleet(&aether);
+        aether.script(
+            "create_agent",
+            Scripted::refuse(code, "registered checkout is unreadable"),
+        );
+        let h = harness(&aether).await;
+        let item = h.enqueue("refused frozen checkout").await;
+        h.dispatch().await;
+        let QueueState::Failed { error, .. } = h.state(&item.id).await else {
+            panic!("a refused root must fail the item");
+        };
+        assert!(error.contains(&h.repo.display().to_string()), "{error}");
+        assert!(
+            error.contains("registered checkout is unreadable"),
+            "{error}"
+        );
+        assert!(
+            error.contains("re-register the repo or cancel the run"),
+            "{error}"
+        );
+        let creates = aether.received_named("create_agent");
+        assert_eq!(creates.len(), 2, "creation and retirement recovery replay");
+        let run = h.run(&item.id).await;
+        for create in &creates {
+            assert_identity(create, Some(&h.repo));
+            assert_eq!(create["idempotency_key"], format!("{}:node:1", run.id));
+        }
+        assert_eq!(
+            without_request_id(creates[0].clone()),
+            without_request_id(creates[1].clone())
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_moved_frozen_checkout_fails_before_replaying_the_node() {
     let dir = tempfile::tempdir().unwrap();
     let aether = start_aether(dir.path()).await;
     aether.set_features(vec!["repository_root".into()]);
-    script_fleet(&aether);
-    aether.script(
-        "create_agent",
-        Scripted::refuse("invalid_argument", "old key"),
-    );
+    let fleet = script_fleet(&aether);
     let h = harness(&aether).await;
-    let item = h.enqueue("replace node without changing identity").await;
+    reconnect(&h, &aether).await;
+    fleet.lock().unwrap().lose_next_reply = true;
+    let item = h.enqueue("checkout moved after identity froze").await;
     h.dispatch().await;
+    assert_eq!(h.stages(&item.id).await[0].state, StageState::Spawning);
+    std::fs::rename(&h.repo, h.repo.with_file_name("moved-checkout")).unwrap();
+    h.dispatch().await;
+    let QueueState::Failed { error, .. } = h.state(&item.id).await else {
+        panic!("a moved root must fail the item");
+    };
+    assert!(error.contains(&h.repo.display().to_string()), "{error}");
+    assert!(error.contains("moved or was removed"), "{error}");
+    assert!(
+        error.contains("re-register the repo or cancel the run"),
+        "{error}"
+    );
     let creates = aether.received_named("create_agent");
-    assert_eq!(creates.len(), 3);
-    for create in &creates {
-        assert_identity(create, Some(&h.repo));
-    }
+    assert_eq!(creates.len(), 1, "the missing root was not sent again");
     let run = h.run(&item.id).await;
-    assert_eq!(creates[1]["idempotency_key"], format!("{}:node:2", run.id));
-    assert_eq!(h.stages(&item.id).await[0].state, StageState::Running);
+    let raw = h.kv(&format!("run_node:{}", run.id)).await.unwrap();
+    let stored: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(stored["generation"], 1);
+    assert_eq!(stored["repository_identity"]["Root"], json!(h.repo));
+}
+
+#[tokio::test]
+async fn replacing_a_dead_generation_two_node_keeps_its_root_after_feature_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let aether = start_aether(dir.path()).await;
+    aether.set_features(vec!["repository_root".into()]);
+    let fleet = script_fleet(&aether);
+    let h = harness(&aether).await;
+    let item = h.enqueue("keep root after generation two dies").await;
+    h.dispatch().await;
+    complete_running(&h, &fleet, |_| json!({"summary": "implemented"})).await;
+    aether.script("get_agent", Scripted::refuse("not_found", "node one lost"));
+    h.dispatch().await;
+    let run = h.run(&item.id).await;
+    let key = format!("run_node:{}", run.id);
+    let raw = h.kv(&key).await.unwrap();
+    let second: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(second["generation"], 2);
+    assert_eq!(second["agent"], node_id(2));
+    assert_eq!(h.running().await.len(), 2);
+
+    aether.set_features(vec![]);
+    reconnect(&h, &aether).await;
+    let pass =
+        json!({"summary": "VERDICT: pass", "structured": {"verdict": "pass", "findings": []}});
+    complete_running(&h, &fleet, |_| pass.clone()).await;
+    aether.script("get_agent", Scripted::refuse("not_found", "node two lost"));
+    let before = aether.received_named("create_agent");
+    h.dispatch().await;
+    let raw = h.kv(&key).await.unwrap();
+    let pending: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(pending["generation"], 3);
+    assert_eq!(
+        pending["repository_identity"],
+        second["repository_identity"]
+    );
+    assert_eq!(pending["request"]["repository_root"], json!(h.repo));
+    assert!(pending["request"]["repository"].is_null());
+    assert!(
+        h.stages(&item.id)
+            .await
+            .iter()
+            .any(|s| s.state == StageState::Spawning)
+    );
+    h.dispatch().await;
+    assert_eq!(
+        h.kv(&key).await.unwrap(),
+        raw,
+        "retries keep the frozen generation"
+    );
+    assert_eq!(aether.received_named("create_agent"), before);
 }

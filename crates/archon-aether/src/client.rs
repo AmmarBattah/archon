@@ -359,21 +359,25 @@ impl AetherClient {
                 "Aether lacks host_context; negotiate full before creating an agent".into(),
             ));
         }
-        assert!(
-            request.repository_root.is_none()
-                || request
-                    .scope
-                    .as_ref()
-                    .is_none_or(|scope| scope.repository.is_none()),
-            "repository_root and scope.repository are exclusive"
-        );
-        assert!(
-            request
-                .repository_root
+        if request.repository_root.is_some()
+            && request
+                .scope
                 .as_ref()
-                .is_none_or(|root| root.is_absolute()),
-            "repository_root is a registered absolute checkout"
-        );
+                .is_some_and(|scope| scope.repository.is_some())
+        {
+            return Err(ArchonError::Invalid(
+                "repository_root and scope.repository are exclusive".into(),
+            ));
+        }
+        if request
+            .repository_root
+            .as_ref()
+            .is_some_and(|root| !root.is_absolute())
+        {
+            return Err(ArchonError::Invalid(
+                "repository_root must be a registered absolute checkout".into(),
+            ));
+        }
         if request.repository_root.is_some() && !self.welcome.supports_repository_root() {
             return Err(ArchonError::Unavailable(
                 "Aether lacks repository_root required by the frozen creation request".into(),

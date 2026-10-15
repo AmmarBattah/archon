@@ -444,9 +444,9 @@ fn check_repository_identity(welcome: Option<&Welcome>) -> Check {
         ),
         Some(_) => (
             Level::Ok,
-            "scope.repository with the registered name for new runs; repository_root needs Aether 1.0.6",
+            "scope.repository with the registered name for new runs; roots require Aether versions that advertise repository_root",
         ),
-        None => (Level::Warn, "identity mode unknown until Aether connects"),
+        None => (Level::Ok, "identity mode unknown until Aether connects"),
     };
     check("repo identity", level, mode)
 }
@@ -841,7 +841,13 @@ mod tests {
             new.detail
                 .contains("existing runs keep their frozen identity")
         );
-        assert_eq!(check_repository_identity(None).level, Level::Warn);
+        let disconnected = check_repository_identity(None);
+        assert_eq!(disconnected.level, Level::Ok);
+        assert!(
+            disconnected
+                .detail
+                .contains("unknown until Aether connects")
+        );
     }
 
     #[test]
