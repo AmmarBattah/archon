@@ -172,7 +172,7 @@ allow_delegation = true
 
 fn implement_plan() -> ModelPlan {
     let mut plan = ModelPlan::default();
-    let choices = vec![choice(MODEL, Effort::High)];
+    let choices = vec![choice(MODEL, Effort::Medium)];
     plan.0.insert("implement".into(), choices);
     plan
 }
