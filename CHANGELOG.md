@@ -12,6 +12,10 @@
   Spend is still recorded and reported, `archon status` and `queue_status`
   say `budgets: off`, and a `budget_usd` set meanwhile is accepted with a
   note that it is not enforced. The default is unchanged. Daemon protocol 9.
+- Quality corrections tell Aether which recalled memories hurt the corrected
+  stage. Delivery happens in the background and resumes after a restart or
+  reconnect. Undo retracts the feedback, and `learning why` shows delivery
+  progress and reasons for skipped or unconfirmed feedback.
 
 ### Fixes
 

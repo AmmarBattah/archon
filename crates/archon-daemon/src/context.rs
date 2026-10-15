@@ -78,6 +78,12 @@ pub struct DaemonContext {
     /// Held while an operator answer is delivered and then recorded, so a
     /// question is delivered at most once (see `handlers::operator`).
     pub answering: Mutex<()>,
+    /// Serializes background evidence delivery with explicit retries.
+    pub learning_memory: Mutex<()>,
+    /// Explicit forget requests retain their serialization independently of evidence.
+    pub memory_curation: Mutex<()>,
+    /// New or revoked corrections and Aether reconnects wake durable delivery.
+    pub memory_feedback_ready: Notify,
     /// Serializes report snapshot refreshes with pruning.
     pub report_files: Arc<Mutex<()>>,
     /// Serializes orchestrator create/revive and announces its id.
