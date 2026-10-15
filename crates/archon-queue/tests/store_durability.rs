@@ -585,7 +585,7 @@ fn v9_keeps_an_earlier_provider_reported_total_as_the_floor() {
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(schema_versions(&path).last(), Some(&12));
+    assert_eq!(schema_versions(&path).last(), Some(&13));
     for n in [1, 2] {
         let settled = SpendRow {
             cost_complete: Some(true),

@@ -1002,9 +1002,11 @@ mod tests {
         )
         .unwrap();
         insert_feedback(&conn, "fb_old", V11_ROW).unwrap();
-        conn.execute_batch("DELETE FROM schema_migrations WHERE version = 12")
-            .unwrap();
-        assert_eq!(migrate(&mut conn).unwrap(), 12);
+        conn.execute_batch(
+            "DROP TABLE merge_requests; DELETE FROM schema_migrations WHERE version >= 12",
+        )
+        .unwrap();
+        assert_eq!(migrate(&mut conn).unwrap(), MIGRATIONS.len());
         let (data, reason): (String, String) = conn
             .query_row(
                 "SELECT data, reason FROM operator_feedback WHERE id = 'fb_old'",
@@ -1014,6 +1016,6 @@ mod tests {
             .unwrap();
         assert_eq!(data, r#"{"memory_feedback":null}"#);
         assert_eq!(reason, "wrong file");
-        assert_eq!(migrate(&mut conn).unwrap(), 12);
+        assert_eq!(migrate(&mut conn).unwrap(), MIGRATIONS.len());
     }
 }
