@@ -354,3 +354,77 @@ fn summaries_without_timeout_grades_keep_their_layout() {
         (0, 0)
     );
 }
+
+#[test]
+fn a_floor_needs_a_reported_cost_among_the_trials_that_priced_the_arm() {
+    let mut substituted = result(Some(0.0), Some(5.0));
+    substituted.cost_gap = Some("unpriced".into());
+    let mut unpriced = result(None, None);
+    unpriced.cost_gap = Some("unreported".into());
+    let exact = trial("t", Arm::Claude, true, 1.0, 2.0);
+
+    let estimated = Summary::build(&[substituted], None).unwrap();
+    assert_eq!(estimated.arms[0].cost_usd.as_ref().unwrap().mean, 5.0);
+    assert_eq!(estimated.arms[0].cost_bound, CostBound::Exact);
+    let with_unpriced = Summary::build(&[exact, unpriced], None).unwrap();
+    assert_eq!(with_unpriced.arms[0].cost_usd.as_ref().unwrap().n, 1);
+    assert_eq!(with_unpriced.arms[0].cost_bound, CostBound::Exact);
+}
+
+#[test]
+fn a_gapped_cost_beside_an_estimate_marks_the_mean_incomplete_not_a_floor() {
+    let mut gapped = trial("a", Arm::Archon, true, 1.0, 1.0);
+    gapped.cost_gap = Some("interrupted".into());
+    let mut estimate = trial("b", Arm::Archon, true, 1.0, 0.0);
+    estimate.cost_usd = None;
+    estimate.estimated_cost_usd = Some(5.0);
+    let summary = Summary::build(&[estimate, gapped], None).unwrap();
+    let archon = &summary.arms[0];
+    assert_eq!(archon.cost_usd.as_ref().unwrap().mean, 3.0);
+    assert_eq!(archon.cost_bound, CostBound::Incomplete);
+    let md = render_markdown(&summary).unwrap();
+    assert!(md.contains("| * 3.00 ± "), "{md}");
+    assert!(!md.contains("≥ 3.00"), "{md}");
+    assert!(md.contains("not a bound"));
+}
+
+#[test]
+fn a_cost_gap_marks_the_cost_as_a_floor_only_where_it_occurs() {
+    let mut gapped = trial("a", Arm::Archon, true, 1.0, 2.0);
+    gapped.cost_gap = Some("interrupted".into());
+    let exact = trial("a", Arm::Claude, true, 1.0, 1.0);
+    let summary = Summary::build(&[gapped, exact], None).unwrap();
+    let (archon, claude) = (&summary.arms[0], &summary.arms[1]);
+    assert_eq!(archon.cost_bound, CostBound::Floor);
+    assert_eq!(claude.cost_bound, CostBound::Exact);
+    assert_eq!(summary.tasks["a"][0].cost_bound, CostBound::Floor);
+    assert_eq!(summary.tasks["a"][1].cost_bound, CostBound::Exact);
+    let md = render_markdown(&summary).unwrap();
+    assert!(md.contains("| ≥ 2.00 ± 0.00 |"), "{md}");
+    assert!(
+        md.contains("| 1.00 ± 0.00 |") && !md.contains("≥ 1.00"),
+        "{md}"
+    );
+    assert!(md.contains("true cost is at least that"));
+
+    let plain = Summary::build(&[trial("a", Arm::Claude, true, 1.0, 1.0)], None).unwrap();
+    assert!(!render_markdown(&plain).unwrap().contains("≥ 1.00"));
+}
+
+#[test]
+fn the_manifest_spend_is_marked_by_its_bound_and_old_manifests_load_exact() {
+    let mut manifest: RunManifest =
+        serde_json::from_str(include_str!("../../results-v3/run.json")).unwrap();
+    assert_eq!(manifest.spent_bound, CostBound::Exact);
+    let mut out = String::new();
+    render_manifest(&mut out, &manifest).unwrap();
+    assert!(out.contains("spent $") && !out.contains("spent ≥"), "{out}");
+    manifest.spent_bound = CostBound::Floor;
+    let mut floor = String::new();
+    render_manifest(&mut floor, &manifest).unwrap();
+    assert!(floor.contains("spent ≥ $"), "{floor}");
+    manifest.spent_bound = CostBound::Incomplete;
+    let mut incomplete = String::new();
+    render_manifest(&mut incomplete, &manifest).unwrap();
+    assert!(incomplete.contains("spent * $"), "{incomplete}");
+}

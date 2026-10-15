@@ -9,7 +9,7 @@ use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::arms::archon::read_archon_work;
-use crate::metrics::{Arm, RunManifest, TrialResult};
+use crate::metrics::{Arm, CostBound, RunManifest, TrialResult};
 
 /// Mean and sample standard deviation of `n` values (stdev 0 when n = 1).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -83,6 +83,9 @@ pub struct Aggregate {
     pub input_tokens: Option<Stat>,
     pub output_tokens: Option<Stat>,
     pub cost_usd: Option<Stat>,
+    /// Whether `cost_usd` is exact, a floor or incomplete; see [`CostBound`].
+    #[serde(default)]
+    pub cost_bound: CostBound,
     pub operator_messages: Stat,
 }
 
@@ -148,6 +151,7 @@ impl Aggregate {
             input_tokens: Stat::of(&values(&|r| r.input_tokens.map(|t| t as f64))),
             output_tokens: Stat::of(&values(&|r| r.output_tokens.map(|t| t as f64))),
             cost_usd: Stat::of(&values(&TrialResult::effective_cost_usd)),
+            cost_bound: CostBound::of(results.iter().copied()),
             operator_messages: Stat::of(&values(&|r| Some(f64::from(r.operator_messages))))?,
         })
     }
@@ -400,7 +404,7 @@ pub fn render_markdown(summary: &Summary) -> anyhow::Result<String> {
             stat(&a.wall_secs, 0),
             opt_stat(a.input_tokens.as_ref(), 0, a.trials),
             opt_stat(a.output_tokens.as_ref(), 0, a.trials),
-            opt_stat(a.cost_usd.as_ref(), 2, a.trials),
+            cost_text(a),
             stat(&a.operator_messages, 1),
             a.infra,
             a.timeouts
@@ -466,10 +470,11 @@ fn render_manifest(out: &mut String, m: &RunManifest) -> anyhow::Result<()> {
     }
     writeln!(
         out,
-        "- Trials: {} planned, {} completed, {} skipped; spent ${:.2} of ${:.2}{}",
+        "- Trials: {} planned, {} completed, {} skipped; spent {}${:.2} of ${:.2}{}",
         m.planned,
         m.completed,
         m.skipped,
+        m.spent_bound.marker(),
         m.spent_usd,
         m.max_usd,
         if m.unpriced_trials > 0 {
@@ -511,7 +516,7 @@ fn render_routing_table(
             a.trials,
             percent(a.success_rate),
             stat(&a.wall_secs, 0),
-            opt_stat(a.cost_usd.as_ref(), 2, a.trials),
+            cost_text(a),
             a.infra,
             a.timeouts
         )?;
@@ -576,7 +581,7 @@ fn cell_text(c: &Aggregate) -> String {
         c.successes,
         c.trials,
         stat(&c.wall_secs, 0),
-        opt_stat(c.cost_usd.as_ref(), 2, c.trials),
+        cost_text(c),
         stat(&c.operator_messages, 1)
     )
 }
@@ -594,6 +599,15 @@ fn percent(x: f64) -> String {
 
 fn stat(s: &Stat, decimals: usize) -> String {
     format!("{:.*} ± {:.*}", decimals, s.mean, decimals, s.stdev)
+}
+
+/// The cost cell, prefixed with the mark for its [`CostBound`].
+pub(crate) fn cost_text(a: &Aggregate) -> String {
+    let text = opt_stat(a.cost_usd.as_ref(), 2, a.trials);
+    if a.cost_usd.is_none() {
+        return text;
+    }
+    format!("{}{text}", a.cost_bound.marker())
 }
 
 /// A metric only some trials reported (tokens, cost) says over how many.
@@ -621,7 +635,7 @@ const METHOD_NOTES: &str = "
 - Success is the hidden grader's verdict. Test graders restore the visible tests from the task, not from the agent's repository, and require the runner's own summary to report no failures and a minimum number of passing tests. Rubric graders need related facts close together and cap the answer length.
 - A failed trial with a harness error (the arm could not run cleanly: a provider limit, a crash, a grading failure) is an infrastructure failure. It is left out of pass rates and every metric, counted under Infra and listed with its error.
 - Wall time runs from handing over the prompt until the arm finished; Archon's daemon start-up (recorded as `setup_secs`) and the quiet window used to detect that Archon finished are excluded.
-- Input tokens include cache reads and writes. Cost is billed dollars when reported, else Aether's estimate or `--price` list prices. `(n=…)` marks a metric only that many trials reported.
+- Input tokens include cache reads and writes. Cost is billed dollars when reported, else Aether's estimate or `--price` list prices. `(n=…)` marks a metric only that many trials reported. `≥` marks a cost Aether reported as incomplete (`cost_gap`); the true cost is at least that. `*` marks a cost that includes one Aether reported as incomplete together with estimates; it is not a bound.
 - Operator messages are what the operator had to read: one final result for `claude`/`codex`, the assistant messages of the Aether agent, and the default-visible chat lines for Archon.
 - Values are mean ± sample standard deviation over graded trials. pass@k uses the unbiased estimator per task, averaged over tasks, with k the fewest graded trials any (task, arm) cell has.
 ";

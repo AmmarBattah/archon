@@ -8,13 +8,15 @@ use std::str::FromStr;
 use anyhow::{Context, bail, ensure};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Usage {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: Option<f64>,
     pub estimated_cost_usd: Option<f64>,
+    /// Aether's reason `cost_usd` is incomplete, making it a lower bound.
+    pub cost_gap: Option<String>,
 }
 
 impl Usage {
@@ -24,6 +26,15 @@ impl Usage {
         self.output_tokens += other.output_tokens;
         self.cost_usd = add_opt(self.cost_usd, other.cost_usd);
         self.estimated_cost_usd = add_opt(self.estimated_cost_usd, other.estimated_cost_usd);
+        self.cost_gap = merge_gaps(self.cost_gap.take(), other.cost_gap.clone());
+    }
+}
+
+/// Equal reasons keep the reason; different ones become `mixed`.
+fn merge_gaps(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) if a != b => Some("mixed".into()),
+        (a, b) => a.or(b),
     }
 }
 
@@ -266,7 +277,17 @@ fn aether_total(total: &Value) -> Usage {
         output_tokens: field("output_tokens"),
         cost_usd: total["cost_usd"].as_f64(),
         estimated_cost_usd: total["estimated_cost_usd"].as_f64(),
+        cost_gap: cost_gap(&total["cost_gap"]),
     }
+}
+
+/// Any present value marks the cost incomplete, so an unrecognised or oddly
+/// typed one is kept as `unknown` instead of being dropped.
+fn cost_gap(value: &Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    Some(value.as_str().unwrap_or("unknown").to_owned())
 }
 
 #[cfg(test)]
@@ -383,6 +404,58 @@ mod tests {
         assert_eq!(usage.cost_usd, Some(0.0));
         assert!((usage.estimated_cost_usd.unwrap() - 0.93).abs() < 1e-9);
         assert_eq!(aether_usage(&[]).unwrap(), None);
+    }
+
+    fn usage_event(agent: &str, seq: u64, gap: Option<Value>) -> Value {
+        let mut total = serde_json::json!({"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.5});
+        if let Some(gap) = gap {
+            total["cost_gap"] = gap;
+        }
+        serde_json::json!({
+            "agent_id": agent, "seq": seq,
+            "kind": {"type": "agent.usage_updated", "total": total}
+        })
+    }
+
+    fn gap_of(events: &[Value]) -> Option<String> {
+        aether_usage(events).unwrap().unwrap().cost_gap
+    }
+
+    #[test]
+    fn aether_cost_gap_is_absent_kept_or_unknown_never_an_error() {
+        let gap = |v: Value| gap_of(&[usage_event("a", 1, Some(v))]);
+        assert_eq!(gap_of(&[usage_event("a", 1, None)]), None);
+        assert_eq!(gap(Value::Null), None);
+        assert_eq!(gap("interrupted".into()), Some("interrupted".into()));
+        assert_eq!(
+            gap("a-future-reason".into()),
+            Some("a-future-reason".into())
+        );
+        assert_eq!(gap(serde_json::json!(7)), Some("unknown".into()));
+    }
+
+    #[test]
+    fn aether_cost_gaps_combine_across_agents() {
+        let same = [
+            usage_event("a", 1, Some("interrupted".into())),
+            usage_event("b", 2, Some("interrupted".into())),
+        ];
+        assert_eq!(gap_of(&same), Some("interrupted".into()));
+        let different = [
+            usage_event("a", 1, Some("interrupted".into())),
+            usage_event("b", 2, Some("unpriced".into())),
+        ];
+        assert_eq!(gap_of(&different), Some("mixed".into()));
+        let one = [
+            usage_event("a", 1, None),
+            usage_event("b", 2, Some("unreported".into())),
+        ];
+        assert_eq!(gap_of(&one), Some("unreported".into()));
+        let superseded = [
+            usage_event("a", 1, Some("interrupted".into())),
+            usage_event("a", 2, None),
+        ];
+        assert_eq!(gap_of(&superseded), None, "only the latest total counts");
     }
 
     #[test]

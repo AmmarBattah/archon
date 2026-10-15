@@ -133,6 +133,13 @@ fn changed_models_effort_and_baseline_shape_need_explicit_rebaselining() {
 }
 
 #[test]
+fn the_smoke_total_carries_the_mark_of_its_cost_bound() {
+    assert_eq!(total_cost_text(CostBound::Exact, 1.5), "$1.50");
+    assert_eq!(total_cost_text(CostBound::Floor, 1.5), "≥ $1.50");
+    assert_eq!(total_cost_text(CostBound::Incomplete, 1.5), "* $1.50");
+}
+
+#[test]
 fn failing_gate_is_persisted_and_returns_an_error() {
     let (baseline, manifest, mut results) = evidence();
     for result in &mut results {

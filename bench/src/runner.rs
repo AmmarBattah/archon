@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 
 use crate::arms::{self, ArmOutcome, ArmSettings, TrialInput};
 use crate::grade::{self, GradeOutcome, ResultSource};
-use crate::metrics::{Arm, RunManifest, TimeoutGrade, TrialResult};
+use crate::metrics::{Arm, CostBound, RunManifest, TimeoutGrade, TrialResult};
 use crate::plan::{Budget, RunOptions, TrialSpec, check_plan, plan};
 use crate::process::{redact_home, version_of};
 use crate::task::BenchTask;
@@ -79,6 +79,7 @@ pub async fn run(
     manifest.completed = ledger.completed;
     manifest.skipped = skipped;
     manifest.spent_usd = ledger.budget.spent_usd;
+    manifest.spent_bound = ledger.budget.spent_bound();
     manifest.unpriced_trials = ledger.budget.unpriced_trials;
     if skipped > 0 {
         manifest.stopped_reason = Some(format!(
@@ -142,9 +143,10 @@ fn record(shared: &Shared, result: &TrialResult) -> anyhow::Result<()> {
 
 fn progress_line(r: &TrialResult) -> String {
     let verdict = if r.success { "pass" } else { "FAIL" };
+    let floor = if r.cost_is_floor() { "≥ " } else { "" };
     let cost = r
         .effective_cost_usd()
-        .map_or_else(|| "$?".to_owned(), |c| format!("${c:.2}"));
+        .map_or_else(|| "$?".to_owned(), |c| format!("{floor}${c:.2}"));
     let problem = r
         .error
         .as_deref()
@@ -342,7 +344,7 @@ fn trial_result(
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
         (a, b) => a.or(b),
     };
-    let usage = outcome.usage;
+    let usage = outcome.usage.as_ref();
     TrialResult {
         task: task.file.id.clone(),
         arm: spec.arm,
@@ -357,6 +359,7 @@ fn trial_result(
         cached_input_tokens: usage.map(|u| u.cached_input_tokens),
         cost_usd: usage.and_then(|u| u.cost_usd),
         estimated_cost_usd: usage.and_then(|u| u.estimated_cost_usd),
+        cost_gap: usage.and_then(|u| u.cost_gap.clone()),
         operator_messages: outcome.operator_messages,
         error,
         timed_out: outcome.timed_out,
@@ -435,6 +438,7 @@ async fn start_manifest(
         completed: 0,
         skipped: 0,
         spent_usd: 0.0,
+        spent_bound: CostBound::Exact,
         unpriced_trials: 0,
         stopped_reason: None,
     }
@@ -505,5 +509,16 @@ mod tests {
             "aetherd not probed: no private sandbox"
         );
         assert_eq!(versions.len(), 1);
+    }
+
+    #[test]
+    fn progress_marks_only_a_gapped_reported_cost_as_a_floor() {
+        let mut gapped = result(Some(1.5), None);
+        gapped.cost_gap = Some("interrupted".into());
+        assert!(progress_line(&gapped).ends_with("1s ≥ $1.50"));
+        assert!(progress_line(&result(Some(1.5), None)).ends_with("1s $1.50"));
+        let mut estimated = result(Some(0.0), Some(2.0));
+        estimated.cost_gap = Some("unpriced".into());
+        assert!(progress_line(&estimated).ends_with("1s $2.00"));
     }
 }
