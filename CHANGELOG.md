@@ -13,6 +13,10 @@
   level. It looks only for an agent that ran no other attempt of the run, once
   none of its reviewers is still running, and refuses when Aether cannot show
   one of their results.
+- Reviewers run each experiment's repeats under one 30-second limit, not one
+  limit per repeat, and make their scratch copies with `mktemp -d` instead of
+  a literal `/tmp` path. In a benchmark, one reviewer's 40 capped runs
+  outlasted the whole task, and agents kept filling the shared `/tmp`.
 
 ## 1.2.2
 
