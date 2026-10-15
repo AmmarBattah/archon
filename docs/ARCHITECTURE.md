@@ -1905,10 +1905,9 @@ the required reviewer role; children with other roles follow the general model
 policy. The role matches `reviewer` exactly (case-insensitively); a reviewer
 with missing or unrecognised effort is refused. If Aether no longer has the
 child when the watchdog reads it, only its event model can be checked: its role
-and effort are unavailable. With no such key the contract asks
-for a model other than the lead's whose cost Aether reports (a Codex reviewer's
-unpriced usage blocks a budgeted item), and the watchdog holds reviewers only to
-the model policy.
+and effort are unavailable. With no such key the contract names the models the
+item's effective policy allows other than the lead's, or the lead's own when the
+policy allows no other, and the watchdog holds reviewers only to the model policy.
 
 **Stage timeouts.** `enqueue`, `update_item` and `steer_item` take `stage_timeouts`, a
 `{"<stage-id>": minutes}` map for the item: each stage it names runs with that

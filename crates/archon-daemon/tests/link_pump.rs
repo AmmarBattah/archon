@@ -2018,3 +2018,30 @@ async fn reviewer_spawn_is_checked_against_the_items_named_model_and_effort() {
             .all(|c| c["reason"].as_str().unwrap().contains("reviewer plan"))
     );
 }
+
+/// With one model allowed and no reviewer plan, a reviewer on the lead's own
+/// model, as its contract advises, runs; one sent to another model does not.
+#[tokio::test]
+async fn a_reviewer_on_the_only_allowed_model_is_kept() {
+    let mut config = Config::default();
+    config.models.allow = vec![ModelRef::new(ALLOWED.0, ALLOWED.1)];
+    config.models.max_effort = Some(Effort::Medium);
+    let harness = Harness::with(config, None).await;
+    let repo = tempfile::tempdir().unwrap();
+    running_stage(&harness.ctx, repo.path(), STAGE, STAGE_TASK).await;
+    let (agents, pump) = running_pump(&harness).await;
+    harness.fake.set_default("cancel", Scripted::ok());
+    for (id, model) in [(CHILD, ALLOWED), (CHILD_2, DENIED)] {
+        let mut agent = agents.set(id, "running");
+        agent["role"] = json!("reviewer");
+        agent["config"] = json!({"effort": "medium"});
+        agents.0.lock().unwrap().insert(id.to_owned(), agent);
+        push(&harness, created(id, STAGE, model), keys::CURSOR_FLEET).await;
+    }
+    pump.abort();
+    let cancels = cancelled(&harness);
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert_eq!(cancels[0].0, CHILD_2);
+    assert!(cancels[0].1.contains("is not allowed"), "{}", cancels[0].1);
+    assert_eq!(harness.kv(&format!("link_unchecked_{CHILD}")).await, None);
+}

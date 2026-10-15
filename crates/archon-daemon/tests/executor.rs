@@ -2113,6 +2113,10 @@ async fn adaptive_guarded_build_delegates_within_the_stated_policy_and_archond_s
     assert!(rules.contains("pass `workspace_mode: \"isolated\"`"));
     assert!(build.instructions.contains("\n## Review on record\n"));
     assert!(build.instructions.contains("\n## Ship record\n"));
+    // The repository leaves the lead's model alone: its reviewers run on it.
+    let own =
+        format!("on your own model {MODEL}, at effort at most high: this item allows no other");
+    assert!(build.instructions.contains(&own), "{}", build.instructions);
 
     let (built, reviewer) = reviewed_by_one(&h, "Verified; one reviewer passed it").await;
     h.settle_running(|_| built.clone()).await;

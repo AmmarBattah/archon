@@ -34,6 +34,12 @@
 
 ### Fixes
 
+- A review holder whose plan names no reviewer models is now told to use a
+  model its item's policy allows: another than its own where there is one,
+  else its own. It was told to find a different priced model, which a
+  single-model allowlist forbids, so such items failed or delegated reviewers
+  Archon then cancelled. The stale claim that Codex usage arrives unpriced is
+  gone.
 - Refreshes map steered build/implement models and reviewers onto the refresh
   pipeline, fill missing choices within model policy, and skip proposal and
   report gates while keeping review, merge and tools. Refreshing a finished

@@ -9,6 +9,7 @@ use archon_core::catalog::{StageKind, WorkspaceMode, is_snapshot_of};
 use archon_core::error::ArchonError;
 use archon_core::id::{PipelineRunId, QueueItemId};
 use archon_core::notify::NotificationKind;
+use archon_core::policy::ModelPolicy;
 use archon_core::queue::{QueueItem, QueueState};
 use archon_core::repo::{Repo, ShipMode};
 use archon_core::run::{PipelineRun, RunState};
@@ -152,12 +153,13 @@ async fn prepare(
             item.pipeline
         )));
     }
-    env.policy(&ctx.config).check_plan(&item.model_plan)?;
+    let models = env.policy(&ctx.config);
+    models.check_plan(&item.model_plan)?;
     let team = spec.file.stages.iter().any(|s| s.kind == StageKind::Team);
     let workspace = workspace(ctx, &env, item, header.workspace, team).await?;
     let added = workspace.added.clone();
     let experiments = crate::experiments::item_dir(&ctx.paths, &item.id);
-    match assemble(item, &env, spec, run_id, workspace, experiments) {
+    match assemble(item, &env, spec, run_id, workspace, experiments, models) {
         Ok(prepared) => Ok(prepared),
         Err(error) => {
             abandon_worktree(ctx, added).await?;
@@ -177,7 +179,8 @@ fn without_retired_ship(item: &QueueItem, spec: &PipelineSpec) -> QueueItem {
 }
 
 /// The run in `workspace` and its driver, which may still refuse the
-/// pipeline's plan, prompts or gates. Its reviewers experiment in `experiments`.
+/// pipeline's plan, prompts or gates. Its reviewers experiment in `experiments`
+/// on models `models` allows.
 fn assemble(
     item: &QueueItem,
     env: &RepoEnv,
@@ -185,6 +188,7 @@ fn assemble(
     run_id: PipelineRunId,
     workspace: Workspace,
     experiments: PathBuf,
+    models: ModelPolicy,
 ) -> Result<Prepared, ArchonError> {
     assert!(!spec.file.stages.is_empty(), "pipelines have a first stage");
     assert!(workspace.path.is_absolute(), "run workspaces are absolute");
@@ -206,7 +210,8 @@ fn assemble(
     let gates = OperatorGates::for_run(&spec, &item.autonomy);
     let driver = RunDriver::new(spec.clone(), item.model_plan.clone(), base_vars.clone())?
         .with_gates(gates)?
-        .with_experiments(experiments);
+        .with_experiments(experiments)
+        .with_policy(models);
     let run = PipelineRun {
         id: run_id,
         item: item.id.clone(),
