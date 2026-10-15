@@ -23,6 +23,13 @@
 
 ### Fixes
 
+- Refreshes map steered build/implement models and reviewers onto the refresh
+  pipeline, fill missing choices within model policy, and skip proposal and
+  report gates while keeping review, merge and tools. Refreshing a finished
+  run (including a retry) works after its prompt templates expire: the base
+  branch is retained separately, with the configured repository base used
+  for older runs whose metadata is already gone.
+
 - Upgrades drain before replacing binaries, keeping the old CLI and agent
   tools compatible with archond while running stages finish. Dispatch stays
   held during installation; an expired drain installs nothing unless requeue
