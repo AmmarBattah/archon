@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 1.2.3
+
+Released 2026-10-15.
+
+Your corrections now teach Aether's memory: with Aether 1.0.8, a quality
+correction tells Aether which recalled memories concerned the corrected stage,
+and a memory you name is ranked a little lower. Stages of a repository share
+one build cache, and a single switch turns dollar budgets off. Reviews retry
+less and finish sooner. The store migrates automatically on first start
+(migration 12); older Archon binaries refuse the migrated store, so keep 1.2.3
+once you have run it. Daemon protocol 9.
 
 ### Added
 
