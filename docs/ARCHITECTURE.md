@@ -3569,7 +3569,7 @@ limits are independent; zero disables the corresponding limit. Normal
 foreground execution preserves its caller's stdout/stderr destination.
 
 `archon status` and `queue_status` expose allocated bytes by kind, including
-worktrees, scratch, build caches, artifacts, report/Lavish copies, logs, the
+worktrees, scratch, experiments, build caches, artifacts, report/Lavish copies, logs, the
 SQLite store plus WAL/SHM, orchestrator mirrors, mirror git objects, frozen
 pipeline definitions, initiative bodies, chat history and dedicated Aether.
 A one-minute cache avoids full filesystem traversal for every status poll;
