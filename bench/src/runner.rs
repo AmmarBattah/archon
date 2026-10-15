@@ -342,7 +342,7 @@ fn trial_result(
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
         (a, b) => a.or(b),
     };
-    let usage = outcome.usage;
+    let usage = outcome.usage.as_ref();
     TrialResult {
         task: task.file.id.clone(),
         arm: spec.arm,
@@ -357,6 +357,7 @@ fn trial_result(
         cached_input_tokens: usage.map(|u| u.cached_input_tokens),
         cost_usd: usage.and_then(|u| u.cost_usd),
         estimated_cost_usd: usage.and_then(|u| u.estimated_cost_usd),
+        cost_gap: usage.and_then(|u| u.cost_gap.clone()),
         operator_messages: outcome.operator_messages,
         error,
         timed_out: outcome.timed_out,

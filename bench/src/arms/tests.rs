@@ -164,7 +164,7 @@ fn model_labels_and_price_estimates() {
         output_tokens: 100_000,
         ..Usage::default()
     };
-    let priced = s.price(Arm::Codex, usage);
+    let priced = s.price(Arm::Codex, usage.clone());
     let estimate = priced.estimated_cost_usd.unwrap();
     assert!((estimate - (1.0 + 0.1 + 1.0)).abs() < 1e-9, "{estimate}");
     assert_eq!(s.price(Arm::Claude, usage).estimated_cost_usd, None);
@@ -172,7 +172,7 @@ fn model_labels_and_price_estimates() {
         cost_usd: Some(0.5),
         ..Usage::default()
     };
-    assert_eq!(s.price(Arm::Codex, billed), billed);
+    assert_eq!(s.price(Arm::Codex, billed.clone()), billed);
 }
 
 #[test]

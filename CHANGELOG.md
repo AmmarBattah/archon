@@ -27,6 +27,9 @@
 - A review holder is told to name every reviewer its coverage rests on,
   earlier whole-change passes included. Naming only the last delta reviewers
   was refused and cost a retry.
+- The bench now marks a cost with `≥` when Aether reports it incomplete
+  (`cost_gap`, such as a parked Claude Code coordinator), instead of showing it
+  as exact.
 
 ## 1.2.1
 

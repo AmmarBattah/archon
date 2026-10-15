@@ -354,3 +354,24 @@ fn summaries_without_timeout_grades_keep_their_layout() {
         (0, 0)
     );
 }
+
+#[test]
+fn a_cost_gap_marks_the_cost_as_a_floor_only_where_it_occurs() {
+    let mut gapped = trial("a", Arm::Archon, true, 1.0, 2.0);
+    gapped.cost_gap = Some("interrupted".into());
+    let exact = trial("a", Arm::Claude, true, 1.0, 1.0);
+    let summary = Summary::build(&[gapped, exact], None).unwrap();
+    let (archon, claude) = (&summary.arms[0], &summary.arms[1]);
+    assert!(archon.cost_floor && !claude.cost_floor);
+    assert!(summary.tasks["a"][0].cost_floor && !summary.tasks["a"][1].cost_floor);
+    let md = render_markdown(&summary).unwrap();
+    assert!(md.contains("| ≥ 2.00 ± 0.00 |"), "{md}");
+    assert!(
+        md.contains("| 1.00 ± 0.00 |") && !md.contains("≥ 1.00"),
+        "{md}"
+    );
+    assert!(md.contains("true cost is at least that"));
+
+    let plain = Summary::build(&[trial("a", Arm::Claude, true, 1.0, 1.0)], None).unwrap();
+    assert!(!render_markdown(&plain).unwrap().contains("≥ 1.00"));
+}

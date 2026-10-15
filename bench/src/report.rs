@@ -20,6 +20,8 @@ struct Metric {
     title: &'static str,
     unit: &'static str,
     value: fn(&Aggregate) -> Option<Stat>,
+    /// Whether the value is only a lower bound, drawn with a `≥` prefix.
+    floor: fn(&Aggregate) -> bool,
 }
 
 const METRICS: [Metric; 5] = [
@@ -33,16 +35,19 @@ const METRICS: [Metric; 5] = [
                 stdev: 0.0,
             })
         },
+        floor: |_| false,
     },
     Metric {
         title: "Wall time",
         unit: "s",
         value: |a| Some(a.wall_secs),
+        floor: |_| false,
     },
     Metric {
         title: "Cost",
         unit: "$",
         value: |a| a.cost_usd,
+        floor: |a| a.cost_floor,
     },
     Metric {
         title: "Total tokens (input + output)",
@@ -55,11 +60,13 @@ const METRICS: [Metric; 5] = [
                 stdev: (input.stdev.powi(2) + output.stdev.powi(2)).sqrt(),
             })
         },
+        floor: |_| false,
     },
     Metric {
         title: "Operator-visible messages",
         unit: "msgs",
         value: |a| Some(a.operator_messages),
+        floor: |_| false,
     },
 ];
 
@@ -115,7 +122,10 @@ fn routing_table(title: &str, buckets: &BTreeMap<String, Aggregate>) -> String {
     for (label, a) in buckets {
         assert_eq!(a.arm, Arm::Archon, "routing buckets contain Archon only");
         assert!(a.successes <= a.trials, "passes cannot exceed trials");
-        let cost = a.cost_usd.as_ref().map_or_else(|| "—".into(), value_label);
+        let cost = match a.cost_usd.as_ref() {
+            Some(stat) => floor_label(stat, a.cost_floor),
+            None => "—".into(),
+        };
         out.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}/{} ({:.0}%)</td><td>{}</td>\
              <td>{}</td><td>{}</td><td>{}</td></tr>",
@@ -174,11 +184,18 @@ fn bar_chart(metric: &Metric, arms: &[Aggregate]) -> String {
             "<text x=\"{:.1}\" y=\"{}\">{}</text>",
             LABEL_WIDTH + bar.max((stat.mean + stat.stdev) * scale) + 6.0,
             y + 14.0,
-            value_label(stat)
+            floor_label(stat, (metric.floor)(aggregate))
         ));
     }
     svg.push_str("</svg></figure>");
     svg
+}
+
+fn floor_label(stat: &Stat, floor: bool) -> String {
+    if floor {
+        return format!("≥ {}", value_label(stat));
+    }
+    value_label(stat)
 }
 
 fn value_label(stat: &Stat) -> String {
@@ -236,6 +253,23 @@ mod tests {
             1,
             "archon had no token counts"
         );
+    }
+
+    #[test]
+    fn report_marks_a_cost_floor_only_when_aether_reported_a_gap() {
+        let mut gapped = result(Some(2.0), None);
+        gapped.arm = Arm::Archon;
+        gapped.cost_gap = Some("interrupted".into());
+        let exact = result(Some(1.0), None);
+        let summary = Summary::build(&[gapped, exact], None).unwrap();
+        let cost = bar_chart(&METRICS[2], &summary.arms);
+        assert_eq!(cost.matches("≥ 2.00").count(), 1, "{cost}");
+        assert!(!cost.contains("≥ 1.00"), "{cost}");
+        let wall = bar_chart(&METRICS[1], &summary.arms);
+        assert!(!wall.contains('≥'), "{wall}");
+
+        let plain = Summary::build(&[result(Some(1.0), None)], None).unwrap();
+        assert!(!render_html(&plain, "").contains("≥ 1.00"));
     }
 
     #[test]

@@ -77,6 +77,9 @@ pub struct TrialResult {
     pub cost_usd: Option<f64>,
     /// Subscription estimates, or `--price` applied to the token counts.
     pub estimated_cost_usd: Option<f64>,
+    /// Why Aether called `cost_usd` incomplete; present means it is a floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_gap: Option<String>,
     /// Messages the operator would have had to read.
     pub operator_messages: u32,
     /// Harness failure (not a task failure): the trial did not run cleanly.
@@ -186,6 +189,7 @@ pub(crate) mod tests {
             cached_input_tokens: None,
             cost_usd: cost,
             estimated_cost_usd: estimate,
+            cost_gap: None,
             operator_messages: 1,
             error: None,
             timed_out: false,
@@ -227,6 +231,18 @@ pub(crate) mod tests {
         assert_eq!(parsed.arm, Arm::Codex);
         assert!(!parsed.timed_out && parsed.cached_input_tokens.is_none());
         assert!(parsed.archon_work.is_none() && parsed.graded_on_timeout.is_none());
+        assert_eq!(parsed.cost_gap, None);
+    }
+
+    #[test]
+    fn cost_gap_round_trips_and_stays_absent_when_unused() {
+        let plain = serde_json::to_string(&result(Some(1.0), None)).unwrap();
+        assert!(!plain.contains("cost_gap"), "{plain}");
+        let mut floor = result(Some(1.0), None);
+        floor.cost_gap = Some("interrupted".into());
+        let parsed: TrialResult =
+            serde_json::from_str(&serde_json::to_string(&floor).unwrap()).unwrap();
+        assert_eq!(parsed.cost_gap.as_deref(), Some("interrupted"));
     }
 
     #[test]
