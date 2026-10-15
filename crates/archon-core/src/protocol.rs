@@ -24,6 +24,7 @@ use crate::lesson::{Lesson, LessonDraft, LessonPatch, LessonQuery, LessonStats, 
 use crate::model::{Effort, ModelChoice, ModelPlan, ModelReasons, ModelRef};
 use crate::model_evidence::{ModelEvidenceQuery, ModelEvidenceReport};
 use crate::notify::{FeedItem, NotificationKind, Question};
+use crate::ops::{UpgradeRequest, Versions};
 use crate::policy::ModelPolicy;
 use crate::queue::{Caps, PauseState, Priority, QueueItem};
 use crate::repo::{Repo, ShipMode};
@@ -43,7 +44,9 @@ use crate::steer::Steer;
 /// 9: `[limits] budgets_enabled`; `Caps` carries it, and a change that sets an
 /// item's budget while budgets are off answers `ItemBudgetsOff`.
 /// 10: `refresh_item`; an older archond knows no such request.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// 11: `upgrade`, `check_updates` and `repo_add`'s `github_watch`; an older
+/// archond would register a repository and silently leave it unwatched.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Said beside an item whose `budget_usd` was set while budgets are off.
 pub const BUDGETS_OFF_NOTE: &str = "Dollar budgets are globally off ([limits] budgets_enabled = \
@@ -275,6 +278,12 @@ pub enum Request {
     OrchestratorAttach,
     /// CLI only: cancel and recreate the orchestrator agent.
     OrchestratorRestart,
+    /// Operator only: install, drain, then restart archond and Archon's own
+    /// aetherd. Accepted at once; each step is reported in the feed.
+    Upgrade(UpgradeRequest),
+    /// Operator only, as it asks the network: the latest releases of archon
+    /// and aether, kept for `status` and `queue_status`.
+    CheckUpdates,
 
     /// CLI only: collect what finished runs left (ARCHITECTURE §13.2).
     /// Worktrees go once their runs finished `older_than_secs` ago
@@ -391,6 +400,8 @@ impl Request {
             | Self::Say { .. }
             | Self::OrchestratorRestart
             | Self::OrchestratorAttach
+            | Self::Upgrade(_)
+            | Self::CheckUpdates
             | Self::Gc { .. }
             | Self::ConfigureGithubWatcher { .. }
             | Self::UpdateLesson { .. }
@@ -399,7 +410,7 @@ impl Request {
             | Self::LearningRestoreMemory { .. }
             | Self::LearningRetryMemory { .. }
             | Self::Answer { .. } => true,
-            Self::RepoAdd(add) => add.auto_merge,
+            Self::RepoAdd(add) => add.auto_merge || add.github_watch,
             Self::Pause(target) | Self::Resume(target) => {
                 matches!(target, PauseTarget::Global { hard: true })
             }
@@ -438,7 +449,8 @@ impl Request {
             | Self::LessonStats { .. }
             | Self::LearningWhy { .. }
             | Self::ListArtifacts { .. }
-            | Self::ReadArtifact { .. } => true,
+            | Self::ReadArtifact { .. }
+            | Self::CheckUpdates => true,
             Self::ForAgent { request, .. } => request.is_read_only(),
             _ => false,
         }
@@ -456,6 +468,10 @@ pub struct RepoAdd {
     /// operator only, as it raises the ceiling. `RepoUpdate` sets the rest.
     #[serde(default)]
     pub auto_merge: bool,
+    /// Also watch the repository's GitHub `origin` with Archon's watcher;
+    /// operator only, as only the operator changes what is watched.
+    #[serde(default)]
+    pub github_watch: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,6 +623,11 @@ pub enum Reply {
     GithubComment {
         url: String,
     },
+    /// An upgrade was accepted; what it will do.
+    UpgradeStarted {
+        text: String,
+    },
+    Versions(Box<Versions>),
     Gc(Box<GcReport>),
     Artifacts(Box<ArtifactListing>),
     ArtifactPage(Box<ArtifactPage>),
@@ -792,6 +813,13 @@ pub struct DaemonStatus {
     /// `None` from an archond that predates the check.
     #[serde(default)]
     pub disk: Option<DiskStatus>,
+    /// Running, installed and latest versions of archon and aether as
+    /// archond last read them. `None` before the first reading.
+    #[serde(default)]
+    pub versions: Option<Versions>,
+    /// The upgrade under way, in one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<String>,
 }
 
 /// `DaemonStatus::disk`: the fuller of the filesystems holding the data
@@ -912,6 +940,8 @@ pub enum WaitingReasonCode {
     DependencyFailed,
     DependencyWaiting,
     GlobalPause,
+    /// An operator's upgrade drains Archon before it restarts.
+    Draining,
     LowDisk,
     TotalBudget,
     DailyBudget,
@@ -1473,8 +1503,29 @@ mod tests {
             base_branch: None,
             default_pipeline: None,
             auto_merge: true,
+            github_watch: false,
         };
-        assert!(Request::RepoAdd(merge).is_operator_only());
+        assert!(Request::RepoAdd(merge.clone()).is_operator_only());
+        let watch = RepoAdd {
+            auto_merge: false,
+            github_watch: true,
+            ..merge
+        };
+        assert!(Request::RepoAdd(watch.clone()).is_operator_only());
+        let plain = RepoAdd {
+            github_watch: false,
+            ..watch
+        };
+        assert!(!Request::RepoAdd(plain).is_operator_only());
+        let upgrade = Request::Upgrade(crate::ops::UpgradeRequest {
+            archon: Some(crate::ops::UpgradeTarget::Main),
+            aether: None,
+            drain_secs: 60,
+            requeue: false,
+            keep_aether: false,
+        });
+        assert!(upgrade.is_operator_only() && !upgrade.is_read_only());
+        assert!(Request::CheckUpdates.is_operator_only());
         for operator_users in [None, Some(OperatorUsers::parse(&["octocat"]).unwrap())] {
             let change = WatcherChange::Operators { operator_users };
             let request = Request::ConfigureGithubWatcher { change };
