@@ -36,6 +36,9 @@
 - A review holder is told to name every reviewer its coverage rests on,
   earlier whole-change passes included. Naming only the last delta reviewers
   was refused and cost a retry.
+- Reviewers run each mutant or probe in a copy under `$TMPDIR` (else `/tmp`),
+  so experiments honour a private temporary directory and never touch the
+  shared workspace.
 - The bench now marks a cost with `≥` when Aether reports it incomplete
   (`cost_gap`, such as a parked Claude Code coordinator), instead of showing it
   as exact. A total or mean that also includes estimates is marked `*`, since
