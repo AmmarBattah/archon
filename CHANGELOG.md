@@ -2,8 +2,16 @@
 
 ## Unreleased
 
-### Features
+### Added
 
+- `[limits] budgets_enabled = false` (or `archon queue caps --budgets off`,
+  until archond restarts) turns every dollar budget off: item budgets, the
+  daily and total admission holds and the distillation reservation stop
+  enforcing, no `cost_budget` goes to Aether for new stage agents, and
+  usage without a dollar cost (every Codex model) no longer blocks a run.
+  Spend is still recorded and reported, `archon status` and `queue_status`
+  say `budgets: off`, and a `budget_usd` set meanwhile is accepted with a
+  note that it is not enforced. The default is unchanged. Daemon protocol 9.
 - Quality corrections tell Aether which recalled memories hurt the corrected
   stage. Delivery happens in the background and resumes after a restart or
   reconnect. Undo retracts the feedback, and `learning why` shows delivery
