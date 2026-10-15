@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 1.2.2
+
+Released 2026-10-15.
+
+With Aether 1.0.6, agents in registered repositories now share memory with your
+direct Aether sessions in the same checkout. Review rounds are faster without
+being weaker, and the bench reports timed-out work and incomplete costs
+honestly. No store migration: update in place.
 
 ### Added
 
@@ -11,8 +18,8 @@
 
 ### Fixes
 
-- Runs fail with the frozen checkout path and recovery guidance when that checkout
-  is missing or Aether refuses its root, without repeatedly advancing node generations.
+- A run whose registered checkout has gone missing fails with the path and how
+  to recover (restore it there and retry the item), instead of retrying.
 - Review rounds are faster without being weaker. Reviewers run each ad-hoc
   experiment, such as a mutant, under a 30-second timeout, and a hang counts as
   caught. On a blocking finding the agent cancels the reviewers still reading
