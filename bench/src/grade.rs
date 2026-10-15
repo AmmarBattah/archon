@@ -68,7 +68,7 @@ pub async fn grade(
     }
     if let Err(e) = remove_grading_copy(task, layout) {
         notes.push(format!(
-            "the grading copy {} was not removed: {e:#}",
+            "cleaning up the grading copy {} failed: {e:#}",
             layout.grade.display()
         ));
     }
