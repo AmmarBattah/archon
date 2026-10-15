@@ -25,6 +25,7 @@ max_effort = "high"
 max_parallel_agents = 8        # the hard cap on running stage agents (the default)
 max_per_repo = 2
 budget_usd_daily = 50.0
+# budgets_enabled = false      # no dollar budget is enforced at all; spend is still recorded
 min_free_gb = 10               # nothing new starts below this much free disk; 0 = off
 [limits.per_pipeline]
 adaptive = 3
@@ -34,7 +35,20 @@ auto_gc = true                 # archond collects finished runs' worktrees itsel
 cache_after = "1h"             # then deletes their build caches (git-ignored files)
 gc_after = "7d"                # and removes worktrees without uncommitted changes
 cache_dirs = ["target"]        # only these caches; unset = everything git ignores
+shared_cache = true            # stages build into one cargo target dir per repository
+shared_cache_after = "14d"     # idle shared caches go; never while a run is live
+pressure_after = "1d"          # shorter ages while dispatch is held for disk space
+
+[artifacts]                    # files stages publish; read by item id later
+max_file_mb = 256
+max_item_mb = 1024
+keep_after = "30d"             # after the item settled
 ```
+
+A repository opts out of the shared cache with `[cache] shared = false` in
+`<repo>/.archon/config.toml`. Cargo locks a shared target directory, so
+parallel builds of one profile queue on it; opt out if that costs more than
+the disk.
 
 To run Archon on your own `aetherd` instead, set `[aether] mode = "shared"`.
 In shared mode, `archon setup` adds the `archon` MCP server to your
@@ -180,7 +194,8 @@ the bounds, sample size and context; five wins are not proof of equivalence.
 `distill_every` (1..100) counts new outcomes per repository before a $1 errand.
 At most one distillation is queued or running per repository. Across repositories,
 `distill_daily_budget_usd` reserves the full errand budgets per UTC creation day;
-the default is $3, and 0 disables new distillations. Imported history informs routing
+the default is $3, and 0 disables new distillations. With `budgets_enabled = false`
+a positive reservation does not limit them; 0 still disables them. Imported history informs routing
 and statistics but is never distilled, avoiding upgrade spending bursts.
 Proposed lessons and pipelines wait for operator acceptance; inspect pipelines with
 `archon pipelines proposals [name]` before `archon pipelines accept <name>`.

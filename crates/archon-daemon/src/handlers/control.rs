@@ -84,7 +84,7 @@ pub(super) async fn status(ctx: &DaemonContext) -> Result<Reply, ArchonError> {
         held_news: count(triggers::held_news(ctx).await?),
         mcp: Some(supervisor::mcp_status(ctx).await),
         github: github::status(ctx).await,
-        disk: Some(disk_status(ctx).await),
+        disk: Some(disk_status(ctx).await?),
         merges_waiting: merges.waiting,
         merge_granted: merges.granted,
     };
@@ -96,7 +96,7 @@ pub(super) async fn status(ctx: &DaemonContext) -> Result<Reply, ArchonError> {
 }
 
 /// Free space where archond writes, read now, with the disk hold.
-async fn disk_status(ctx: &DaemonContext) -> DiskStatus {
+async fn disk_status(ctx: &DaemonContext) -> Result<DiskStatus, ArchonError> {
     let (path, free_bytes, error) = match dispatcher::read_disk(ctx).await {
         Ok(reading) => (reading.path, Some(reading.free_bytes), None),
         Err(error) => (ctx.paths.data_dir.clone(), None, Some(error.to_string())),
@@ -109,13 +109,14 @@ async fn disk_status(ctx: &DaemonContext) -> DiskStatus {
         held: ctx.disk.holding(),
         disk_full: ctx.disk.disk_full(),
         standby: ctx.standby.get().cloned(),
+        gc: crate::gc::last_pass(&*ctx.store.lock().await)?,
     };
     assert_ne!(status.free_bytes.is_some(), status.error.is_some());
     assert!(
         !status.path.as_os_str().is_empty(),
         "the status names a path"
     );
-    status
+    Ok(status)
 }
 
 fn count(n: usize) -> u32 {

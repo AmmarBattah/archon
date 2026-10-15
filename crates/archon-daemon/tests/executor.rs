@@ -1968,10 +1968,10 @@ const SCHEDULE_TOOLS: [&str; 3] = ["create_schedule", "update_schedule", "list_s
 
 /// What a guarded stage agent does not see, in a workspace it may write.
 fn guarded_hidden() -> Vec<String> {
-    let messaging = archon_core::mcp_tools::qualified("message_orchestrator");
+    let kept = archon_core::mcp_tools::STAGE_TOOLS.map(archon_core::mcp_tools::qualified);
     archon_core::mcp_tools::qualified_names()
         .into_iter()
-        .filter(|name| name != &messaging)
+        .filter(|name| !kept.contains(name))
         .chain(SCHEDULE_TOOLS.map(str::to_owned))
         .collect()
 }
@@ -2157,6 +2157,50 @@ async fn a_completed_builder_named_as_the_reviewer_is_no_review() {
     let error = refused_review(&h, &item).await;
     assert!(error.contains(&format!("reviewer {builder}")), "{error}");
     assert!(error.contains("no `verdict`"), "{error}");
+}
+
+/// Codex can finish with JSON text that Aether stores only as the summary.
+#[tokio::test]
+async fn a_luna_summary_json_verdict_still_needs_to_pass_the_current_commit() {
+    for verdict in ["pass", "fail", "missing", "stale"] {
+        let h = Harness::new().await;
+        let item = adaptive_item(&h).await;
+        let lead = h.running().await.remove(0);
+        let reviewer = h.backend.delegate(&lead_agent(&lead), "codex/gpt-6-luna");
+        let named = pass_by(std::slice::from_ref(&reviewer));
+        let built = shipped_by(&h, &lead, "Reviewed", named).await;
+        let mut data = verdict_on(&built, if verdict == "fail" { "fail" } else { "pass" });
+        match verdict {
+            "missing" => {
+                data.as_object_mut().unwrap().remove("verdict");
+            }
+            "stale" => {
+                data["head"] = git(&h.repo, &["rev-parse", "main"]).into();
+            }
+            _ => {}
+        }
+        h.backend.complete_delegated_with(
+            &reviewer,
+            StageOutcome::Completed {
+                summary: data.to_string(),
+                structured: None,
+            },
+        );
+        h.settle_running(|_| built.clone()).await;
+        if verdict == "pass" {
+            h.dispatch().await;
+            assert!(delivered(&h, &item).await, "{:?}", h.state(&item.id).await);
+        } else {
+            let error = refused_review(&h, &item).await;
+            let why = match verdict {
+                "fail" => "0 of the reviewers named passed",
+                "missing" => "no `verdict`",
+                "stale" => "read the base branch, not the change",
+                _ => unreachable!(),
+            };
+            assert!(error.contains(why), "{verdict}: {error}");
+        }
+    }
 }
 
 /// A reviewer that failed the change does not pass it, whatever the lead says.

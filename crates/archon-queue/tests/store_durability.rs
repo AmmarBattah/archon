@@ -239,7 +239,7 @@ fn migrations_apply_once_and_a_newer_store_is_refused() {
     drop(Store::open(&path).unwrap());
     assert_eq!(
         schema_versions(&path),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     );
     let conn = rusqlite::Connection::open(&path).unwrap();
     let mode: String = conn
@@ -309,7 +309,7 @@ fn concurrent_first_opens_migrate_once() {
     }
     assert_eq!(
         schema_versions(&path),
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     );
 }
 

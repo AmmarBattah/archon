@@ -11,9 +11,11 @@ use crate::team::TeamSlot;
 
 mod initiative;
 mod lessons;
+mod storage;
 
 pub use initiative::initiative_rules;
 pub use lessons::lesson_rules;
+pub use storage::{artifact_rules, build_cache_rules};
 
 /// Where a stage stands towards its pipeline's team stage.
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +121,9 @@ fn depth_rule(depth: u32) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Dependency {
     pub item: String,
+    /// The directory of the files it published, if it published any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<String>,
     /// Its branch in the repository of the stage's item, if it has one there.
     pub branch: Option<String>,
     pub pull_request: Option<String>,
@@ -197,7 +202,7 @@ fn contract_header(
          stage (`kind=escalation`) or sends low-priority `info`. It returns at once: keep \
          working, and never wait for a reply, end your turn or complete the stage because \
          you sent one. Use no raw `send_message` to the orchestrator and no other Archon \
-         mutation tool.\n\
+         mutation tool but `publish_artifact`.\n\
          {fan_rule}\n\
          ## Finishing\n\n\
          - When done, call Aether's `complete_task` exactly once. Its `summary` is concise \
@@ -399,11 +404,12 @@ or, only where the stage prompt lets a change go without review:\n\n\
 ```\n\n";
 
 const REVIEWER_VERDICT_RULES: &str = "\
-- Tell each reviewer to finish with this `structured` data, its verdict on the \
-commits it read; `base` is where the diff it read starts:\n\n\
+- In each reviewer's instructions require `complete_task(summary=..., structured=\
+<JSON below>)`, not final text. `base` starts the diff read:\n\n\
 ```json\n\
-{\"verdict\": \"pass\" or \"fail\", \"head\": \"<commit>\", \"base\": \"<commit>\", \"findings\": […]}\n\
-```\n\n";
+{\"verdict\": \"pass\", \"head\": \"<commit>\", \"base\": \"<commit>\", \"findings\": []}\n\
+```\n\n\
+Use `\"fail\"` with findings for failures.\n\n";
 
 const REVIEW_CHECK_RULES: &str = "\
 - Delegate with `wait: false`, then use `wait_for` with `any: true`. On a blocking \
@@ -962,11 +968,13 @@ mod tests {
         assert_eq!(dependency_rules("main", &[]), "");
         let stacked = Dependency {
             item: "qi_01".into(),
+            artifacts: Some("/d/artifacts/qi_01".into()),
             branch: Some("archon/first-01".into()),
             pull_request: Some("https://github.com/o/r/pull/1".into()),
         };
         let elsewhere = Dependency {
             item: "qi_02".into(),
+            artifacts: None,
             branch: None,
             pull_request: None,
         };
@@ -979,7 +987,7 @@ mod tests {
             .collect();
         let pull_request = "https://github.com/o/r/pull/1";
         let expected = [
-            serde_json::json!({"item": "qi_01", "branch": "archon/first-01", "pull_request": pull_request}),
+            serde_json::json!({"item": "qi_01", "artifacts": "/d/artifacts/qi_01", "branch": "archon/first-01", "pull_request": pull_request}),
             serde_json::json!({"item": "qi_02", "branch": null, "pull_request": null}),
         ];
         assert_eq!(facts, expected);
@@ -1041,7 +1049,10 @@ mod tests {
             "reviewed by an agent you delegate to that wrote none of it",
             "{\"review\": {\"verdict\": \"pass\", \"reviewers\": [\"<agent id>\"]}}",
             "{\"review\": {\"verdict\": \"skipped\", \"reason\": \"<why this change needed none>\"}}",
-            "{\"verdict\": \"pass\" or \"fail\", \"head\": \"<commit>\", \"base\": \"<commit>\"",
+            "In each reviewer's instructions require `complete_task(summary=..., structured=<JSON below>)`",
+            "not final text",
+            "{\"verdict\": \"pass\", \"head\": \"<commit>\", \"base\": \"<commit>\"",
+            "Use `\"fail\"` with findings for failures",
             "Each agent named must be a different one you delegated to yourself",
             "a passing reviewer read with `base` at or before it",
             "Name every reviewer that coverage rests on, earlier whole-change passes included",

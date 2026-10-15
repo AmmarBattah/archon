@@ -450,14 +450,7 @@ pub fn context(
         archon_bin: PathBuf::from("/usr/bin/false"),
         data_dir,
     };
-    for dir in [
-        &paths.data_dir,
-        &paths.worktrees,
-        &paths.scratch,
-        &paths.reports,
-    ] {
-        std::fs::create_dir_all(dir).expect("create dir");
-    }
+    create_context_dirs(&paths);
     let store = Store::open(&paths.store).expect("store");
     let (feed, _) = broadcast::channel(1024);
     let dispatch = Arc::new(Notify::new());
@@ -473,6 +466,9 @@ pub fn context(
         runs: Mutex::new(RunTable::default()),
         replies: Mutex::new(ReplyTracker::default()),
         answering: Mutex::new(()),
+        learning_memory: Mutex::new(()),
+        memory_curation: Mutex::new(()),
+        memory_feedback_ready: Notify::new(),
         report_files: Arc::new(Mutex::new(())),
         triggers: TriggerQueue::default(),
         mirrors: archon_daemon::mirror::MirrorQueue::default(),
@@ -487,6 +483,20 @@ pub fn context(
         gc: Mutex::new(None),
         collecting: archon_daemon::gc::Collecting::new(dispatch),
     }
+}
+
+fn create_context_dirs(paths: &DaemonPaths) {
+    assert!(paths.store.starts_with(&paths.data_dir));
+    assert!(paths.reports.starts_with(&paths.data_dir));
+    for dir in [
+        &paths.data_dir,
+        &paths.worktrees,
+        &paths.scratch,
+        &paths.reports,
+    ] {
+        std::fs::create_dir_all(dir).expect("create dir");
+    }
+    assert!(paths.scratch.is_dir() && paths.worktrees.is_dir());
 }
 
 /// A git repository on `main` with one commit and the test pipeline.
@@ -910,6 +920,18 @@ impl FakeBackend {
     /// The delegated `agent` completed its task with `structured` as its
     /// result, as a reviewer returns its verdict.
     pub fn complete_delegated(&self, agent: &AetherAgentId, structured: serde_json::Value) {
+        self.complete_delegated_with(
+            agent,
+            StageOutcome::Completed {
+                summary: "reviewed".into(),
+                structured: Some(structured),
+            },
+        );
+    }
+
+    /// The delegated `agent` completed with Aether's recorded outcome.
+    pub fn complete_delegated_with(&self, agent: &AetherAgentId, outcome: StageOutcome) {
+        assert!(matches!(outcome, StageOutcome::Completed { .. }));
         let mut state = self.state();
         let delegated = state.delegated.iter_mut().find(|d| d.agent == *agent);
         let delegated = delegated.expect("a delegated agent");
@@ -918,10 +940,6 @@ impl FakeBackend {
             .task
             .clone()
             .expect("a delegated agent has a task");
-        let outcome = StageOutcome::Completed {
-            summary: "reviewed".into(),
-            structured: Some(structured),
-        };
         state.outcomes.insert(task, outcome);
     }
 

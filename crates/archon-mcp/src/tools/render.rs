@@ -2,6 +2,7 @@
 //! half of a tool result, so every id, state and reason the orchestrator
 //! acts on is written out; only long free text is clipped, and says so.
 
+mod artifacts;
 mod cost;
 mod initiatives;
 mod lessons;
@@ -20,7 +21,7 @@ use archon_core::policy::ModelPolicy;
 use archon_core::protocol::{
     AetherLinkStatus, DaemonStatus, DiskStatus, ItemDetail, Reply, ReportPublished, gib,
 };
-use archon_core::queue::{QueueItem, QueueState};
+use archon_core::queue::{Caps, QueueItem, QueueState};
 use archon_core::repo::Repo;
 use archon_core::run::{OperatorGate, PipelineRun, RunState, StageRun, StageState};
 
@@ -39,6 +40,12 @@ pub(super) fn reply(tool: &str, reply: &Reply) -> String {
         Reply::Repo(repo) => format!("{}{}", verb(tool), repo_line(repo)),
         Reply::Repos(repos) => listing("repositories", repos.iter().map(repo_line)),
         Reply::Item(item) => format!("{}{}", verb(tool), item_line(item, CLIP_CHARS)),
+        Reply::ItemBudgetsOff(item) => format!(
+            "{}{}\nNote: {}",
+            verb(tool),
+            item_line(item, CLIP_CHARS),
+            archon_core::protocol::BUDGETS_OFF_NOTE
+        ),
         Reply::Items(items) => listing("items", items.iter().map(|i| item_line(i, LINE_CHARS))),
         Reply::ItemDetail(detail) => item_detail(detail),
         Reply::ItemSummaries(rows) => item_summaries(rows),
@@ -62,6 +69,8 @@ pub(super) fn reply(tool: &str, reply: &Reply) -> String {
         Reply::Initiative(detail) => initiatives::detail(tool, detail),
         Reply::Lesson(lesson) => lessons::recorded(lesson),
         Reply::Merge(request) => merge_text(request),
+        Reply::Artifacts(listing) => artifacts::listing(listing),
+        Reply::ArtifactPage(page) => artifacts::page(page),
         Reply::Questions(_)
         | Reply::Lessons(_)
         | Reply::LessonsWhy(_)
@@ -608,8 +617,7 @@ fn daemon_status(status: &DaemonStatus) -> String {
     format!(
         "archond {} (pid {}), up since {}. Aether: {aether}. Orchestrator: {orchestrator}.\n\
          Paused: {}.\nAgents running {} (max {}), active runs {} (max {}), queued {}, blocked {}, \
-         open questions {}, operator gates waiting {}.\nBudget-counted spend today {} (daily budget {}), total {} \
-         (total budget {}), per-item default {}. Lavish {}.\nAutonomy defaults {}; the ceiling allows {}; {} \
+         open questions {}, operator gates waiting {}.\n{} Lavish {}.\nAutonomy defaults {}; the ceiling allows {}; {} \
          directive(s) in force (autonomy_policy lists them).{}{}",
         status.daemon_version,
         status.pid,
@@ -623,11 +631,7 @@ fn daemon_status(status: &DaemonStatus) -> String {
         status.blocked_items,
         status.open_questions,
         status.open_gates,
-        usd(status.spend_today_usd),
-        budget(caps.budget_usd_daily),
-        usd(status.spend_total_usd),
-        budget(caps.budget_usd_total),
-        budget(caps.budget_usd_per_item),
+        spend_text(caps, status.spend_today_usd, status.spend_total_usd),
         if status.lavish_available {
             "available"
         } else {
@@ -638,6 +642,26 @@ fn daemon_status(status: &DaemonStatus) -> String {
         status.directives.len(),
         status.github.as_ref().map_or(String::new(), github_text),
         status.disk.as_ref().map_or(String::new(), disk_text)
+    )
+}
+
+/// Spend against the budgets, or that the budgets are off.
+pub(super) fn spend_text(caps: &Caps, today_usd: f64, total_usd: f64) -> String {
+    let spend = format!(
+        "Budget-counted spend today {}, total {}",
+        usd(today_usd),
+        usd(total_usd)
+    );
+    if !caps.budgets_enabled {
+        return format!(
+            "{spend}. Budgets: OFF (no dollar budget is enforced; spend is still recorded)."
+        );
+    }
+    format!(
+        "{spend} (daily budget {}, total budget {}), per-item default {}.",
+        budget(caps.budget_usd_daily),
+        budget(caps.budget_usd_total),
+        budget(caps.budget_usd_per_item)
     )
 }
 
