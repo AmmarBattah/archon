@@ -289,6 +289,8 @@ fn relevance_of(
         TriggerEvent::OperatorAnswer { .. }
         | TriggerEvent::AgentMessage { .. }
         | TriggerEvent::ChatAnswer { .. }
+        | TriggerEvent::ChatMergeRefused { .. }
+        | TriggerEvent::MergeFinished { .. }
         | TriggerEvent::Mirror { .. } => Relevance::Pinned,
         TriggerEvent::GateOpened { question, .. } => {
             match facts.open_gate_questions.contains(question) {

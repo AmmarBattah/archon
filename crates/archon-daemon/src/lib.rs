@@ -2,6 +2,7 @@
 
 mod agent_messages;
 mod chat_answer;
+mod chat_merge;
 pub mod context;
 pub mod disk;
 pub mod dispatcher;

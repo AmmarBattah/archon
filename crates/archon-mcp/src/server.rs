@@ -427,6 +427,7 @@ fn how_to_check(request: &Request) -> String {
         Request::MessageOrchestrator { .. } => "the message may already be recorded; check the item's archon log before repeating it, and keep working on your stage".into(),
         Request::GithubReply { thread, .. } => thread.check_before_retry(),
         Request::RecordChatAnswer { .. } => "the answer may already be recorded; a repeat is then refused as already answered, which is the confirmation".into(),
+        Request::RequestMerge { item, .. } => format!("the request may already be recorded or the pull request merged; check get_item {item} (its merge line) before repeating it, which is refused while one is open"),
         _ => "the change may already have been applied, so check with list_queue or get_item \
               before repeating it (an enqueue repeated with the same idempotency_key is always \
               safe)"

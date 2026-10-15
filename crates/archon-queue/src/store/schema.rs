@@ -398,7 +398,26 @@ CREATE INDEX operator_feedback_by_cohort
     WHERE stage_run IS NOT NULL AND cause = 'quality';
 "#;
 
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+/// Version 12: merges the operator asked for (ARCHITECTURE §18.6). At most
+/// one request per item is open; `question` is its confirmation, if any.
+const V12: &str = r#"
+CREATE TABLE merge_requests (
+    id           TEXT PRIMARY KEY,
+    item         TEXT NOT NULL REFERENCES items (id),
+    run          TEXT NOT NULL REFERENCES runs (id),
+    question     TEXT UNIQUE REFERENCES questions (id),
+    state        TEXT NOT NULL CHECK (state IN
+                     ('awaiting_operator', 'merging', 'merged', 'declined', 'refused')),
+    requested_at TEXT NOT NULL,
+    updated_at   TEXT NOT NULL CHECK (updated_at >= requested_at),
+    data         TEXT NOT NULL CHECK (json_valid(data))
+);
+CREATE UNIQUE INDEX merge_requests_open_per_item ON merge_requests (item)
+    WHERE state IN ('awaiting_operator', 'merging');
+CREATE INDEX merge_requests_by_item ON merge_requests (item, requested_at);
+"#;
+
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
 
 /// Pragmas every connection needs. `on_disk` connections must end up in
 /// WAL mode; in-memory databases report `memory` and stay that way.
