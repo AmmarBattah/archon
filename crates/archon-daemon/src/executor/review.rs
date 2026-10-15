@@ -178,9 +178,10 @@ async fn verdict_of(
 ) -> Result<Result<Verdict, String>, ArchonError> {
     let task = reviewer.task.as_ref().expect("picked with a task");
     match ctx.backend.task_outcome(task).await {
-        Ok(Some(StageOutcome::Completed { structured, .. })) => {
-            Ok(Verdict::read(structured.as_ref()))
-        }
+        Ok(Some(StageOutcome::Completed {
+            summary,
+            structured,
+        })) => Ok(Verdict::read_result(&summary, structured.as_ref())),
         Ok(Some(_)) => Ok(Err("did not complete its task".into())),
         // Aether shows the agent completed before its task settles.
         Ok(None) => Err(ArchonError::Unavailable(format!(
