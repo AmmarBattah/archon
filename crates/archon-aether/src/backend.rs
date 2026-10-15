@@ -112,6 +112,7 @@ pub fn subtree(root: &AetherAgentId, agents: &[Agent]) -> Vec<Descendant> {
                 effort: child.config.effort.as_deref().and_then(|e| e.parse().ok()),
                 state: descendant_state(child),
                 task: child.current_task.clone(),
+                created_at: child.created_at,
             });
         }
     }
@@ -658,6 +659,7 @@ mod tests {
         value["parent"] = serde_json::json!(parent);
         value["status"] = serde_json::json!({"state": state});
         value["config"] = serde_json::json!({"effort": "medium"});
+        value["created_at"] = serde_json::json!("2026-09-26T10:00:00Z");
         serde_json::from_value(value).unwrap()
     }
 
@@ -688,6 +690,8 @@ mod tests {
             ]
         );
         assert!(found.iter().all(|d| d.effort == Some(Effort::Medium)));
+        let created = "2026-09-26T10:00:00Z".parse().ok();
+        assert!(found.iter().all(|d| d.created_at == created));
         assert!(subtree(&id("agt_grandchild"), &agents).is_empty());
     }
 

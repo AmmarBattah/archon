@@ -14,14 +14,17 @@ pub const MAX_NAMED_REVIEWERS: usize = 12;
 /// `review` keys only Archon writes: the reviewers it found, or why it found too few.
 const REVIEWER_AGENTS: &str = "reviewer_agents";
 const REVIEWER_MODELS: &str = "reviewer_models";
+/// Earlier reviewers the lead did not name that Archon found anchoring named delta reads.
+const IMPLICIT_REVIEWER_AGENTS: &str = "implicit_reviewer_agents";
 const UNVERIFIED: &str = archon_core::run::REVIEW_REFUSED_KEY;
 /// What Archon wrote for the one reviewer before a review could need several,
 /// beside the model its lead named.
 const LEGACY_REVIEWER_AGENT: &str = "reviewer_agent";
 const LEGACY_REVIEWER_MODEL: &str = "reviewer_model";
-const ARCHON_KEYS: [&str; 5] = [
+const ARCHON_KEYS: [&str; 6] = [
     REVIEWER_AGENTS,
     REVIEWER_MODELS,
+    IMPLICIT_REVIEWER_AGENTS,
     UNVERIFIED,
     LEGACY_REVIEWER_AGENT,
     LEGACY_REVIEWER_MODEL,
@@ -246,6 +249,21 @@ pub fn record_check(structured: &mut Value, found: Option<Result<Vec<Reviewer>, 
     debug_assert!(!(review.contains_key(REVIEWER_AGENTS) && review.contains_key(UNVERIFIED)));
 }
 
+/// Put on a checked pass the `agents` Archon added to anchor its named delta
+/// reads, so the record shows what its coverage rests on. None adds no key.
+pub fn record_implicit(structured: &mut Value, agents: &[String]) {
+    if agents.is_empty() {
+        return;
+    }
+    let review = structured.get_mut("review").and_then(Value::as_object_mut);
+    let review = review.expect("an implicit reviewer anchors a checked pass");
+    assert!(
+        review.contains_key(REVIEWER_AGENTS) && !review.contains_key(UNVERIFIED),
+        "implicit reviewers are recorded on a pass Archon found"
+    );
+    review.insert(IMPLICIT_REVIEWER_AGENTS.into(), agents.to_vec().into());
+}
+
 /// `text` as one trimmed line of at most [`MAX_FIELD_CHARS`] characters.
 fn one_line(text: &str) -> String {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -408,6 +426,24 @@ mod tests {
         assert_eq!(claimed_reviewers(&several).unwrap(), ["agt_1", "agt_2"]);
         let unnamed = json!({"review": {"verdict": "pass"}});
         assert_eq!(claimed_reviewers(&unnamed).unwrap(), Vec::<String>::new());
+    }
+
+    /// Only Archon says which unnamed reviewers a pass rests on.
+    #[test]
+    fn archon_records_the_earlier_reviewers_it_added_and_nothing_forged() {
+        let mut forged = pass(json!({"implicit_reviewer_agents": ["agt_forged"]}));
+        record_check(&mut forged, Some(Ok(vec![checked("a/1", "agt_r")])));
+        record_implicit(&mut forged, &[]);
+        assert_eq!(forged["review"].get("implicit_reviewer_agents"), None);
+        record_implicit(&mut forged, &["agt_whole".to_owned()]);
+        assert_eq!(
+            forged["review"]["implicit_reviewer_agents"],
+            json!(["agt_whole"])
+        );
+        assert_eq!(
+            read(forged).unwrap().line(),
+            "REVIEW: pass, by a/1 (agent agt_r)"
+        );
     }
 
     #[test]

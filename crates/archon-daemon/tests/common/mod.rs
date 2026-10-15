@@ -901,6 +901,7 @@ impl FakeBackend {
             effort: Some(Effort::Medium),
             state: DescendantState::Live,
             task: Some(task),
+            created_at: Some(archon_core::now()),
         });
         agent
     }

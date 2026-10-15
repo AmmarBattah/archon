@@ -1,9 +1,12 @@
 //! A declared review is checked against Aether and the run's branch, never
 //! taken from the lead's word: each reviewer the lead names must be an agent
 //! it delegated to whose own result passed the change as the branch holds it.
+//! A named delta read it left unanchored may rest on the lead's own earlier
+//! reviewers of the same attempt, which Archon finds, checks and records itself.
 
 mod coverage;
 
+use archon_core::Timestamp;
 use archon_core::aether_ids::AetherAgentId;
 use archon_core::error::ArchonError;
 use archon_core::ports::{Descendant, DescendantState};
@@ -13,13 +16,32 @@ use archon_pipeline::review::{self, MAX_NAMED_REVIEWERS, Reviewer, Verdict};
 
 use super::recover;
 use crate::context::DaemonContext;
-use coverage::History;
+use coverage::{Held, History};
 
 /// Agents named in a refusal: enough to see what the lead delegated to.
 const MAX_LISTED: usize = 6;
 
-/// What Archon puts on the record: the reviewers it found, or why not.
-type Finding = Result<Vec<Reviewer>, String>;
+/// A review Archon found holds: the named reviewers that passed, and the
+/// earlier reviewers it added to anchor their delta reads.
+#[derive(Debug)]
+struct Found {
+    reviewers: Vec<Reviewer>,
+    implicit: Vec<String>,
+}
+
+/// What Archon puts on the record: the review it found, or why not.
+type Finding = Result<Found, String>;
+
+/// A reviewer's agent id and the verdict its task returned.
+type Read = (String, Verdict);
+
+/// What checking the verdicts against the branch came to.
+enum Checked {
+    Held(Held),
+    Refused(String),
+    /// A named delta read needs an anchor, and the earlier reviewers were not read.
+    Unanchored,
+}
 
 /// What a settling stage's result owes besides its gate.
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +84,15 @@ pub(super) async fn verify(
         }
         _ => None,
     };
-    review::record_check(&mut structured, found);
+    let implicit = match &found {
+        Some(Ok(found)) => found.implicit.clone(),
+        _ => Vec::new(),
+    };
+    if !implicit.is_empty() {
+        tracing::info!(stage = %stage.id, ?implicit, "anchored named delta reviews on the lead's earlier reviewers");
+    }
+    review::record_check(&mut structured, found.map(|f| f.map(|f| f.reviewers)));
+    review::record_implicit(&mut structured, &implicit);
     Ok(StageOutcome::Completed {
         summary,
         structured: Some(structured),
@@ -96,8 +126,56 @@ async fn reviewers(
         Ok(picked) => picked,
         Err(why) => return Ok(Err(why)),
     };
+    let verdicts = match verdicts_of(ctx, &picked).await? {
+        Ok(verdicts) => verdicts,
+        Err(why) => return Ok(Err(why)),
+    };
+    assert!(
+        picked.len() >= owed as usize,
+        "the review level's reviewers were picked"
+    );
+    let check = |earlier: Option<Vec<Read>>| {
+        holding(ctx, run, verdicts.clone(), earlier, owed, shipped.clone())
+    };
+    let checked = match check(None).await? {
+        Checked::Unanchored => {
+            let since = resumed_since(ctx, stage, lead).await?;
+            let earlier = earlier_reviewers(lead, &beneath, &picked, since);
+            check(Some(earlier_verdicts(ctx, &earlier).await?)).await?
+        }
+        checked => checked,
+    };
+    Ok(match checked {
+        Checked::Held(held) => Ok(found(&picked, held)),
+        Checked::Refused(why) => Err(why),
+        Checked::Unanchored => unreachable!("the earlier reviewers were read"),
+    })
+}
+
+/// The `picked` reviewers whose passes `held` counts, and the earlier ones it added.
+fn found(picked: &[&Descendant], held: Held) -> Found {
+    assert!(!held.passes.is_empty(), "a review that holds has a pass");
+    assert!(
+        held.passes.iter().all(|i| *i < picked.len()),
+        "only a named pass counts, by its index among those picked"
+    );
+    let reviewers = held.passes.into_iter().map(|i| Reviewer {
+        model: picked[i].model.to_string(),
+        agent: picked[i].agent.to_string(),
+    });
+    Found {
+        reviewers: reviewers.collect(),
+        implicit: held.implicit,
+    }
+}
+
+/// The verdict of each `picked` reviewer, in order, or why one is none.
+async fn verdicts_of(
+    ctx: &DaemonContext,
+    picked: &[&Descendant],
+) -> Result<Result<Vec<Read>, String>, ArchonError> {
     let mut verdicts = Vec::with_capacity(picked.len());
-    for child in &picked {
+    for child in picked {
         match verdict_of(ctx, child).await? {
             Ok(verdict) => verdicts.push((child.agent.to_string(), verdict)),
             Err(why) => return Ok(Err(format!("reviewer {} {why}", child.agent))),
@@ -109,20 +187,74 @@ async fn reviewers(
         picked.len(),
         "a verdict for every reviewer picked"
     );
+    Ok(Ok(verdicts))
+}
+
+/// The verdicts of the `earlier` reviewers that returned one; any other
+/// result anchors nothing, so it is left out.
+async fn earlier_verdicts(
+    ctx: &DaemonContext,
+    earlier: &[&Descendant],
+) -> Result<Vec<Read>, ArchonError> {
+    let mut verdicts = Vec::with_capacity(earlier.len());
+    for child in earlier {
+        match verdict_of(ctx, child).await? {
+            Ok(verdict) => verdicts.push((child.agent.to_string(), verdict)),
+            Err(why) => {
+                tracing::debug!(agent = %child.agent, %why, "an earlier reviewer anchors nothing")
+            }
+        }
+    }
     assert!(
-        picked.len() >= owed as usize,
-        "the review level's reviewers were picked"
+        verdicts.len() <= earlier.len(),
+        "one verdict per reviewer at most"
     );
-    let counted = holding(ctx, run, verdicts, owed, shipped).await?;
-    Ok(counted.map(|passes| {
-        let found = passes.into_iter().map(|i| picked[i]);
-        found
-            .map(|d| Reviewer {
-                model: d.model.to_string(),
-                agent: d.agent.to_string(),
-            })
-            .collect()
-    }))
+    Ok(verdicts)
+}
+
+/// When the attempt `stage` began, if its `lead` is a kept agent that ran an
+/// earlier attempt too: what it delegated before then belongs to that one.
+async fn resumed_since(
+    ctx: &DaemonContext,
+    stage: &StageRun,
+    lead: &AetherAgentId,
+) -> Result<Option<Timestamp>, ArchonError> {
+    let runs = ctx.store.lock().await.stage_runs(&stage.run)?;
+    assert!(
+        runs.iter().any(|s| s.id == stage.id),
+        "a stage is checked within its own run"
+    );
+    let resumed = runs
+        .iter()
+        .any(|s| s.id != stage.id && s.aether_agent.as_ref() == Some(lead));
+    Ok(resumed.then_some(stage.started_at))
+}
+
+/// The lead's direct children, other than the `picked` ones, that completed a
+/// task in this attempt: those Aether created `since` its start, if it resumed.
+fn earlier_reviewers<'a>(
+    lead: &AetherAgentId,
+    beneath: &'a [Descendant],
+    picked: &[&Descendant],
+    since: Option<Timestamp>,
+) -> Vec<&'a Descendant> {
+    assert!(!picked.is_empty(), "earlier reviewers anchor named ones");
+    let this_attempt = |d: &Descendant| match since {
+        None => true,
+        // Aether that does not say when it created an agent leaves it unplaced.
+        Some(start) => d.created_at.is_some_and(|created| created >= start),
+    };
+    let earlier: Vec<&Descendant> = beneath
+        .iter()
+        .filter(|d| d.parent == *lead && d.state == DescendantState::Completed)
+        .filter(|d| d.task.is_some() && this_attempt(d))
+        .filter(|d| picked.iter().all(|p| p.agent != d.agent))
+        .collect();
+    assert!(
+        earlier.iter().all(|d| d.agent != *lead),
+        "a lead is not its own reviewer"
+    );
+    earlier
 }
 
 /// An Aether failure the pump retries, not a verdict on the review.
@@ -192,43 +324,57 @@ async fn verdict_of(
     }
 }
 
-/// Indexes of the `verdicts` that hold for the run's branch as it stands,
-/// which must hold the `shipped` tree if one is given.
+/// Whether the named `verdicts` hold for the run's branch as it stands, which
+/// must hold the `shipped` tree if one is given. `earlier` reads, once read,
+/// may anchor named delta reads; `None` asks first whether any is needed.
 async fn holding(
     ctx: &DaemonContext,
     run: &PipelineRun,
-    verdicts: Vec<(String, Verdict)>,
+    verdicts: Vec<Read>,
+    earlier: Option<Vec<Read>>,
     owed: u32,
     shipped: Option<String>,
-) -> Result<Result<Vec<usize>, String>, ArchonError> {
+) -> Result<Checked, ArchonError> {
     assert!(!verdicts.is_empty(), "a named reviewer was read");
-    let base_branch = {
-        let store = ctx.store.lock().await;
-        match recover::load_run_vars(&store, &run.id) {
-            Ok(vars) => vars.get("base_branch").cloned().unwrap_or_default(),
-            // Without a base only reviews stating no base read the whole change.
-            Err(ArchonError::NotFound(_)) => String::new(),
-            Err(error) => return Err(error),
-        }
-    };
+    let base_branch = base_branch(ctx, run).await?;
     let workspace = run.workspace.clone();
     let checked = tokio::task::spawn_blocking(move || {
         let mut history = History::new(&workspace);
-        let (head, placed) = match coverage::place(&mut history, &base_branch, &verdicts)? {
+        let read = earlier.as_deref().unwrap_or_default();
+        let placed = coverage::place(&mut history, &base_branch, &verdicts, read)?;
+        let (head, placed) = match placed {
             Ok(placed) => placed,
-            Err(why) => return Ok(Err(why)),
+            Err(why) => return Ok(Checked::Refused(why)),
         };
         if let Some(tree) = &shipped
             && let Err(why) = coverage::holds_tree(&workspace, &head, tree)?
         {
-            return Ok(Err(why));
+            return Ok(Checked::Refused(why));
         }
-        coverage::counted(&mut history, &placed, &head, owed)
+        if earlier.is_none() && coverage::needs_anchor(&mut history, &placed)? {
+            return Ok(Checked::Unanchored);
+        }
+        Ok(
+            match coverage::counted(&mut history, &placed, &head, owed)? {
+                Ok(held) => Checked::Held(held),
+                Err(why) => Checked::Refused(why),
+            },
+        )
     });
-    let counted = checked
+    checked
         .await
-        .map_err(|e| ArchonError::io("reviewed commits task", std::io::Error::other(e)))??;
-    Ok(counted)
+        .map_err(|e| ArchonError::io("reviewed commits task", std::io::Error::other(e)))?
+}
+
+/// The branch `run` forked from, or empty when its variables name none.
+async fn base_branch(ctx: &DaemonContext, run: &PipelineRun) -> Result<String, ArchonError> {
+    let store = ctx.store.lock().await;
+    match recover::load_run_vars(&store, &run.id) {
+        Ok(vars) => Ok(vars.get("base_branch").cloned().unwrap_or_default()),
+        // Without a base only reviews stating no base read the whole change.
+        Err(ArchonError::NotFound(_)) => Ok(String::new()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Why `name` is not an agent the lead delegated to, listing those it did.
@@ -276,7 +422,13 @@ mod tests {
             effort: None,
             state,
             task: Some(AetherTaskId::parse(&id.replace("agt_", "tsk_")).unwrap()),
+            created_at: Some(at(10)),
         }
+    }
+
+    /// A time on the test's clock, `minute` minutes in.
+    fn at(minute: u32) -> Timestamp {
+        format!("2026-10-01T10:{minute:02}:00Z").parse().unwrap()
     }
 
     fn pick(beneath: &[Descendant], named: &[&str], owed: u32) -> Result<Vec<String>, String> {
@@ -326,5 +478,42 @@ mod tests {
         assert!(unnamed.contains("`review.reviewers`"), "{unnamed}");
         let many = vec!["agt_c1"; MAX_NAMED_REVIEWERS + 1];
         assert!(pick(&beneath, &many, 1).unwrap_err().contains("at most"));
+    }
+
+    /// Only what this lead delegated in this attempt and completed may anchor.
+    #[test]
+    fn earlier_reviewers_are_the_lead_s_own_completed_children_of_this_attempt() {
+        use DescendantState::{Completed, Live, Stopped};
+        let created = |d: Descendant, minute: Option<u32>| Descendant {
+            created_at: minute.map(at),
+            ..d
+        };
+        let beneath = [
+            child("agt_named", "agt_lead", Completed),
+            child("agt_whole", "agt_lead", Completed),
+            child("agt_cancelled", "agt_lead", Stopped),
+            child("agt_running", "agt_lead", Live),
+            child("agt_nested", "agt_whole", Completed),
+            created(child("agt_before", "agt_lead", Completed), Some(2)),
+            created(child("agt_unplaced", "agt_lead", Completed), None),
+        ];
+        let lead = agent("agt_lead");
+        let picked = [&beneath[0]];
+        let earlier = |since| -> Vec<String> {
+            let found = earlier_reviewers(&lead, &beneath, &picked, since);
+            found.iter().map(|d| d.agent.to_string()).collect()
+        };
+        assert_eq!(
+            earlier(None),
+            ["agt_whole", "agt_before", "agt_unplaced"],
+            "a fresh lead's children are all of this attempt"
+        );
+        assert_eq!(
+            earlier(Some(at(5))),
+            ["agt_whole"],
+            "a resumed lead's earlier attempt is left out"
+        );
+        let stranger = agent("agt_other_lead");
+        assert!(earlier_reviewers(&stranger, &beneath, &picked, None).is_empty());
     }
 }

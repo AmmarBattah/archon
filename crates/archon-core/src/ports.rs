@@ -202,6 +202,8 @@ pub struct Descendant {
     pub state: DescendantState,
     /// The task it was given, kept after it ends; `None` before it has one.
     pub task: Option<AetherTaskId>,
+    /// When Aether created it, by Aether's clock; `None` when Aether does not say.
+    pub created_at: Option<Timestamp>,
 }
 
 /// A change to a live agent; `None` leaves that part as it is.
