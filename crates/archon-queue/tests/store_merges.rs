@@ -49,7 +49,12 @@ fn one_request_per_item_stays_open_and_an_ended_one_is_final() {
     let run = start(&mut store, &items[0].id);
     let mut first = merge(&run, &repo, MergeState::Merging);
     store.insert_merge(&first).unwrap();
-    let second = merge(&run, &repo, MergeState::Merging);
+    // Later, so the record's order never rests on ids made in one millisecond.
+    let second = MergeRequest {
+        requested_at: t(32),
+        updated_at: t(32),
+        ..merge(&run, &repo, MergeState::Merging)
+    };
     let refused = store.insert_merge(&second).unwrap_err();
     assert!(
         matches!(refused, ArchonError::InvalidTransition(_)),
