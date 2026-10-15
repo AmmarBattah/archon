@@ -952,12 +952,13 @@ fn shown_bytes(definition: &ToolDefinition) -> usize {
 }
 
 /// Every orchestrator turn pays for the tool list: 1.0's 25 tools (30,071 bytes
-/// then) stay within 60% of that, and all of them within 25 KiB.
+/// then) stay within 60% of that, and all of them within 26 KiB (25 KiB until
+/// `request_merge`).
 #[test]
 fn the_tool_list_stays_within_its_budget() {
     const FROM_1_0: usize = 25;
     const FROM_1_0_BUDGET_BYTES: usize = 18_087;
-    const BUDGET_BYTES: usize = 25 * 1024;
+    const BUDGET_BYTES: usize = 26 * 1024;
     let definitions = definitions();
     assert_eq!(definitions[FROM_1_0 - 1].name, "message_orchestrator");
     let carried: usize = definitions[..FROM_1_0].iter().map(shown_bytes).sum();
