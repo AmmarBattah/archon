@@ -2363,11 +2363,12 @@ ever asked for without it. Stages after the record stage cannot commit
 (§8.2), so what they verified is that tree.
 
 When the last stage passes, the driver emits `Ship(ShipPlan)`: the record,
-its stage, the run summary, and the pull request body (the record's, then
+its stage, the run summary, and the pull request text (the record's, then
 the `REVIEW:` line, the summaries of the stages that passed after the
-record stage under `## Review and verification`, the change report under
-`## Change report`, and `Archon item: <id>`; each part clipped so the whole
-stays under GitHub's limit). `executor::ship` queues the plan in the run
+record stage under `## Review and verification`, and the change report
+under `## Change report`; each part clipped to leave room under GitHub's
+limit). Delivery ends it with `Archon item: <id>` unless the repository's
+`attribution` is `none` at that moment (`ship::pr_body`). `executor::ship` queues the plan in the run
 table and delivers it off every lock:
 
 1. **Wait for the worktree to be quiet.** While the run owes a descendant
@@ -2388,6 +2389,10 @@ table and delivers it off every lock:
    registered before this record existed has it taken at its first
    delivery. A `user.email` an agent writes into the repository later
    changes nothing. Any miss is a refusal that names the paths or commits.
+   Under `attribution = "none"` the record's `pr.body` and the message of
+   each such commit must also hold no line that starts, past space and
+   emoji, with `Co-Authored-By:` or `Generated with`; the refusal quotes
+   every one, and a retry of the item sends its stage back to remove them.
    A stacked run's branch must also hold every parent commit its stack
    recorded and has not seen merged (§8.8), checked here so that a missing
    parent pushes nothing and opens no pull request. The base is what
@@ -2789,7 +2794,9 @@ defined in `archon_core::protocol` and served by `archon-daemon`.
   `--pipeline ""` sends `"clear"`. `RepoPatch.grant_merge` is a plain
   optional bool: absent keeps the setting.
 - Protocol 12 added `MergeItem`, `RequestMerge`, `Reply::Merge` and
-  `grant_merge`; an older archond is refused at hello.
+  `grant_merge`; an older archond is refused at hello. Protocol 14 added
+  `RepoPatch.attribution` (`"none"` or `"item-id"`), a plain option like
+  `grant_merge`.
 
 The command set is `archon_core::protocol::Request`, and every variant is
 documented there. Reply kinds are `archon_core::protocol::Reply`. Error codes

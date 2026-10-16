@@ -16,7 +16,7 @@ use archon_core::notify::NotificationKind;
 use archon_core::outcome::{Correction, FailureClass};
 use archon_core::protocol::{EnqueueRequest, Reply, RepoPatch, RepoRef, Request};
 use archon_core::queue::{QueueItem, QueueState};
-use archon_core::repo::ShipMode;
+use archon_core::repo::{Attribution, ShipMode};
 use archon_core::run::{PipelineRun, StageOutcome, StageRun};
 use archon_core::steer::Steer;
 use archon_daemon::executor;
@@ -341,6 +341,95 @@ async fn a_commit_under_another_identity_refuses_the_delivery() {
     );
     assert_eq!(pushed(&origin_of(&h), &run.branch), None);
     assert!(gh.calls().is_empty());
+}
+
+fn attribute(policy: Attribution) -> RepoPatch {
+    RepoPatch {
+        attribution: Some(policy),
+        ..RepoPatch::default()
+    }
+}
+
+/// The trailers of a commit `attributed` makes.
+const CO_AUTHORS: [&str; 6] = ["a", "b", "c", "d", "e", "Claude"];
+
+/// A change committed with six models' trailers, and a record whose body
+/// ends with a tool's footer.
+fn attributed(workspace: &Path) -> Value {
+    std::fs::write(workspace.join("change.txt"), "a change\n").unwrap();
+    git(workspace, &["add", "change.txt"]);
+    let trailers: Vec<String> = CO_AUTHORS
+        .iter()
+        .map(|name| format!("Co-Authored-By: {name} <noreply@anthropic.com>"))
+        .collect();
+    let message = format!("Change the thing\n\n{}", trailers.join("\n"));
+    git(workspace, &["commit", "--quiet", "-m", &message]);
+    let mut record = record(workspace);
+    record["pr"]["body"] = json!(
+        "Why, and how it was verified.\n\n\u{1f916} Generated with [Claude Code](https://claude.com/claude-code)"
+    );
+    record
+}
+
+/// Under `none`, set while the run was under way, the pull request body ends
+/// with the record's own text.
+#[tokio::test]
+async fn without_attribution_the_pull_request_names_no_item() {
+    let (h, gh) = delivering().await;
+    let (item, _) = started(&h, "direct").await;
+    update_repo(&h, attribute(Attribution::None)).await;
+    settle_changed(&h, json!({})).await;
+
+    succeeded(&h, &item).await;
+    let (_, body) = gh.created();
+    assert!(body.starts_with("Why, and how it was verified."), "{body}");
+    assert!(!body.contains("Archon item:"), "{body}");
+    assert!(!body.contains(item.id.as_str()), "{body}");
+}
+
+/// Under `none`, set while the run was under way, trailers and a footer
+/// refuse the delivery, every line quoted, and nothing leaves the machine.
+#[tokio::test]
+async fn an_attribution_line_refuses_the_delivery_under_none() {
+    let (h, gh) = delivering().await;
+    let (item, run) = started(&h, "direct").await;
+    update_repo(&h, attribute(Attribution::None)).await;
+    settle_with(&h, attributed(&run.workspace)).await;
+
+    let error = failed(&h, &item).await;
+    assert!(error.contains("attribution policy is `none`"), "{error}");
+    assert!(error.contains("7 line(s) do"), "{error}");
+    let footer = "Generated with [Claude Code](https://claude.com/claude-code)";
+    assert!(
+        error.contains(&format!("`pr.body` has {footer:?}")),
+        "{error}"
+    );
+    let commit = git(&run.workspace, &["rev-parse", "HEAD"]);
+    for name in CO_AUTHORS {
+        let trailer = format!(
+            "commit {} has \"Co-Authored-By: {name} <noreply@anthropic.com>\"",
+            &commit[..12]
+        );
+        assert!(error.contains(&trailer), "{error}");
+    }
+    assert!(error.contains("Retry the item"), "{error}");
+    assert_eq!(pushed(&origin_of(&h), &run.branch), None);
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+}
+
+/// The default `item-id` policy refuses nothing and keeps the item line.
+#[tokio::test]
+async fn attribution_lines_ship_under_the_default_policy() {
+    let (h, gh) = delivering().await;
+    let (item, run) = started(&h, "direct").await;
+    settle_with(&h, attributed(&run.workspace)).await;
+
+    succeeded(&h, &item).await;
+    let (_, body) = gh.created();
+    assert!(
+        body.ends_with(&format!("Archon item: {}\n", item.id)),
+        "{body}"
+    );
 }
 
 /// A record that names commits the branch does not add ships nothing.

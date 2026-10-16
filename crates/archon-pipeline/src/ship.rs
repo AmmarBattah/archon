@@ -3,6 +3,7 @@
 //! the driver asks of the daemon once every stage passed, and how it ended.
 //! Pure data and parsing; git and `gh` live in the daemon.
 
+use archon_core::repo::Attribution;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -84,7 +85,8 @@ pub struct ShipPlan {
     pub record_stage: String,
     pub record: ShipRecord,
     /// The pull request body: the record's, then what Archon adds
-    /// (`pr_body`), ending with the line naming the item.
+    /// (`pr_text`); delivery ends it with [`pr_body`] under the repository's
+    /// attribution policy as it stands then.
     pub body: String,
     /// The run's summary once it shipped, before the line saying where to.
     pub summary: String,
@@ -133,11 +135,10 @@ pub(crate) struct BodyAdditions<'a> {
     pub report: Option<&'a str>,
 }
 
-/// The pull request body archond sends: `record`'s, then `added` under
-/// headings of its own, each part cut to fit GitHub's limit, then `item`'s line.
-pub(crate) fn pr_body(record: &ShipRecord, added: BodyAdditions<'_>, item: &str) -> String {
+/// The pull request text a run delivers: `record`'s, then `added` under
+/// headings of its own, each part cut to leave room below GitHub's limit.
+pub(crate) fn pr_text(record: &ShipRecord, added: BodyAdditions<'_>) -> String {
     use crate::gate::clip;
-    assert!(!item.is_empty(), "every run belongs to an item");
     assert!(
         added.review.is_none_or(|line| !line.contains('\n')),
         "one line"
@@ -155,9 +156,52 @@ pub(crate) fn pr_body(record: &ShipRecord, added: BodyAdditions<'_>, item: &str)
         let report = clip(report, MAX_BODY_CHARS / 5);
         body.push_str(&format!("\n\n## Change report\n\n{report}"));
     }
-    body.push_str(&format!("\n\nArchon item: {item}\n"));
+    debug_assert!(body.chars().count() < MAX_BODY_CHARS);
+    body
+}
+
+/// The pull request body archond sends: `text` from [`ShipPlan::body`], then
+/// `item`'s line where the repository's `attribution` policy keeps it.
+pub fn pr_body(text: &str, item: &str, attribution: Attribution) -> String {
+    assert!(!item.is_empty(), "every run belongs to an item");
+    assert!(!text.trim().is_empty(), "a ship record has a body");
+    let body = match attribution {
+        Attribution::ItemId => format!("{text}\n\nArchon item: {item}\n"),
+        Attribution::None => format!("{text}\n"),
+    };
     debug_assert!(body.chars().count() <= MAX_BODY_CHARS);
     body
+}
+
+/// The lines of `text` that attribute it to a model or a tool: a
+/// `Co-Authored-By:` trailer or a `Generated with` footer, each trimmed.
+/// A line is matched from its start, past leading space and emoji, so prose
+/// that mentions such a line in passing or in backticks is not one. The
+/// trailer is matched as git parses it (`Co-Authored-By :x` too); the footer
+/// phrase must end a word, so "Generated without" is prose.
+pub fn attribution_lines(text: &str) -> Vec<&str> {
+    fn after<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+        let rest = line.get(prefix.len()..)?;
+        line[..prefix.len()]
+            .eq_ignore_ascii_case(prefix)
+            .then_some(rest)
+    }
+    let is_trailer = |line: &str| {
+        after(line, "co-authored-by")
+            .is_some_and(|rest| rest.trim_start_matches([' ', '\t']).starts_with(':'))
+    };
+    let is_footer = |line: &str| {
+        after(line, "generated with")
+            .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+    };
+    let found: Vec<&str> = text
+        .lines()
+        .map(|line| line.trim_start_matches(|c: char| c.is_whitespace() || !c.is_ascii()))
+        .filter(|line| is_trailer(line) || is_footer(line))
+        .map(str::trim_end)
+        .collect();
+    debug_assert!(found.iter().all(|line| !line.contains('\n')));
+    found
 }
 
 fn stage_section((stage, summary): &(&str, &str)) -> String {
@@ -222,7 +266,9 @@ mod tests {
     #[test]
     fn the_body_ends_with_the_item_and_carries_the_change_report() {
         let record = ShipRecord::read(Some(&record())).unwrap();
-        let plain = pr_body(&record, BodyAdditions::default(), "qi_1");
+        let text = pr_text(&record, BodyAdditions::default());
+        assert_eq!(text, "Why and how.", "the plan's text names no item");
+        let plain = pr_body(&text, "qi_1", Attribution::ItemId);
         assert_eq!(plain, "Why and how.\n\nArchon item: qi_1\n");
         let added = BodyAdditions {
             review: Some("REVIEW: pass, by a/1 (agent agt_r)"),
@@ -232,7 +278,7 @@ mod tests {
             ],
             report: Some(" The report. \n"),
         };
-        let full = pr_body(&record, added, "qi_1");
+        let full = pr_body(&pr_text(&record, added), "qi_1", Attribution::ItemId);
         assert_eq!(
             full,
             "Why and how.\n\nREVIEW: pass, by a/1 (agent agt_r)\n\n\
@@ -247,9 +293,65 @@ mod tests {
             later: &[("review", &flood), ("test", &flood)],
             report: Some(&flood),
         };
-        let cut = pr_body(&long, added, "qi_1");
+        let cut = pr_body(&pr_text(&long, added), "qi_1", Attribution::ItemId);
         assert!(cut.chars().count() <= MAX_BODY_CHARS);
         assert!(cut.contains("## Change report") && cut.ends_with("Archon item: qi_1\n"));
+    }
+
+    #[test]
+    fn without_attribution_the_body_names_no_item() {
+        let record = ShipRecord::read(Some(&record())).unwrap();
+        let plain = pr_body(
+            &pr_text(&record, BodyAdditions::default()),
+            "qi_1",
+            Attribution::None,
+        );
+        assert_eq!(plain, "Why and how.\n");
+        let added = BodyAdditions {
+            review: Some("REVIEW: pass, by a/1 (agent agt_r)"),
+            later: &[("test", "All green.")],
+            report: Some("The report."),
+        };
+        let full = pr_body(&pr_text(&record, added), "qi_1", Attribution::None);
+        assert!(
+            !full.contains("Archon item:") && !full.contains("qi_1"),
+            "{full}"
+        );
+        assert!(
+            full.ends_with("## Change report\n\nThe report.\n"),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn attribution_lines_are_the_trailers_and_footers_not_mentions() {
+        let body = "Why.\n\n\u{1f916} Generated with [Claude Code](https://claude.com/claude-code)\n\n\
+                    Co-Authored-By: Claude <noreply@anthropic.com>  \n  co-authored-by: x <y>\n\
+                    Refuses `Generated with` lines; nothing was Generated with care.\n\
+                    > Generated with quotes is prose.";
+        assert_eq!(
+            attribution_lines(body),
+            [
+                "Generated with [Claude Code](https://claude.com/claude-code)",
+                "Co-Authored-By: Claude <noreply@anthropic.com>",
+                "co-authored-by: x <y>",
+            ]
+        );
+        assert!(attribution_lines("Why and how.\nCo-authored by people.").is_empty());
+        assert_eq!(
+            attribution_lines(
+                "Co-Authored-By:Claude <c@a>\nCo-authored-by\t: x <y>\nCo-authored-byline"
+            ),
+            ["Co-Authored-By:Claude <c@a>", "Co-authored-by\t: x <y>"],
+            "every trailer git parses, glued to its value or spaced from its colon"
+        );
+        let prose = "Generated without changing the public API.\nGenerated within budget.";
+        assert!(attribution_lines(prose).is_empty(), "words, not the footer");
+        assert_eq!(
+            attribution_lines("Generated with: a tool"),
+            ["Generated with: a tool"]
+        );
+        assert!(attribution_lines("").is_empty());
     }
 
     #[test]

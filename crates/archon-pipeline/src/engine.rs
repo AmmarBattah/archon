@@ -1047,7 +1047,7 @@ impl RunDriver {
             later: &later,
             report: report_stage.and_then(passed),
         };
-        let body = ship::pr_body(&record, added, &self.base_vars["item.id"]);
+        let body = ship::pr_text(&record, added);
         ShipPlan {
             record_stage: record_stage.id.clone(),
             record,
