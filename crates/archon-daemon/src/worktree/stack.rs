@@ -268,7 +268,21 @@ pub(crate) fn push(
     branch: &str,
     commit: &str,
 ) -> Result<Ran, ArchonError> {
+    push_with(shadow, url, (branch, commit), None)
+}
+
+/// [`push`], with `lease` the extra `--force-with-lease` argument, if any.
+fn push_with(
+    shadow: &Shadow,
+    url: &str,
+    (branch, commit): (&str, &str),
+    lease: Option<&str>,
+) -> Result<Ran, ArchonError> {
     super::check_branch(branch)?;
+    assert!(
+        lease.is_none_or(|l| l.starts_with("--force-with-lease=refs/heads/")),
+        "only a lease on the pushed branch"
+    );
     assert!(is_commit_id(commit), "the checked commit is pushed");
     let url = check_url(url)?;
     let receive_pack = match is_local(&url) {
@@ -281,14 +295,9 @@ pub(crate) fn push(
     );
     let refspec = format!("{commit}:refs/heads/{branch}");
     let receive_pack = format!("--receive-pack={receive_pack}");
-    let args = [
-        "push",
-        "--porcelain",
-        "--no-verify",
-        &receive_pack,
-        &url,
-        &refspec,
-    ];
+    let mut args = vec!["push", "--porcelain", "--no-verify", &receive_pack];
+    args.extend(lease);
+    args.extend([url.as_str(), &refspec]);
     shadow
         .git(None, Config::Operator)?
         .network()
@@ -360,18 +369,7 @@ pub(crate) fn fetch_head(
     let Some(url) = origin_url(repo)? else {
         return Ok(None);
     };
-    let wanted = format!("refs/heads/{branch}");
-    let args = ["ls-remote", "--upload-pack=git-upload-pack", &url, &wanted];
-    let listed = shadow
-        .git(None, Config::Operator)?
-        .network()
-        .args(args)
-        .text()?;
-    let head = listed.lines().find_map(|line| {
-        let (sha, name) = line.split_once('\t')?;
-        (name == wanted && is_commit_id(sha)).then(|| sha.to_owned())
-    });
-    let Some(sha) = head else {
+    let Some(sha) = remote_head(shadow, &url, branch)? else {
         return Err(ArchonError::Invalid(format!(
             "`origin` has no branch `{branch}`"
         )));
@@ -382,6 +380,74 @@ pub(crate) fn fetch_head(
     DaemonGit::sealed_in(repo).args(update).text()?;
     assert!(is_commit_id(&sha), "ls-remote names a full commit id");
     Ok(Some(sha))
+}
+
+/// The commit `url` names as the head of `branch`; `None` when it has no such branch.
+fn remote_head(shadow: &Shadow, url: &str, branch: &str) -> Result<Option<String>, ArchonError> {
+    super::check_branch(branch)?;
+    let wanted = format!("refs/heads/{branch}");
+    let args = ["ls-remote", "--upload-pack=git-upload-pack", url, &wanted];
+    let listed = shadow
+        .git(None, Config::Operator)?
+        .network()
+        .args(args)
+        .text()?;
+    let head = listed.lines().find_map(|line| {
+        let (sha, name) = line.split_once('\t')?;
+        (name == wanted && is_commit_id(sha)).then(|| sha.to_owned())
+    });
+    debug_assert!(head.as_deref().is_none_or(is_commit_id));
+    Ok(head)
+}
+
+/// Create `branch` on `origin` at `origin`'s head of `from` when `origin` has
+/// no `branch`, never forced. `false`: it had one, or there is no `origin`.
+pub(crate) fn ensure_remote_branch(
+    shadow: &Shadow,
+    repo: &Path,
+    branch: &str,
+    from: &str,
+) -> Result<bool, ArchonError> {
+    super::check_branch(from)?;
+    assert_ne!(
+        branch, from,
+        "validated: the integration branch is not the release branch"
+    );
+    let Some(url) = origin_url(repo)? else {
+        return Ok(false);
+    };
+    if remote_head(shadow, &url, branch)?.is_some() {
+        return Ok(false);
+    }
+    let Some(sha) = remote_head(shadow, &url, from)? else {
+        return Err(ArchonError::Invalid(format!(
+            "`origin` has neither `{branch}` nor `{from}` to create it from"
+        )));
+    };
+    // The local `from` may be behind: the push needs `origin`'s commit here.
+    fetch(shadow, repo, from, &sha)?;
+    create_remote_branch(shadow, &url, branch, &sha)
+}
+
+/// Push `commit` as `branch`, which `url` must not have yet. `false`: another
+/// creator made it first, and its branch is left as it is.
+fn create_remote_branch(
+    shadow: &Shadow,
+    url: &str,
+    branch: &str,
+    commit: &str,
+) -> Result<bool, ArchonError> {
+    assert!(is_commit_id(commit), "a commit id");
+    // An empty expected value refuses a branch that exists, even a fast-forward.
+    let lease = format!("--force-with-lease=refs/heads/{branch}:");
+    let pushed = push_with(shadow, url, (branch, commit), Some(&lease))?;
+    if pushed.status.success() {
+        return Ok(true);
+    }
+    if remote_head(shadow, url, branch)?.is_some() {
+        return Ok(false);
+    }
+    Err(pushed.failure())
 }
 
 /// Up to a few commits `repo`'s branches name, for a fetch to negotiate with.
@@ -429,5 +495,44 @@ mod tests {
         }
         assert!(is_local("/srv/r.git") && is_local("file:///srv/r") && is_local("./a:b"));
         assert!(!is_local("git@github.com:o/r.git") && !is_local("ssh://h/r"));
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=T", "-c", "user.email=t@archon.invalid"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A branch another creator made between the absence check and the push,
+    /// even at an ancestor of ours, is adopted and never moved.
+    #[test]
+    fn creating_a_remote_branch_never_moves_one_made_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, origin) = (dir.path().join("repo"), dir.path().join("origin.git"));
+        run_git(dir.path(), &["init", "--quiet", "--bare", "origin.git"]);
+        run_git(dir.path(), &["init", "--quiet", "-b", "main", "repo"]);
+        run_git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "one"]);
+        let first = run_git(&repo, &["rev-parse", "HEAD"]);
+        run_git(&repo, &["commit", "--quiet", "--allow-empty", "-m", "two"]);
+        let second = run_git(&repo, &["rev-parse", "HEAD"]);
+        let url = origin.to_str().unwrap();
+        run_git(
+            &repo,
+            &["push", "--quiet", url, &format!("{first}:refs/heads/next")],
+        );
+        let shadow = Shadow::of(&dir.path().join("data"), &repo).unwrap();
+
+        assert!(!create_remote_branch(&shadow, url, "next", &second).unwrap());
+        assert_eq!(remote_head(&shadow, url, "next").unwrap(), Some(first));
+        assert!(create_remote_branch(&shadow, url, "fresh", &second).unwrap());
+        assert_eq!(remote_head(&shadow, url, "fresh").unwrap(), Some(second));
     }
 }
