@@ -4,6 +4,8 @@
 //! branch is pushed from the shadow. Nothing an agent configured runs.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use archon_core::error::ArchonError;
 
@@ -250,7 +252,7 @@ fn check_url(url: &str) -> Result<String, ArchonError> {
 
 /// Whether git reaches `url` as a repository on this machine, where its
 /// receive-pack would run that repository's hooks.
-fn is_local(url: &str) -> bool {
+pub(crate) fn is_local(url: &str) -> bool {
     if let Some((scheme, _)) = url.split_once("://") {
         return scheme == "file";
     }
@@ -271,15 +273,79 @@ pub(crate) fn push(
     commit: &str,
     token: Option<&Token>,
 ) -> Result<Ran, ArchonError> {
-    push_with(shadow, url, (branch, commit), None, token)
+    push_with(shadow, url, (branch, commit), (None, false), token)
 }
 
-/// [`push`], with `lease` the extra `--force-with-lease` argument, if any.
+/// A remote [`push_from`] pushes through: `url` as its only URL and push URL,
+/// so git applies no `pushInsteadOf`, only the `insteadOf` [`pinned_url`] reports.
+struct Pinned {
+    /// New for each command, so no config file can set anything for it.
+    name: String,
+    /// `-c` arguments defining it; an empty value clears what came before.
+    args: Vec<String>,
+}
+
+impl Pinned {
+    fn new(url: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        assert!(!url.is_empty() && !url.contains('\n'), "a checked URL");
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let name = format!("archon-pinned-{}-{n}-{nanos}", std::process::id());
+        let mut args = Vec::new();
+        for key in ["url", "pushurl"] {
+            for value in ["", url] {
+                args.extend(["-c".to_owned(), format!("remote.{name}.{key}={value}")]);
+            }
+        }
+        Self { name, args }
+    }
+
+    /// Its `-c` arguments, then `command`.
+    fn before<'a>(&'a self, command: &[&'a str]) -> Vec<&'a str> {
+        let mut args: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        args.extend(command);
+        args
+    }
+}
+
+/// Where [`push_from`] to `url` without a token goes, as git resolves it with
+/// the operator's config in the same shadow: `url` after their `insteadOf`.
+pub(crate) fn pinned_url(shadow: &Shadow, url: &str) -> Result<String, ArchonError> {
+    let url = check_url(url)?;
+    let pinned = Pinned::new(&url);
+    let args = pinned.before(&["ls-remote", "--get-url", &pinned.name]);
+    let resolved = shadow.git(None, Config::Operator)?.args(args).text()?;
+    assert!(!resolved.is_empty() && !resolved.contains('\n'), "one URL");
+    Ok(resolved)
+}
+
+/// [`push`] of `commit` to `branch` only while `url` holds `expected` there,
+/// which the receiver checks in the same update. The caller proves `commit`
+/// descends from `expected`, so the update is a fast-forward. It goes where
+/// [`pinned_url`] says.
+pub(crate) fn push_from(
+    shadow: &Shadow,
+    url: &str,
+    (branch, commit): (&str, &str),
+    expected: &str,
+    token: Option<&Token>,
+) -> Result<Ran, ArchonError> {
+    assert!(is_commit_id(expected), "a lease names a commit");
+    assert_ne!(expected, commit, "an update moves the branch");
+    let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
+    push_with(shadow, url, (branch, commit), (Some(&lease), true), token)
+}
+
+/// [`push`], with `lease` the extra `--force-with-lease` argument, if any,
+/// through a [`Pinned`] remote when `pin`.
 fn push_with(
     shadow: &Shadow,
     url: &str,
     (branch, commit): (&str, &str),
-    lease: Option<&str>,
+    (lease, pin): (Option<&str>, bool),
     token: Option<&Token>,
 ) -> Result<Ran, ArchonError> {
     super::check_branch(branch)?;
@@ -289,7 +355,9 @@ fn push_with(
     );
     assert!(is_commit_id(commit), "the checked commit is pushed");
     let url = check_url(url)?;
-    let receive_pack = match is_local(&url) {
+    // The operator's `insteadOf` may send a pinned remote URL to this machine.
+    let rewritten_local = pin && token.is_none() && is_local(&pinned_url(shadow, &url)?);
+    let receive_pack = match is_local(&url) || rewritten_local {
         true => format!("git {} receive-pack", no_programs().join(" ")),
         false => "git-receive-pack".to_owned(),
     };
@@ -299,9 +367,14 @@ fn push_with(
     );
     let refspec = format!("{commit}:refs/heads/{branch}");
     let receive_pack = format!("--receive-pack={receive_pack}");
-    let mut args = vec!["push", "--porcelain", "--no-verify", &receive_pack];
-    args.extend(lease);
-    args.extend([url.as_str(), &refspec]);
+    let pinned = Pinned::new(&url);
+    let mut command = vec!["push", "--porcelain", "--no-verify", &receive_pack];
+    command.extend(lease);
+    command.extend([if pin { &pinned.name } else { url.as_str() }, &refspec]);
+    let args = match pin {
+        true => pinned.before(&command),
+        false => command,
+    };
     let Some(token) = token else {
         let git = shadow.git(None, Config::Operator)?.network();
         return git.args(args).output();
@@ -392,15 +465,46 @@ pub(crate) fn fetch_head(
 }
 
 /// The commit `url` names as the head of `branch`; `None` when it has no such branch.
-fn remote_head(shadow: &Shadow, url: &str, branch: &str) -> Result<Option<String>, ArchonError> {
+pub(crate) fn remote_head(
+    shadow: &Shadow,
+    url: &str,
+    branch: &str,
+) -> Result<Option<String>, ArchonError> {
+    remote_head_as(shadow, url, branch, None)
+}
+
+/// [`remote_head`], read as `token`'s login when given, with none of the
+/// operator's config, as [`push`] with that token goes.
+pub(crate) fn remote_head_as(
+    shadow: &Shadow,
+    url: &str,
+    branch: &str,
+    token: Option<&Token>,
+) -> Result<Option<String>, ArchonError> {
     super::check_branch(branch)?;
     let wanted = format!("refs/heads/{branch}");
     let args = ["ls-remote", "--upload-pack=git-upload-pack", url, &wanted];
-    let listed = shadow
-        .git(None, Config::Operator)?
-        .network()
-        .args(args)
-        .text()?;
+    let listed = match token {
+        None => shadow
+            .git(None, Config::Operator)?
+            .network()
+            .args(args)
+            .text()?,
+        Some(token) => {
+            assert!(url.starts_with("https://github.com/"), "only github.com");
+            let git = shadow.git(None, Config::Sealed)?.network();
+            let ran = git
+                .secret_config(&token.push_settings())
+                .args(args)
+                .output()?;
+            if !ran.status.success() {
+                let said = token.redact(&ran.stderr_text());
+                let what = format!("git ls-remote of `{branch}` as {}", token.user());
+                return Err(ArchonError::io(what, std::io::Error::other(said)));
+            }
+            ran.stdout_text()?
+        }
+    };
     let head = listed.lines().find_map(|line| {
         let (sha, name) = line.split_once('\t')?;
         (name == wanted && is_commit_id(sha)).then(|| sha.to_owned())
@@ -460,7 +564,13 @@ fn create_remote_branch(
     );
     // An empty expected value refuses a branch that exists, even a fast-forward.
     let lease = format!("--force-with-lease=refs/heads/{branch}:");
-    let pushed = push_with(shadow, push_to, (branch, commit), Some(&lease), token)?;
+    let pushed = push_with(
+        shadow,
+        push_to,
+        (branch, commit),
+        (Some(&lease), false),
+        token,
+    )?;
     if pushed.status.success() {
         return Ok(true);
     }
@@ -559,5 +669,116 @@ mod tests {
         assert_eq!(remote_head(&shadow, url, "next").unwrap(), Some(first));
         assert!(create_remote_branch(&shadow, (url, url), ("fresh", &second), None).unwrap());
         assert_eq!(remote_head(&shadow, url, "fresh").unwrap(), Some(second));
+    }
+
+    /// A tip that moved off the expected commit after it was read, even to
+    /// an ancestor of the pushed one, refuses the update and is kept.
+    #[test]
+    fn a_push_from_a_commit_refuses_a_tip_that_moved_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, origin) = (dir.path().join("repo"), dir.path().join("origin.git"));
+        run_git(dir.path(), &["init", "--quiet", "--bare", "origin.git"]);
+        run_git(dir.path(), &["init", "--quiet", "-b", "main", "repo"]);
+        let mut commits = Vec::new();
+        for message in ["frozen", "between", "ours"] {
+            run_git(
+                &repo,
+                &["commit", "--quiet", "--allow-empty", "-m", message],
+            );
+            commits.push(run_git(&repo, &["rev-parse", "HEAD"]));
+        }
+        let [frozen, between, ours] = commits.as_slice() else {
+            unreachable!("three commits")
+        };
+        let url = origin.to_str().unwrap();
+        let tip = |sha: &str| format!("{sha}:refs/heads/feature");
+        run_git(&repo, &["push", "--quiet", url, &tip(between)]);
+        let shadow = Shadow::of(&dir.path().join("data"), &repo).unwrap();
+
+        assert_eq!(
+            pinned_url(&shadow, url).unwrap(),
+            url,
+            "nothing rewrites it"
+        );
+        let moved = push_from(&shadow, url, ("feature", ours), frozen, None).unwrap();
+        assert!(!moved.status.success(), "the lease refuses it");
+        assert_eq!(
+            remote_head(&shadow, url, "feature").unwrap().as_ref(),
+            Some(between)
+        );
+        run_git(&repo, &["push", "--quiet", "--force", url, &tip(frozen)]);
+        let pushed = push_from(&shadow, url, ("feature", ours), frozen, None).unwrap();
+        assert!(pushed.status.success(), "{pushed:?}");
+        assert_eq!(
+            remote_head(&shadow, url, "feature").unwrap().as_ref(),
+            Some(ours)
+        );
+    }
+
+    const HOOKED_ENV: &str = "ARCHON_TEST_HOOKED_ORIGIN";
+
+    /// An operator `insteadOf` sending the GitHub URL to a repository on this
+    /// machine still runs none of its hooks; run under that global config.
+    #[test]
+    fn a_push_rewritten_to_a_local_repository_runs_none_of_its_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let inner = module_path!().split_once("::").unwrap().1;
+        let inner = format!("{inner}::a_rewritten_push_under_the_operator_s_config");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([inner.as_str(), "--exact", "--ignored", "--quiet"])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .env(HOOKED_ENV, &home)
+            .status()
+            .expect("the inner test runs");
+        assert!(status.success(), "the inner test failed");
+    }
+
+    #[test]
+    #[ignore = "run by a_push_rewritten_to_a_local_repository_runs_none_of_its_hooks"]
+    fn a_rewritten_push_under_the_operator_s_config() {
+        let home = PathBuf::from(std::env::var_os(HOOKED_ENV).expect("run by the outer test"));
+        let (repo, origin) = (home.join("repo"), home.join("origin.git"));
+        run_git(&home, &["init", "--quiet", "--bare", "origin.git"]);
+        let marker = home.join("hook-ran");
+        let hook = origin.join("hooks/pre-receive");
+        let script = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+        archon_core::testing::write_script(&hook, &script);
+        let github = "https://github.com/o/r.git";
+        let rewrite = format!("[url \"{}\"]\n\tinsteadOf = {github}\n", origin.display());
+        std::fs::create_dir_all(home.join("git")).unwrap();
+        std::fs::write(home.join("git/config"), rewrite).unwrap();
+        run_git(&home, &["init", "--quiet", "-b", "main", "repo"]);
+        let mut commits = Vec::new();
+        for message in ["frozen", "ours"] {
+            run_git(
+                &repo,
+                &["commit", "--quiet", "--allow-empty", "-m", message],
+            );
+            commits.push(run_git(&repo, &["rev-parse", "HEAD"]));
+        }
+        let [frozen, ours] = commits.as_slice() else {
+            unreachable!("two commits")
+        };
+        let to_origin = format!("{frozen}:refs/heads/feature");
+        run_git(
+            &repo,
+            &["push", "--quiet", origin.to_str().unwrap(), &to_origin],
+        );
+        std::fs::remove_file(&marker).ok();
+        let shadow = Shadow::of(&home.join("data"), &repo).unwrap();
+
+        assert_eq!(
+            pinned_url(&shadow, github).unwrap(),
+            origin.to_str().unwrap()
+        );
+        let pushed = push_from(&shadow, github, ("feature", ours), frozen, None).unwrap();
+        assert!(pushed.status.success(), "{pushed:?}");
+        assert_eq!(
+            remote_head(&shadow, github, "feature").unwrap().as_ref(),
+            Some(ours)
+        );
+        assert!(!marker.exists(), "the receiver ran its pre-receive hook");
     }
 }

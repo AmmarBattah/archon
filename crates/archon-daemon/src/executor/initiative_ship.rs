@@ -272,6 +272,8 @@ struct MemberPr {
     repo: Repo,
     branch: String,
     url: String,
+    /// The member was queued `onto` this pull request, which is not its own.
+    onto: bool,
 }
 
 async fn member_prs(
@@ -308,6 +310,7 @@ async fn member_prs(
             repo: store.repo(&crate::resolve::repo_ref(repo))?,
             branch: run.branch,
             url,
+            onto: member.onto.is_some(),
         });
     }
     assert!(prs.len() <= detail.members.len());
@@ -371,6 +374,10 @@ async fn sync_member(
     let pr = pass.by_number(binary, &member.repo, &identity).await?;
     if !pr.is_open() {
         return gh::settle(&mut *ctx.store.lock().await, &pr);
+    }
+    // A pull request delivered into keeps its owner's body and draft state.
+    if member.onto {
+        return Ok(());
     }
     let links = prs
         .iter()
