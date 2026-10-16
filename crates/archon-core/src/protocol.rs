@@ -1643,6 +1643,7 @@ mod tests {
             autonomy: Default::default(),
             origin: None,
             fresh_retries: 0,
+            routed_provider: None,
             initiative: None,
             state: crate::queue::QueueState::Queued,
             created_at: crate::now(),
