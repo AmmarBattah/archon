@@ -63,6 +63,7 @@ pub struct Config {
     pub github: GithubConfig,
     pub autonomy: AutonomyConfig,
     pub learning: LearningConfig,
+    pub notify: crate::push::NotifyConfig,
 }
 
 /// Defaults for reviewers an item's model plan leaves unnamed.
@@ -983,6 +984,7 @@ impl Config {
         self.worktrees.validate()?;
         self.artifacts.validate()?;
         self.storage.validate()?;
+        self.notify.validate()?;
         self.models.check_weights()?;
         let orchestrator = crate::model::ModelChoice {
             model: self.orchestrator.model.clone(),
