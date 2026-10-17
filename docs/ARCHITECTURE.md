@@ -2995,7 +2995,8 @@ defined in `archon_core::protocol` and served by `archon-daemon`.
   `grant_merge`; an older archond is refused at hello. Protocol 14 added
   `RepoPatch.attribution` (`"none"` or `"item-id"`), a plain option like
   `grant_merge`. Protocol 15 added `RepoPatch.gh_user`, a `Clearable`
-  GitHub login.
+  GitHub login. Protocol 17 added `RepoPatch.merge_waive_checks`, a plain
+  option holding the whole list.
 
 The command set is `archon_core::protocol::Request`, and every variant is
 documented there. Reply kinds are `archon_core::protocol::Reply`. Error codes
@@ -4687,9 +4688,23 @@ operator). The types are in
 - `grant_merge = true` on a repository (`archon repo set R --grant-merge
   true`) stands in for that question. It has no expiry and is independent of
   the ceiling. Under it, a `request_merge` for an item reviewed at
-  `standard` or `strict` whose checks are all green merges with no question;
-  red checks or `review = none` are still asked. A change to the grant posts
-  a `System` note.
+  `standard` or `strict` whose checks are all green merges with no question.
+  When its checks are pending and none failed, the request is recorded as
+  `awaiting_checks` (kept as `queued` in the store's `state` column) and no
+  question is asked. The coordination pass reads the checks again and merges
+  once all are green; a failed check or 60 minutes without a result asks the
+  operator instead, and a moved head or closed pull request refuses it. The
+  `merge_finished` news says it waited. The operator's own `merge` replaces a
+  waiting request, a read of GitHub that fails is retried on the next pass, and
+  turning the grant off makes the pass ask instead of merge. Red checks, no checks or `review =
+  none` are still asked at once. A change to the grant posts a `System` note.
+- `merge_waive_checks = ["next"]` on a repository (operator only, set by
+  `/archon set --repo R merge_waive_checks=next` or a `repo_update` patch;
+  empty by default, so older stores load unchanged) lists base branches whose
+  reviewed pull requests merge under `grant_merge` without waiting for their
+  checks, failed ones included. The merge's result says the checks were waived by that setting.
+  It never applies to a pull request whose head moved after the review, as
+  that is refused before. Adding a branch needs the operator's confirmation.
 
 **What a merge needs.** Each is checked just before `gh pr merge`, and
 for `request_merge` also before asking, against what `gh pr view --json
