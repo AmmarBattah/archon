@@ -4,7 +4,7 @@
 use archon_core::error::ArchonError;
 use archon_core::id::LessonId;
 use archon_core::mcp_tools::TOOLS;
-use archon_core::protocol::OrchestratorFreshness;
+use archon_core::protocol::{OrchestratorFreshness, SettingsDrift};
 use archon_queue::Store;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,10 @@ struct Origin {
     /// [`fingerprint`] of its instructions before the lessons were added.
     prompt: String,
     tools: String,
+    /// `provider/model effort` it was created with; empty when an older
+    /// archond recorded the origin.
+    #[serde(default)]
+    settings: String,
     /// The lessons it was chosen, in selection order.
     lessons: Vec<LessonId>,
 }
@@ -36,13 +40,15 @@ pub(super) fn record_lessons(store: &mut Store, generation: u64) -> Result<(), A
         archon_version: env!("CARGO_PKG_VERSION").to_owned(),
         prompt: String::new(),
         tools: tools_fingerprint(),
+        settings: String::new(),
         lessons: chosen_lessons(store)?,
     };
     assert!(origin.lessons.len() <= archon_core::lesson::ORCHESTRATOR_LESSONS);
     store.kv_set(ORIGIN_KEY, &serde_json::to_string(&origin)?)
 }
 
-/// Record what Aether created generation `generation` with: `prompt`, the
+/// Record what Aether created generation `generation` with: `settings`, the
+/// model and effort of the successful request, and `prompt`, the
 /// part of `sent` before the lessons, unless `created` (the agent's
 /// instructions, when Aether returns them) differs from `sent`, as when it
 /// replays an earlier attempt's creation; then that text is recorded.
@@ -52,7 +58,9 @@ pub(super) fn record_created(
     prompt: &str,
     sent: &str,
     created: Option<&str>,
+    settings: &str,
 ) -> Result<(), ArchonError> {
+    assert!(!settings.is_empty(), "the orchestrator has a model");
     assert!(
         !prompt.trim().is_empty(),
         "the orchestrator has instructions"
@@ -68,16 +76,18 @@ pub(super) fn record_created(
     origin.archon_version = env!("CARGO_PKG_VERSION").to_owned();
     origin.prompt = fingerprint(received);
     origin.tools = tools_fingerprint();
+    origin.settings = settings.to_owned();
     store.kv_set(ORIGIN_KEY, &serde_json::to_string(&origin)?)
 }
 
 /// How generation `generation` compares with one started now with any of
-/// `instructions` (empty when they cannot be built); `None` when its
-/// creation was not recorded.
+/// `instructions` (empty when they cannot be built) and `settings`; `None`
+/// when its creation was not recorded.
 pub(super) fn freshness(
     store: &Store,
     generation: u64,
     instructions: &[String],
+    settings: &str,
 ) -> Result<Option<OrchestratorFreshness>, ArchonError> {
     let Some(origin) = read(store)?.filter(|origin| origin.generation == generation) else {
         return Ok(None);
@@ -91,6 +101,12 @@ pub(super) fn freshness(
         .filter(|id| !origin.lessons.contains(id))
         .count();
     assert!(new_lessons <= archon_core::lesson::ORCHESTRATOR_LESSONS);
+    assert!(!settings.is_empty(), "the orchestrator has a model");
+    let settings_drift =
+        (!origin.settings.is_empty() && origin.settings != settings).then(|| SettingsDrift {
+            configured: settings.to_owned(),
+            running: origin.settings.clone(),
+        });
     Ok(Some(OrchestratorFreshness {
         created_by: origin.archon_version,
         prompt_outdated: (!instructions.is_empty()).then(|| {
@@ -100,6 +116,7 @@ pub(super) fn freshness(
         }),
         tools_outdated: tools_fingerprint() != origin.tools,
         new_lessons: u32::try_from(new_lessons).expect("at most ORCHESTRATOR_LESSONS"),
+        settings_drift,
     }))
 }
 
