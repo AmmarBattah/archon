@@ -90,6 +90,9 @@ impl CostGroup {
     }
 }
 
+/// The furthest back an age may reach: ten years, far beyond any ledger.
+pub const MAX_DAYS_BACK: u32 = 3650;
+
 /// One end of a report's range: a local calendar date, or a number of
 /// whole days back from today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +123,13 @@ impl DayBound {
             )));
         }
         let days = u32::try_from(age.secs() / SECS_PER_DAY)
-            .map_err(|_| ArchonError::Invalid(format!("{text:?} is too long")))?;
+            .ok()
+            .filter(|days| *days <= MAX_DAYS_BACK)
+            .ok_or_else(|| {
+                ArchonError::Invalid(format!(
+                    "{text:?} reaches back too far: at most {MAX_DAYS_BACK} days"
+                ))
+            })?;
         Ok(Self::Days(days))
     }
 
@@ -266,6 +275,18 @@ mod tests {
     }
 
     #[test]
+    fn ages_reaching_back_too_far_are_refused() {
+        assert_eq!(
+            DayBound::parse("3650d").unwrap(),
+            DayBound::Days(MAX_DAYS_BACK)
+        );
+        for text in ["3651d", "99999d", "9999999999d"] {
+            let error = DayBound::parse(text).unwrap_err().to_string();
+            assert!(error.contains("reaches back too far"), "{error}");
+        }
+    }
+
+    #[test]
     fn older_cost_reports_can_be_read_without_an_unclassified_field() {
         let amounts: CostAmounts = serde_json::from_value(serde_json::json!({
             "counted_usd": 2.5, "cost_usd": 2.0, "estimated_cost_usd": 0.5,
@@ -341,7 +362,7 @@ mod tests {
         assert!(matches!(backwards, ArchonError::Invalid(_)), "{backwards}");
         assert!(range(Some("7d"), Some("7d")).is_err());
         assert!(range(Some("0d"), None).is_err());
-        assert!(range(Some("4000000000d"), None).is_err());
+        assert!(DayBound::parse("4000000000d").is_err());
     }
 
     #[test]
