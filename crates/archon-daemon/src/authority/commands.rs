@@ -18,14 +18,28 @@ async fn command(ctx: &DaemonContext, text: &str) -> Result<Request, ArchonError
     let (verb, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
     let words: Vec<_> = rest.split_whitespace().collect();
     match (verb, words.as_slice()) {
-        ("undo", [seq]) => Ok(Request::UndoAuthority { change: seq.parse().map_err(|_| ArchonError::Invalid("undo needs the numeric change id from the Authority feed".into()))? }),
+        ("undo", [seq]) => Ok(Request::UndoAuthority {
+            change: seq.parse().map_err(|_| {
+                ArchonError::Invalid(
+                    "undo needs the numeric change id from the Authority feed".into(),
+                )
+            })?,
+        }),
         ("pause", ["--hard"]) => Ok(Request::Pause(PauseTarget::Global { hard: true })),
         ("resume", ["--hard"]) => Ok(Request::Resume(PauseTarget::Global { hard: true })),
-        ("repo", ["remove", name]) => Ok(Request::RepoRemove { repo: RepoRef((*name).into()) }),
-        ("apply", _) => serde_json::from_str(rest).map_err(|e| ArchonError::Invalid(format!("invalid authority command: {e}"))),
-        ("watcher", _) => Ok(Request::ConfigureGithubWatcher { change: serde_json::from_str(rest).map_err(|e| ArchonError::Invalid(format!("invalid watcher change: {e}")))? }),
+        ("repo", ["remove", name]) => Ok(Request::RepoRemove {
+            repo: RepoRef((*name).into()),
+        }),
+        ("apply", _) => serde_json::from_str(rest)
+            .map_err(|e| ArchonError::Invalid(format!("invalid authority command: {e}"))),
+        ("watcher", _) => Ok(Request::ConfigureGithubWatcher {
+            change: serde_json::from_str(rest)
+                .map_err(|e| ArchonError::Invalid(format!("invalid watcher change: {e}")))?,
+        }),
         ("reset", []) => Ok(Request::ResetSettings { repo: None }),
-        ("reset", ["--repo", name]) => Ok(Request::ResetSettings { repo: Some(RepoRef((*name).into())) }),
+        ("reset", ["--repo", name]) => Ok(Request::ResetSettings {
+            repo: Some(RepoRef((*name).into())),
+        }),
         ("item", [id, settings @ ..]) if !settings.is_empty() => Ok(Request::UpdateItem {
             item: archon_core::id::QueueItemId::parse(id)?,
             patch: archon_core::protocol::ItemPatch {
@@ -34,13 +48,77 @@ async fn command(ctx: &DaemonContext, text: &str) -> Result<Request, ArchonError
             },
         }),
         ("set", ["--repo", name, settings @ ..]) if !settings.is_empty() => {
-            let registry = ["grant_merge=", "merge_waive_checks=", "ship=", "base_branch=", "attribution=", "gh_user="];
-            if settings.iter().any(|s| registry.iter().any(|key| s.starts_with(key))) {
+            let is_repo_key = |s: &&str| {
+                REPO_KEYS
+                    .iter()
+                    .any(|key| s.starts_with(&format!("{key}=")))
+            };
+            if settings.iter().any(is_repo_key) {
                 repo_settings(ctx, name, settings).await
-            } else { overlay_settings(ctx, Some(name), settings).await }
+            } else {
+                overlay_settings(ctx, Some(name), settings).await
+            }
         }
         ("set", settings) if !settings.is_empty() => overlay_settings(ctx, None, settings).await,
-        _ => Err(ArchonError::Invalid("usage: /archon answer N TEXT | approve [N] | reject [N] | merge ITEM [--ignore-checks] | set --repo NAME key=value … | pause --hard | resume --hard | repo remove NAME | watcher JSON | apply JSON".into())),
+        _ => Err(usage_error(verb)),
+    }
+}
+
+const USAGE: &str = "usage: /archon answer N TEXT | approve [N] | reject [N] | merge ITEM [--ignore-checks] | set [--repo NAME] key=value … | item ID knob=value … | undo N | reset [--repo NAME] | pause --hard | resume --hard | repo remove NAME | watcher JSON | apply JSON";
+
+const VERBS: [&str; 13] = [
+    "answer", "approve", "reject", "merge", "set", "undo", "reset", "pause", "resume", "repo",
+    "watcher", "apply", "item",
+];
+
+/// The usage line, led by the verb when it is not one `/archon` knows.
+fn usage_error(verb: &str) -> ArchonError {
+    match VERBS.contains(&verb) {
+        true => ArchonError::Invalid(USAGE.into()),
+        false => ArchonError::Invalid(format!("unknown verb `{verb}`; {USAGE}")),
+    }
+}
+
+/// Keys `set --repo` stores in the repository registry, not the overlay.
+const REPO_KEYS: [&str; 6] = [
+    "grant_merge",
+    "merge_waive_checks",
+    "ship",
+    "base_branch",
+    "attribution",
+    "gh_user",
+];
+
+/// Repository-scope overlay keys; the rest of the settings are global only.
+const REPO_OVERLAY_KEYS: [&str; 6] = [
+    "budgets_enabled",
+    "budget_usd_per_item",
+    "max_per_repo",
+    "default_pipeline",
+    "autonomy_default",
+    "autonomy_max",
+];
+
+/// The refusal for a `set --repo` key that is neither a repository key nor
+/// an overlay one, suggesting the repository key it abbreviates.
+fn unknown_repo_key(key: &str) -> ArchonError {
+    let guess = REPO_KEYS
+        .iter()
+        .find(|known| !key.is_empty() && known.starts_with(key));
+    let hint = guess.map_or(String::new(), |known| format!("; did you mean `{known}`?"));
+    ArchonError::Invalid(format!(
+        "unknown key `{key}`{hint} (repository keys: {}; overlay keys: {}; or default.KNOB / max.KNOB)",
+        REPO_KEYS.join(", "),
+        REPO_OVERLAY_KEYS.join(", "),
+    ))
+}
+
+/// `value` without one pair of matching quotes around it.
+fn unquoted(value: &str) -> &str {
+    let quoted = |q: char| value.len() >= 2 && value.starts_with(q) && value.ends_with(q);
+    match quoted('"') || quoted('\'') {
+        true => &value[1..value.len() - 1],
+        false => value,
     }
 }
 
@@ -56,6 +134,7 @@ async fn repo_settings(
         let (key, value) = pair
             .split_once('=')
             .ok_or_else(|| ArchonError::Invalid(format!("expected key=value, got {pair:?}")))?;
+        let value = unquoted(value);
         match key {
             "grant_merge" => {
                 patch.grant_merge = Some(value.parse().map_err(|_| {
@@ -68,13 +147,14 @@ async fn repo_settings(
             "gh_user" if value.is_empty() => patch.gh_user = Clearable::Clear,
             "gh_user" => patch.gh_user = Clearable::Set(value.parse()?),
             "base_branch" => patch.base_branch = Clearable::Set(value.into()),
+            _ if REPO_OVERLAY_KEYS.contains(&key) || key.contains('.') => {
+                return Err(ArchonError::Invalid(format!(
+                    "set {} separately from saved overlay settings such as `{key}`",
+                    REPO_KEYS.join(", ")
+                )));
+            }
             _ => {
-                return Err(ArchonError::Invalid(
-                    "set grant_merge, merge_waive_checks, ship, base_branch, attribution and gh_user \
-                     separately from \
-                     saved overlay settings"
-                        .into(),
-                ));
+                return Err(unknown_repo_key(key));
             }
         }
     }
@@ -136,6 +216,9 @@ async fn overlay_settings(
                 value[group][knob] = set.clone();
             }
         } else {
+            if repo.is_some() && !REPO_OVERLAY_KEYS.contains(&key) {
+                return Err(unknown_repo_key(key));
+            }
             value[key] = if key == "default_pipeline" {
                 serde_json::json!(raw)
             } else {
@@ -148,4 +231,50 @@ async fn overlay_settings(
         repo,
         settings: serde_json::from_value(value)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_quotes_around_a_value_are_dropped() {
+        assert_eq!(unquoted("\"main\""), "main");
+        assert_eq!(unquoted("'main'"), "main");
+        assert_eq!(unquoted("main"), "main");
+        assert_eq!(unquoted("\"main"), "\"main");
+        assert_eq!(unquoted("\""), "\"");
+    }
+
+    #[test]
+    fn an_abbreviated_repo_key_names_the_full_one_and_lists_the_keys() {
+        let refusal = unknown_repo_key("base").to_string();
+        assert!(refusal.contains("unknown key `base`"), "{refusal}");
+        assert!(refusal.contains("did you mean `base_branch`?"), "{refusal}");
+        let unrelated = unknown_repo_key("colour").to_string();
+        assert!(!unrelated.contains("did you mean"), "{unrelated}");
+        for key in REPO_KEYS {
+            assert!(unrelated.contains(key), "{unrelated}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn the_usage_lists_undo_and_reset_and_a_bogus_verb_is_named() {
+        assert!(USAGE.contains("undo N") && USAGE.contains("reset [--repo NAME]"));
+        let bogus = usage_error("bogus").to_string();
+        assert!(
+            bogus.starts_with("invalid input: unknown verb `bogus`")
+                || bogus.contains("unknown verb `bogus`"),
+            "{bogus}"
+        );
+        assert!(!usage_error("set").to_string().contains("unknown verb"));
+        for verb in VERBS {
+            assert!(USAGE.contains(verb), "{verb} is missing from the usage");
+        }
+    }
 }

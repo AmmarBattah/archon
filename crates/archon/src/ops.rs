@@ -21,12 +21,13 @@ pub async fn say(client: &ArchonClient, text: String) -> anyhow::Result<()> {
     }
 }
 
-/// Answer `question`; a bare option number picks that option; a number outside the options is refused. Returns the
+/// Answer `question` (`chat` when typed in the chat); a bare option number picks that option; a number outside the options is refused. Returns the
 /// answer as sent.
 pub async fn answer(
     client: &ArchonClient,
     question: &Question,
     text: &str,
+    chat: bool,
 ) -> anyhow::Result<String> {
     assert!(!text.trim().is_empty(), "callers refuse empty answers");
     let text = question.expand_option(text)?;
@@ -38,6 +39,7 @@ pub async fn answer(
         .into());
     }
     let request = Request::Answer {
+        chat,
         question: question.id.clone(),
         text: text.clone(),
     };
@@ -47,15 +49,42 @@ pub async fn answer(
     }
 }
 
-/// Pause `target`, or resume it when `pause` is false.
-pub async fn pause(client: &ArchonClient, target: PauseTarget, pause: bool) -> anyhow::Result<()> {
+/// Pause `target`, or resume it when `pause` is false. `false` comes back
+/// when a resume found nothing paused.
+pub async fn pause(
+    client: &ArchonClient,
+    target: PauseTarget,
+    pause: bool,
+) -> anyhow::Result<bool> {
+    let was_paused = match pause {
+        true => true,
+        false => is_paused(client, &target).await?,
+    };
     let request = match pause {
         true => Request::Pause(target),
         false => Request::Resume(target),
     };
     match client.request(request).await? {
-        Reply::Ok => Ok(()),
+        Reply::Ok => Ok(was_paused),
         other => Err(unexpected(&other, "ok")),
+    }
+}
+
+/// Whether `target` is paused now. A hard resume also frees stage agents,
+/// so it always counts as a change; an unknown repository is left for
+/// archond to refuse.
+async fn is_paused(client: &ArchonClient, target: &PauseTarget) -> anyhow::Result<bool> {
+    let state = crate::views::fetch_status(client).await?.pause;
+    match target {
+        PauseTarget::Global { hard } => Ok(*hard || state.global),
+        PauseTarget::Pipeline { name } => Ok(state.pipelines.contains(name)),
+        PauseTarget::Repo { name } => {
+            let repos = crate::views::fetch_repos(client).await?;
+            let repo = repos
+                .iter()
+                .find(|r| r.name == name.0 || r.id.as_str() == name.0);
+            Ok(repo.is_none_or(|r| state.repos.contains(&r.id)))
+        }
     }
 }
 
