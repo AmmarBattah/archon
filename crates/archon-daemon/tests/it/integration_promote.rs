@@ -23,6 +23,7 @@ use common::{Harness, REPO_NAME, git};
 /// `pr view` shows `origin`'s head of it, and `pr merge` merges it there
 /// with a merge commit, as GitHub does, only at the commit it names. With
 /// `gh-state/queue` it only queues the merge, which `queue land` lands.
+/// Labels are created and set as asked; an edited body is `edited-body`.
 const MERGING_GH: &str = r#"#!/bin/sh
 state="$(dirname "$0")/gh-state"
 origin="$(cat "$state/origin")"
@@ -67,6 +68,11 @@ case "$1 $2" in
 "queue land")
     read -r base head < "$state/pr"
     land
+    ;;
+"label list") printf '[]' ;;
+"label create") ;;
+"pr edit")
+    if [ "$4" = "--body-file" ]; then cat > "$state/edited-body"; fi
     ;;
 *)
     exit 2
@@ -284,6 +290,19 @@ async fn a_green_integration_branch_merges_into_the_release_branch_and_is_realig
             .any(|c| c.starts_with("pr create --base main --head next")),
         "{calls:?}"
     );
+    let labelled = "pr edit https://github.com/o/r/pull/9 --add-label risk: high";
+    assert!(calls.iter().any(|c| c == labelled), "{calls:?}");
+    let body = std::fs::read_to_string(gh.state.join("edited-body")).expect("risk section");
+    assert!(
+        body.starts_with("<!-- archon-risk -->\n## Risk: high\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("Archon labels every promotion `high`."),
+        "{body}"
+    );
+    let risk = done.risk.as_deref().unwrap_or("");
+    assert!(risk.starts_with("RISK: high, labelled"), "{done:?}");
     assert!(told(&h, NotificationKind::Outcome, "promoted demo/next").await);
 
     integration::pass(&h.ctx)
