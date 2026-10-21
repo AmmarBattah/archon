@@ -151,9 +151,17 @@ pub(super) fn commit_leftovers(
         let kept = changed_paths(path)?;
         return Ok(Leftovers { saved: None, kept });
     };
-    let mut add = vec!["add", "--all", "--", "."];
+    let mut add = vec![
+        "add",
+        "--all",
+        "--",
+        ".",
+        ":(exclude,glob)**/__pycache__/**",
+    ];
+    add.extend([":(exclude,glob)**/*.pyc", ":(exclude,glob)**/*.pyo"]);
     add.extend(nested.iter().map(String::as_str));
     git(path, &add)?;
+    unstage_caches(path)?;
     let staged = nul_paths(path, &["diff", "--cached", "--name-only"])?;
     let saved = match staged.is_empty() {
         true => None,
@@ -208,6 +216,50 @@ fn commit_staged(
     })
 }
 
+/// Take caches the role staged itself out of the index; its files stay.
+fn unstage_caches(path: &Path) -> Result<(), ArchonError> {
+    let staged = nul_entries(path, &["diff", "--cached", "--name-only"])?;
+    let mut caches = Vec::new();
+    for name in staged {
+        let name = match String::from_utf8(name) {
+            Ok(name) => name,
+            Err(raw) if is_python_cache(&String::from_utf8_lossy(raw.as_bytes())) => {
+                return Err(ArchonError::Invalid(format!(
+                    "a cache staged in {} has a name that is not UTF-8, so it cannot be \
+                     left out of the commit: {}",
+                    path.display(),
+                    String::from_utf8_lossy(raw.as_bytes())
+                )));
+            }
+            Err(_) => continue,
+        };
+        if is_python_cache(&name) {
+            caches.push(format!(":(literal){name}"));
+        }
+    }
+    if caches.is_empty() {
+        return Ok(());
+    }
+    let mut reset = vec!["reset", "--quiet", "--"];
+    reset.extend(caches.iter().map(String::as_str));
+    git(path, &reset)?;
+    debug_assert!(
+        nul_paths(path, &["diff", "--cached", "--name-only"])?
+            .iter()
+            .all(|name| !is_python_cache(name)),
+        "no cache stays staged"
+    );
+    Ok(())
+}
+
+/// Bytecode a worker's test run leaves: never committed on its behalf, and
+/// not a reason to refuse its branch.
+fn is_python_cache(path: &str) -> bool {
+    path.split('/').any(|part| part == "__pycache__")
+        || path.ends_with(".pyc")
+        || path.ends_with(".pyo")
+}
+
 /// The paths `git status` reports changed in `tree`, untracked included,
 /// but not a submodule holding only untracked files, such as its build
 /// output. Before `add` only whether it is empty matters; after the commit
@@ -223,6 +275,7 @@ fn changed_paths(tree: &Path) -> Result<Vec<String>, ArchonError> {
     let changed: Vec<String> = entries
         .iter()
         .map(|entry| entry.get(3..).unwrap_or(entry).to_owned())
+        .filter(|path| !is_python_cache(path))
         .collect();
     debug_assert!(changed.iter().all(|path| !path.is_empty()));
     Ok(changed)
