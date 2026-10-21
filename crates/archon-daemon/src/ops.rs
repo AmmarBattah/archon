@@ -16,6 +16,7 @@ use archon_core::config::AetherMode;
 use archon_core::error::ArchonError;
 use archon_core::notify::NotificationKind;
 use archon_core::ops::{ProgramVersions, UpgradeRequest, UpgradeTarget, Versions, bare_version};
+use archon_core::protocol::McpHealth;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
@@ -463,13 +464,55 @@ async fn report_restart(ctx: &DaemonContext) -> Result<(), ArchonError> {
     }
     match serde_json::from_str::<Restarted>(&record) {
         Ok(restarted) => {
-            let text = restarted.report(&versions(ctx).await);
+            let now = versions(ctx).await;
+            let mut text = restarted.report(&now);
+            if !restarted.restart_aether && restarted.before.archon.running != now.archon.running {
+                text.push_str(&refresh_bridge(ctx).await);
+            }
             feed::notify(ctx, NotificationKind::Outcome, text, None, None).await?;
         }
         Err(error) => tracing::warn!(%error, "the upgrade record is unreadable; not reported"),
     }
     ctx.store.lock().await.kv_delete(RESTART_KEY)?;
     Ok(())
+}
+
+/// Aether keeps the `archon mcp` process it spawned, which after an Archon
+/// upgrade is the old binary. Refresh it so Aether starts the new one, and
+/// owe the orchestrator a restart for the new tools. The sentence added to the report.
+async fn refresh_bridge(ctx: &DaemonContext) -> String {
+    let by_hand = "Run `archon aether mcp refresh archon`, then `archon orchestrator restart`.";
+    let client = match ctx.aether.client() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "the archon MCP server was not refreshed after the upgrade");
+            return format!(
+                " Aether is not connected, so the MCP server was not refreshed. {by_hand}"
+            );
+        }
+    };
+    match client
+        .refresh_mcp(archon_core::mcp_tools::SERVER_NAME)
+        .await
+    {
+        Ok(McpHealth::Ready { .. }) => {
+            crate::supervisor::owe_orchestrator_restart(ctx).await;
+            crate::supervisor::check_mcp_soon(ctx);
+            " Refreshed Archon's MCP server in Aether; the orchestrator restarts to get its tools."
+                .to_owned()
+        }
+        Ok(health) => {
+            tracing::warn!(
+                ?health,
+                "the archon MCP server is not ready after the refresh"
+            );
+            format!(" Aether refreshed the MCP server but it is not ready ({health:?}). {by_hand}")
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the archon MCP server was not refreshed after the upgrade");
+            format!(" Refreshing the MCP server failed: {error}. {by_hand}")
+        }
+    }
 }
 
 #[cfg(test)]

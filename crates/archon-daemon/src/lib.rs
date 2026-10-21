@@ -85,6 +85,15 @@ pub struct DaemonOptions {
 /// then run every worker; it serves while Aether is down, while it recovers
 /// (reads only) and in standby.
 pub async fn run(options: DaemonOptions) -> Result<(), ArchonError> {
+    let started = archon_core::now();
+    let result = run_until_stopped(options).await;
+    if let Err(error) = &result {
+        record_fatal_stop(&archon_core::paths::data_dir(), started, error);
+    }
+    result
+}
+
+async fn run_until_stopped(options: DaemonOptions) -> Result<(), ArchonError> {
     let endpoint = Endpoint::from_config(&options.config.aether)?;
     let starter = options.aether_starter.clone();
     // Holds the data directory's lock from before the store opens until the
@@ -119,16 +128,80 @@ pub async fn run(options: DaemonOptions) -> Result<(), ArchonError> {
     drop(lock);
     match &result {
         Ok(()) => tracing::info!("archond stopped"),
-        Err(error) => tracing::error!(%error, "archond stopped"),
+        Err(error) => {
+            tracing::error!(%error, "archond stopped");
+        }
     }
     result
 }
+
+/// Keep why archond stopped under the data directory, which outlives the
+/// runtime directory's log. A panic marker this run already wrote keeps its
+/// source location, and a refusal because another archond runs is no crash.
+fn record_fatal_stop(data_dir: &Path, started: archon_core::Timestamp, error: &ArchonError) {
+    if matches!(error, ArchonError::Unavailable(_)) {
+        return;
+    }
+    match archon_core::crash::read_pending(data_dir) {
+        Ok(Some(pending)) if pending.kind == "panic" && pending.at >= started => return,
+        Ok(_) => {}
+        Err(read_error) => tracing::error!(%read_error, "the crash marker cannot be read"),
+    }
+    let record = archon_core::crash::CrashRecord::new("fatal", &error.to_string(), None);
+    if let Err(write_error) = archon_core::crash::write_pending(data_dir, &record) {
+        tracing::error!(%write_error, "the crash marker was not written");
+    }
+}
+
+/// Tell the operator, once, of the crash an earlier run left: in the log and
+/// in the chat. The marker moves on only after the chat has it.
+pub async fn report_crash(ctx: &DaemonContext) -> Result<(), ArchonError> {
+    let data_dir = &ctx.paths.data_dir;
+    let pending = match archon_core::crash::read_pending(data_dir) {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::error!(%error, "the crash marker of an earlier run cannot be read");
+            return Ok(());
+        }
+    };
+    let Some(record) = pending else {
+        return Ok(());
+    };
+    let text = record.describe();
+    tracing::error!(kind = %record.kind, at = %record.at, "the previous run left a crash marker: {text}");
+    let reported = record.at.to_string();
+    let mut store = ctx.store.lock().await;
+    if store.kv_get(CRASH_REPORTED_KEY)?.as_deref() != Some(reported.as_str()) {
+        let notification = archon_core::notify::Notification {
+            id: archon_core::id::NotificationId::new(),
+            kind: NotificationKind::Blocker,
+            text,
+            item: None,
+            run: None,
+            at: archon_core::now(),
+        };
+        let entry = archon_core::notify::FeedEntry::Notification(notification);
+        let item = store.append_feed_with_kv(
+            entry,
+            archon_core::now(),
+            &[(CRASH_REPORTED_KEY, reported.as_str())],
+        )?;
+        drop(store);
+        feed::publish(ctx, vec![item]);
+    }
+    archon_core::crash::acknowledge(data_dir)
+}
+
+/// `kv`: the time of the crash the chat was last told of, so a start cut off
+/// before the marker moved on does not tell it twice.
+const CRASH_REPORTED_KEY: &str = "crash_reported";
 
 /// Recover runs, with the disk hold read first so a low disk defers the
 /// spawns recovery would issue.
 async fn recover(ctx: &DaemonContext) -> Result<(), ArchonError> {
     dispatcher::check_disk(ctx).await?;
     note_legacy_config(ctx, &archon_core::paths::config_dir()).await?;
+    report_crash(ctx).await?;
     executor::recover(ctx).await
 }
 
@@ -445,6 +518,26 @@ fn remove_socket(socket: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fatal_stop_keeps_this_runs_panic_marker_and_records_startup_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = archon_core::now();
+        let failure = ArchonError::Invalid("bad store".into());
+        record_fatal_stop(dir.path(), started, &failure);
+        let first = archon_core::crash::read_pending(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.kind, "fatal");
+        let panic = archon_core::crash::CrashRecord::new("panic", "boom", Some("a.rs:1".into()));
+        archon_core::crash::write_pending(dir.path(), &panic).unwrap();
+        record_fatal_stop(dir.path(), started, &failure);
+        let kept = archon_core::crash::read_pending(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.kind, "panic");
+        assert_eq!(kept.location.as_deref(), Some("a.rs:1"));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stopping_leaves_a_worker_that_never_yields_behind() {
