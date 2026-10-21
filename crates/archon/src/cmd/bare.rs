@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use archon_core::config::Config;
 
-use super::instance;
+use super::{first_run, instance};
 use crate::chat;
 use crate::cli::TuiArgs;
 
@@ -40,10 +40,19 @@ pub async fn run() -> anyhow::Result<ExitCode> {
     let config = Config::load_default()?;
     let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     match front(terminal, config.aether.address.is_some()) {
-        Front::Tui => instance::tui_checked(TuiArgs::default())
-            .await
-            .context(TUI_FAILED),
+        Front::Tui => {
+            if !first_run::offer(&config).await? {
+                return Ok(ExitCode::SUCCESS);
+            }
+            instance::tui_checked(TuiArgs::default())
+                .await
+                .context(TUI_FAILED)
+        }
         Front::Chat(reason) => {
+            if !terminal && let Some(hint) = first_run::non_interactive_hint(&config)? {
+                eprintln!("archon: {hint}");
+                return Ok(ExitCode::FAILURE);
+            }
             eprintln!("archon: {reason}; opening the line chat (`archon chat`) instead");
             chat::run(false).await
         }
