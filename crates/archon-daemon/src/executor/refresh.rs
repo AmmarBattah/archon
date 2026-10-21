@@ -284,8 +284,16 @@ fn head_now(
         false => stack::sha(repo, base)?,
     };
     if stack::contains(repo, &sha, &format!("refs/heads/{branch}"))? {
+        let tip = stack::sha(repo, branch)?;
+        let shipped = !remote && stack::contains(repo, &tip, &format!("refs/heads/{base}"))?;
+        let why = match shipped {
+            true => {
+                format!("it already shipped to `{base}` locally, so there is nothing to refresh")
+            }
+            false => "there is nothing to refresh".to_owned(),
+        };
         return Err(ArchonError::Invalid(format!(
-            "`{branch}` already holds `{base}` at {}; nothing to refresh",
+            "`{branch}` already holds `{base}` at {}; {why}",
             &sha[..12]
         )));
     }
