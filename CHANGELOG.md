@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.4.1
+
+Released 2026-10-20.
+
+A small patch release on 1.4.0, with no store migration. The daemon protocol
+is now 18 (it was 17), so `archon` and archond upgrade together.
+
+Archon still asks Aether for protocol 24. Image paste and the notification
+center need **Aether 1.2.1** or newer: it serves image attachments and the
+`notifications` feature, and both were tested with it. Against an older
+aetherd, such as 1.2.0, archond logs one line and posts no notifications;
+everything else here works on every aetherd 1.4.0 worked with.
+
 Images reach the orchestrator from `archon chat`. Ctrl+V (or Alt+V) attaches
 a copied image as a chip, `[image #1]`, read through `wl-paste` or `xclip`;
 with only text on the clipboard it pastes the text, and Ctrl+Shift+V stays
@@ -11,8 +24,7 @@ after a chip removes its image. archond checks each message as Aether does
 (at most 10 PNG, JPEG, GIF or WebP images, 3.8 MB each, 10 MB together),
 delivers the images through Aether's `send_message` attachments (an aetherd
 speaking protocol 19 or later), and keeps only `[image: name, size]` in the
-feed. The daemon protocol is now 18, so `archon` and archond upgrade
-together; a text-only message is the frame it always was.
+feed. A text-only message is the frame it always was.
 
 Steering several running items at once, or one item several times, no longer
 panics archond ("steps are only added while one is made"). A steer's delivery
@@ -42,6 +54,9 @@ repository lacks them. `get_item`, `list_queue`, `queue list` and
 `queue show` show the level. The label is advisory only: no merge, gate or
 review rule follows from it, and a label GitHub refuses never fails a
 delivery.
+
+Dependencies: `serde_json` 1.0.154 and `tokio` 1.53.3, both patch releases,
+and CI's `taiki-e/install-action` 2.87.28.
 
 ## 1.4.0
 
