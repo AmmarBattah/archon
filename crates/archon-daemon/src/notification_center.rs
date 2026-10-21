@@ -323,7 +323,7 @@ async fn mirror_notice(
         return Ok(());
     };
     client.post_notification(post).await?;
-    if let (Some(item), notify::NotificationKind::Blocker) = (&notice.item, notice.kind) {
+    if let Some(item) = &notice.item {
         blockers::remember(ctx, item, &notice.id).await?;
     }
     Ok(())
