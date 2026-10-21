@@ -48,11 +48,11 @@ pub(super) async fn finish_run(
     let now = archon_core::now();
     let finished = {
         let mut store = ctx.store.lock().await;
-        let stages = store.stage_runs(&run.id)?;
         run.cost_usd = store.spend_for_run(&run.id, archon_core::cost::API_EQUIVALENT)?;
         run.shipped = match &proof {
             ShippingProof::Daemon => true,
-            ShippingProof::Stage(id) => stages
+            ShippingProof::Stage(id) => store
+                .stage_runs(&run.id)?
                 .iter()
                 .any(|s| &s.stage_id == id && s.state == StageState::Completed),
             ShippingProof::None => false,
@@ -178,7 +178,11 @@ fn item_state(run: &PipelineRun) -> QueueState {
 
 /// The newest `pr_url` a completed stage reported (the ship stage's).
 async fn pr_url(ctx: &DaemonContext, run: &PipelineRun) -> Result<Option<String>, ArchonError> {
-    let stages = ctx.store.lock().await.stage_runs(&run.id)?;
+    let stages = match ctx.store.lock().await.stage_runs(&run.id) {
+        Ok(stages) => stages,
+        Err(error) if !error.is_store() => return Ok(None),
+        Err(error) => return Err(error),
+    };
     Ok(archon_core::run::pr_url(stages.iter()).map(str::to_owned))
 }
 
@@ -290,7 +294,13 @@ pub(super) async fn announce(
     let summary = outcome_text(item);
     let notice = if matches!(item.state, QueueState::Failed { .. }) {
         let stages = match run {
-            Some(run) => ctx.store.lock().await.stage_runs(&run.id)?,
+            Some(run) => match ctx.store.lock().await.stage_runs(&run.id) {
+                Err(error) if !error.is_store() => {
+                    tracing::warn!(run = %run.id, %error, "stage rows unreadable; notice without them");
+                    Vec::new()
+                }
+                other => other?,
+            },
             None => Vec::new(),
         };
         failure_notice(item, run, &stages)
@@ -407,7 +417,10 @@ fn wakes_orchestrator(item: &QueueItem, wake_on_success: bool) -> bool {
 /// full error. Read the failing member instead of the engine's nested report.
 fn failure_notice(item: &QueueItem, run: Option<&PipelineRun>, stages: &[StageRun]) -> String {
     let QueueState::Failed { error, .. } = &item.state else {
-        unreachable!("failure notice requires a failed item");
+        return format!(
+            "{} did not fail; `archon queue show {}` says where it stands",
+            item.title, item.id
+        );
     };
     let (stage, fallback) = match run.map(|r| &r.state) {
         Some(RunState::Failed { stage_id, error }) => (stage_id.as_str(), error.as_str()),
@@ -514,7 +527,7 @@ pub(super) fn outcome_text(item: &QueueItem) -> String {
         QueueState::Failed { error, .. } => format!("Failed: {}. {error}", item.title),
         QueueState::Cancelled { reason: Some(r) } => format!("Cancelled: {}. {r}", item.title),
         QueueState::Cancelled { reason: None } => format!("Cancelled: {}.", item.title),
-        other => unreachable!("outcome of a {} item", other.kind()),
+        other => format!("{}: {} is {}.", item.id, item.title, other.kind()),
     };
     text.trim().to_owned()
 }

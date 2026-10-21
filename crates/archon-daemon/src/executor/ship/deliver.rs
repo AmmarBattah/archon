@@ -173,7 +173,7 @@ async fn claim(
         .kv_get(&ship_key(run_id))?
         .map(|raw| serde_json::from_str::<ShipOutcome>(&raw))
         .transpose()
-        .map_err(|e| ArchonError::Store(format!("delivery outcome of run {run_id}: {e}")))?;
+        .map_err(|e| ArchonError::Corrupt(format!("delivery outcome of run {run_id}: {e}")))?;
     let claimed = Claimed {
         plan,
         repo: repo_of(&store, &run)?,
@@ -234,10 +234,13 @@ async fn fresh(
         ..
     } = &outcome
     {
-        let repo = claimed
-            .repo
-            .as_ref()
-            .expect("a pull request is of a registered repository");
+        let repo = claimed.repo.as_ref().ok_or_else(|| {
+            ArchonError::Corrupt(format!(
+                "run {} delivered {url} but its repository is no longer registered; \
+                 `archon repo add` registers it again",
+                run.id
+            ))
+        })?;
         pr_checks::owe(&mut store, &run.id, &run.item, &repo.id, url)?;
         if owes_merge {
             auto_merge::owe(&mut store, &run.id, &run.item, &repo.id, url, commit)?;
@@ -666,9 +669,9 @@ fn load_retry(store: &Store, run: &PipelineRunId) -> Result<Option<ShipRetry>, A
         return Ok(None);
     };
     let persisted: PersistedRetry =
-        serde_json::from_str(&raw).map_err(|e| ArchonError::Store(format!("kv {key}: {e}")))?;
+        serde_json::from_str(&raw).map_err(|e| ArchonError::Corrupt(format!("kv {key}: {e}")))?;
     if persisted.failures == 0 || persisted.failures >= MAX_ATTEMPTS {
-        return Err(ArchonError::Store(format!(
+        return Err(ArchonError::Corrupt(format!(
             "kv {key}: {} failures",
             persisted.failures
         )));
@@ -721,7 +724,7 @@ pub(in crate::executor) fn replay(
         return Ok(());
     };
     let outcome: ShipOutcome =
-        serde_json::from_str(&raw).map_err(|e| ArchonError::Store(format!("kv {key}: {e}")))?;
+        serde_json::from_str(&raw).map_err(|e| ArchonError::Corrupt(format!("kv {key}: {e}")))?;
     driver.record_ship(outcome)
 }
 
@@ -735,7 +738,7 @@ pub(crate) fn shipped_commit(
         return Ok(None);
     };
     let outcome: ShipOutcome =
-        serde_json::from_str(&raw).map_err(|e| ArchonError::Store(format!("kv {key}: {e}")))?;
+        serde_json::from_str(&raw).map_err(|e| ArchonError::Corrupt(format!("kv {key}: {e}")))?;
     Ok(match outcome {
         ShipOutcome::Shipped { commit, .. } => {
             assert!(!commit.is_empty(), "a shipped outcome names its commit");
@@ -758,13 +761,18 @@ pub(crate) fn prune_finished_ships(store: &mut Store) -> Result<usize, ArchonErr
 fn prune_finished(store: &mut Store, prefix: &str) -> Result<usize, ArchonError> {
     let mut pruned = 0;
     for (key, _) in store.kv_prefix(prefix)? {
-        let raw_run = key.strip_prefix(prefix).expect("ranged by prefix");
-        let run = PipelineRunId::parse(raw_run)
-            .map_err(|e| ArchonError::Store(format!("delivery key {key}: {e}")))?;
+        let Some(Ok(run)) = key.strip_prefix(prefix).map(PipelineRunId::parse) else {
+            tracing::error!(%key, "a delivery record under a malformed key is left alone");
+            continue;
+        };
         let finished = match store.run(&run) {
             Ok(found) => found.state.is_terminal(),
             Err(ArchonError::NotFound(_)) => true,
-            Err(error) => return Err(error),
+            Err(error) if error.is_store() => return Err(error),
+            Err(error) => {
+                tracing::error!(%run, %error, "a run record is unreadable; its delivery record is left alone");
+                continue;
+            }
         };
         if finished {
             store.kv_delete(&key)?;

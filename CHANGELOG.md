@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Stability: archond no longer stops on stored or external state. Every
+  background task is supervised and restarted with a growing pause (switched
+  off with a notice after repeated failures); a corrupt run variable, a bad
+  pipeline file, malformed `gh` output or an unknown Aether event fails or
+  skips only the record it belongs to, which `archon doctor` and
+  `archon status` list as quarantined with the exact retry and cancel
+  commands.
+
 - Update suggestions (#208): `archon status` ends with `run archon update`
   when a checked latest release is newer; the launch prompt links the
   release notes and says that running agents are waited for and what

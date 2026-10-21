@@ -29,6 +29,29 @@ fn read_rows<T: serde::de::DeserializeOwned>(
     Ok(out)
 }
 
+fn read_rows_lenient<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    sql: &str,
+    arg: &str,
+    what: &str,
+) -> Result<Vec<T>, ArchonError> {
+    let mut stmt = conn.prepare_cached(sql).ctx(what)?;
+    let rows = stmt
+        .query_map([arg], |row| row.get::<_, String>(0))
+        .ctx(what)?;
+    let mut out = Vec::new();
+    for data in rows {
+        match from_json(&data.ctx(what)?, what) {
+            Ok(row) => out.push(row),
+            Err(error @ ArchonError::Corrupt(_)) => {
+                tracing::error!(%error, "an unreadable {what} row is skipped");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(out)
+}
+
 pub(super) fn load(conn: &Connection, id: &PipelineRunId) -> Result<PipelineRun, ArchonError> {
     let data: Option<String> = conn
         .query_row(
@@ -261,6 +284,92 @@ pub(super) fn active(conn: &Connection) -> Result<Vec<PipelineRun>, ArchonError>
     Ok(out)
 }
 
+/// An active run row whose data does not decode: what the SQL columns know.
+#[derive(Debug)]
+pub struct UnreadableRun {
+    pub run: String,
+    pub item: String,
+    pub error: String,
+}
+
+/// Active runs that decode, and those that do not, so one bad row cannot stop
+/// recovery of the others.
+pub(super) fn active_lenient(
+    conn: &Connection,
+) -> Result<(Vec<PipelineRun>, Vec<UnreadableRun>), ArchonError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, item, data FROM runs WHERE terminal = 0 ORDER BY started_at, id",
+        )
+        .ctx("list active runs")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .ctx("list active runs")?;
+    let (mut good, mut bad) = (Vec::new(), Vec::new());
+    for row in rows {
+        let (run, item, data) = row.ctx("read run")?;
+        match from_json::<PipelineRun>(&data, "pipeline run") {
+            Ok(decoded) if decoded.id.as_str() != run || decoded.item.as_str() != item => {
+                bad.push(UnreadableRun {
+                    run,
+                    item,
+                    error: "the run record names another run or item than its index row".into(),
+                });
+            }
+            Ok(decoded) if decoded.state.is_terminal() => bad.push(UnreadableRun {
+                run,
+                item,
+                error: "the run is finished in its record but still active in the index".into(),
+            }),
+            Ok(decoded) => good.push(decoded),
+            Err(error @ ArchonError::Corrupt(_)) => bad.push(UnreadableRun {
+                run,
+                item,
+                error: error.to_string(),
+            }),
+            Err(error) => return Err(error),
+        }
+    }
+    debug_assert!(good.iter().all(|r| !r.state.is_terminal()));
+    Ok((good, bad))
+}
+
+/// Mark an undecodable run terminal (`retired`) so its item can be settled
+/// and retried, or active again when settling the item failed.
+pub(super) fn retire_unreadable(
+    conn: &Connection,
+    run: &str,
+    retired: bool,
+) -> Result<(), ArchonError> {
+    let changed = conn
+        .execute(
+            "UPDATE runs SET terminal = ?2 WHERE id = ?1",
+            rusqlite::params![run, retired],
+        )
+        .ctx("retire unreadable run")?;
+    assert_eq!(changed, 1, "run {run} exists");
+    Ok(())
+}
+
+/// Whether `run`'s item is `failed`: a set-aside run stays listed until then.
+pub(super) fn item_failed(conn: &Connection, run: &str) -> Result<bool, ArchonError> {
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT i.state FROM runs r JOIN items i ON i.id = r.item WHERE r.id = ?1",
+            [run],
+            |row| row.get(0),
+        )
+        .optional()
+        .ctx("read item state of run")?;
+    Ok(state.as_deref() == Some("failed"))
+}
+
 /// `spawning` < `running` < terminal; a state never moves backwards and a
 /// terminal state never changes.
 fn stage_rank(state: &StageState) -> u8 {
@@ -473,13 +582,113 @@ pub(super) fn live_stages(conn: &Connection) -> Result<Vec<StageRun>, ArchonErro
         .ctx("list live stage runs")?;
     let mut out: Vec<StageRun> = Vec::new();
     for data in rows {
-        out.push(from_json(&data.ctx("read stage run")?, "stage run")?);
+        match from_json(&data.ctx("read stage run")?, "stage run") {
+            Ok(stage) => out.push(stage),
+            // One unreadable row must not hide every healthy live stage from the sweeps.
+            Err(error @ ArchonError::Corrupt(_)) => {
+                tracing::error!(%error, "a live stage run is unreadable and skipped");
+            }
+            Err(error) => return Err(error),
+        }
     }
     debug_assert!(out.iter().all(|s| !s.state.is_terminal()));
     Ok(out)
 }
 
+fn archive_row(archive: &std::path::Path, id: &str, data: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    assert!(
+        !safe.contains('/') && !safe.contains(".."),
+        "a plain file name"
+    );
+    std::fs::create_dir_all(archive)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(archive.join(format!("{safe}.json")))?;
+    file.write_all(data.as_bytes())?;
+    file.sync_all()
+}
+
+/// Delete the stage rows of `run` that no longer decode and no operator
+/// feedback cites, returning their ids and raw data. Their agents stay mapped to the run in `agent_runs`.
+pub(super) fn drop_unreadable_stages(
+    conn: &mut Connection,
+    run: &PipelineRunId,
+    archive: &std::path::Path,
+) -> Result<Vec<(String, String)>, ArchonError> {
+    let tx = write_tx(conn)?;
+    let rows: Vec<(String, String)> = {
+        let mut stmt = tx
+            .prepare_cached("SELECT id, data FROM stage_runs WHERE run = ?1")
+            .ctx("list stage runs")?;
+        let found = stmt
+            .query_map([run.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .ctx("list stage runs")?;
+        found
+            .collect::<rusqlite::Result<_>>()
+            .ctx("read stage runs")?
+    };
+    let bad: Vec<(String, String)> = rows
+        .into_iter()
+        .filter(|(_, data)| from_json::<StageRun>(data, "stage run").is_err())
+        .collect();
+    let mut dropped = Vec::with_capacity(bad.len());
+    for (id, data) in bad {
+        // Feedback rows tie stage_run to model/effort/revision by CHECK
+        // constraints, so a row they cite is kept rather than detached.
+        let cited: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM operator_feedback WHERE stage_run = ?1)",
+                [&id],
+                |row| row.get(0),
+            )
+            .ctx("check feedback on unreadable stage run")?;
+        if cited {
+            tracing::warn!(stage_run = %id, "an unreadable stage run is kept: operator feedback cites it");
+            continue;
+        }
+        // Saved before the delete; a row that cannot be saved is kept.
+        if let Err(error) = archive_row(archive, &id, &data) {
+            tracing::error!(stage_run = %id, %error, "an unreadable stage run could not be saved and is kept");
+            continue;
+        }
+        tx.execute("DELETE FROM stage_runs WHERE id = ?1", [&id])
+            .ctx("delete unreadable stage run")?;
+        dropped.push((id, data));
+    }
+    tx.commit().ctx("commit unreadable stage runs")?;
+    Ok(dropped)
+}
+
+/// Like [`stages_of`] but an undecodable row is logged and left out, so one
+/// retained unreadable row cannot hide the run's healthy stages.
 pub(super) fn stages_of(
+    conn: &Connection,
+    run: &PipelineRunId,
+) -> Result<Vec<StageRun>, ArchonError> {
+    load(conn, run)?;
+    read_rows_lenient(
+        conn,
+        "SELECT data FROM stage_runs WHERE run = ?1
+         ORDER BY started_at, attempt, fan_index, id",
+        run.as_str(),
+        "stage run",
+    )
+}
+
+/// Every stage run of `run`; an undecodable row is a [`ArchonError::Corrupt`].
+pub(super) fn stages_of_strict(
     conn: &Connection,
     run: &PipelineRunId,
 ) -> Result<Vec<StageRun>, ArchonError> {
@@ -500,7 +709,7 @@ pub(super) fn stages_of_item(
     item: &QueueItemId,
 ) -> Result<Vec<StageRun>, ArchonError> {
     items::load(conn, item)?;
-    read_rows(
+    read_rows_lenient(
         conn,
         "SELECT s.data FROM stage_runs s JOIN runs r ON r.id = s.run
          WHERE r.item = ?1

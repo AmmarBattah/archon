@@ -47,7 +47,7 @@ pub(super) fn target_base(
         return Ok(Some(open.parent_branch.clone()));
     }
     let Some(repo) = store.item(&owner)?.repo else {
-        return Err(ArchonError::Store(format!(
+        return Err(ArchonError::Corrupt(format!(
             "stacked item {owner} has no repository"
         )));
     };
@@ -313,7 +313,9 @@ pub(super) async fn merge_others(
 pub(crate) async fn reconcile(ctx: &DaemonContext, pass: &mut Pass) -> Result<(), ArchonError> {
     let items = ctx.store.lock().await.stacked_items()?;
     for id in items {
-        let result = reconcile_item(ctx, &id, pass).await;
+        let result =
+            super::coordination::guarded(&format!("stack {id}"), reconcile_item(ctx, &id, pass))
+                .await;
         let what = format!("Restacking item {id}");
         super::coordination::isolate(ctx, &format!("stack:{id}"), Some(&id), &what, result).await?;
     }

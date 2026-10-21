@@ -133,11 +133,17 @@ async fn pass(
         Err(error) if error.is_store() => return Err(error),
         Err(error) => return Ok(PassEnd::stalled(false, error.to_string())),
     };
-    assert!(
-        cursor.is_none_or(|c| subscription.last_seq >= c),
-        "a subscription after the cursor starts at or after it"
-    );
-    if cursor.is_none() {
+    // An Aether whose history was reset reports a sequence before ours:
+    // follow it from its own end rather than from a cursor it never had.
+    let reset = cursor.is_some_and(|c| subscription.last_seq < c);
+    if reset {
+        tracing::warn!(
+            key,
+            last_seq = subscription.last_seq,
+            "Aether's event history is behind the stored cursor; following from its end"
+        );
+    }
+    if cursor.is_none() || reset {
         save_cursor(ctx, key, subscription.last_seq).await?;
     }
     tokio::pin!(until);
@@ -176,7 +182,9 @@ async fn handle_one(
     event: &AetherEvent,
 ) -> Result<Option<String>, ArchonError> {
     assert!(event.seq > 0, "event seqs start at 1");
-    match stream.handle(ctx, event).await {
+    let subject = format!("Aether event {} ({})", event.seq, stream.name());
+    let handled = crate::executor::coordination::guarded(&subject, stream.handle(ctx, event));
+    match handled.await {
         Ok(()) => Ok(None),
         Err(error) if error.is_store() => Err(error),
         Err(ArchonError::Unavailable(reason)) => Ok(Some(reason)),
@@ -196,10 +204,13 @@ async fn read_cursor(ctx: &DaemonContext, key: &str) -> Result<Option<u64>, Arch
     let raw = ctx.store.lock().await.kv_get(key)?;
     match raw.filter(|v| !v.is_empty()) {
         None => Ok(None),
-        Some(raw) => raw
-            .parse()
-            .map(Some)
-            .map_err(|e| ArchonError::Store(format!("kv {key} = {raw:?}: {e}"))),
+        Some(raw) => match raw.parse() {
+            Ok(seq) => Ok(Some(seq)),
+            Err(error) => {
+                tracing::warn!(key, %raw, %error, "unreadable event cursor; replaying from the start");
+                Ok(Some(0))
+            }
+        },
     }
 }
 

@@ -231,7 +231,8 @@ async fn record_publication(
 /// failure, a panic included, is its report's.
 pub async fn supervise(ctx: Arc<DaemonContext>) -> Result<(), ArchonError> {
     let Some(lavish) = ctx.lavish.clone() else {
-        return Ok(());
+        // Nothing to poll without Lavish; stay idle rather than look like a failed task.
+        return std::future::pending().await;
     };
     let mut feed = ctx.feed.subscribe();
     let mut polls = Polls::default();
@@ -843,7 +844,7 @@ async fn update_record(
 ) -> Result<(), ArchonError> {
     let mut store = ctx.store.lock().await;
     let mut record = records::get(&mut store, report)?
-        .ok_or_else(|| ArchonError::Store(format!("report {report} has no record")))?;
+        .ok_or_else(|| ArchonError::Corrupt(format!("report {report} has no record")))?;
     change(&mut record);
     records::put(&mut store, report, record, archon_core::now())
 }
