@@ -1,10 +1,13 @@
 //! `archon update`: replace this archon with a released one, from the assets
-//! and with the SHA-256 check of `install.sh`. It restarts nothing.
+//! and with the SHA-256 check of `install.sh`; then, when asked, update Aether
+//! and restart what runs them (`restart`).
 
 mod aether;
 mod interrupt;
+mod launch;
 mod location;
 mod release;
+mod restart;
 mod tools;
 pub(super) mod version;
 
@@ -22,6 +25,7 @@ use self::version::Version;
 use super::{emit, to_json};
 use crate::cli::UpdateArgs;
 use crate::connect::{archon_bin, connect_existing};
+use archon_core::config::{AetherMode, Config};
 
 /// `archon update --check` exits with this when a newer release exists.
 const UPDATE_AVAILABLE: u8 = 10;
@@ -60,12 +64,56 @@ impl Step {
     }
 }
 
+/// Before `archon`, `archon chat` or `archon tui` opens: check for newer
+/// releases and offer the one-step update. After an accepted update this
+/// process is replaced by the new archon with the same arguments.
+pub async fn before_launch() -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    // Resolved first: once the update replaces it, the running file has no path.
+    let bin = archon_bin()?;
+    // A broken config is reported by the command that follows.
+    let Ok(config) = Config::load_default() else {
+        return Ok(());
+    };
+    if launch::offer(&config.update).await != launch::Launch::Again {
+        return Ok(());
+    }
+    let error = std::process::Command::new(bin)
+        .args(std::env::args_os().skip(1))
+        .env(launch::NO_CHECK_ENV, "1")
+        .exec();
+    Err(error).context("starting the updated archon")
+}
+
+/// What `archon update` prints. Under `--json --yes` the install report is
+/// kept, so the restart adds to it and one object is printed.
+struct Report {
+    json: bool,
+    kept: Option<serde_json::Value>,
+    defer: bool,
+}
+
+impl Report {
+    fn say(&mut self, value: serde_json::Value, text: &str) -> anyhow::Result<()> {
+        if self.json && self.defer {
+            self.kept = Some(value);
+            return Ok(());
+        }
+        emit(self.json, || Ok(value), text)
+    }
+}
+
 pub async fn run(args: UpdateArgs, json: bool) -> anyhow::Result<ExitCode> {
     if args.requirements {
         let own = Requirement::own();
         emit(json, || to_json(&own), &own.render())?;
         return Ok(ExitCode::SUCCESS);
     }
+    let mut report = Report {
+        json,
+        kept: None,
+        defer: args.yes,
+    };
     // Listened for before anything is staged, so no interrupt leaves it behind.
     let mut interrupts = Interrupts::listen()?;
     // Refused before any request: an archon that cannot be replaced asks nothing.
@@ -77,14 +125,98 @@ pub async fn run(args: UpdateArgs, json: bool) -> anyhow::Result<ExitCode> {
         biased;
         // The preparation is dropped where it waited, which kills its download.
         interrupt = interrupts.next() => return interrupted(interrupt, place),
-        prepared = prepare(&args, place.as_ref(), json) => prepared?,
+        prepared = prepare(&args, place.as_ref(), &mut report) => prepared?,
     };
     // No signal is waited for from here on: the swap and its report end whole.
-    match (prepared, place) {
-        (Prepared::Reported(code), _) => Ok(code),
-        (Prepared::Staged(staged), Some(place)) => commit(&staged, &place, json),
+    let (code, installed) = match (prepared, place) {
+        (Prepared::Reported(code), _) => (code, None),
+        (Prepared::Staged(staged), Some(place)) => {
+            (commit(&staged, &place, &mut report)?, Some(staged.wanted))
+        }
         (Prepared::Staged(_), None) => unreachable!("--check stages nothing"),
+    };
+    if args.check || args.no_restart {
+        return Ok(code);
     }
+    restart_after(&args, &mut report, code, installed).await
+}
+
+/// Update Aether and restart, after the operator confirms or `--yes`. A run
+/// that cannot ask has printed the commands for it, and stops there.
+async fn restart_after(
+    args: &UpdateArgs,
+    report: &mut Report,
+    code: ExitCode,
+    installed: Option<Version>,
+) -> anyhow::Result<ExitCode> {
+    use restart::Steps as _;
+    let config = Config::load_default().context("loading the config to restart from")?;
+    let plan = restart::Plan {
+        installed: installed
+            .clone()
+            .unwrap_or_else(Version::current)
+            .to_string(),
+        archon_changed: installed.is_some(),
+        dedicated: config.aether.mode == AetherMode::Dedicated,
+        drain_secs: args.wait,
+        requeue: args.requeue,
+    };
+    if !args.yes && !can_ask(report.json) {
+        return Ok(code);
+    }
+    let running = restart::Live.running_archond().await?;
+    if !args.yes && !confirmed(&plan, running.as_ref())? {
+        return Ok(code);
+    }
+    let outcome = restart::apply(&restart::Live, &plan).await?;
+    let value = serde_json::json!({
+        "restarted": outcome.restarted, "steps": outcome.lines, "warnings": outcome.warnings,
+    });
+    match report.kept.take() {
+        Some(mut install) if report.json => {
+            install["restart"] = value;
+            report.defer = false;
+            report.say(install, "")?;
+        }
+        _ => report.say(value, &outcome.lines.join("\n"))?,
+    }
+    for warning in &outcome.warnings {
+        eprintln!("archon: warning: {warning}");
+    }
+    Ok(match outcome.warnings.is_empty() {
+        true => code,
+        false => ExitCode::FAILURE,
+    })
+}
+
+/// Whether a question can be put: a terminal on both ends, and no `--json`.
+fn can_ask(json: bool) -> bool {
+    use std::io::IsTerminal as _;
+    !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Say what will update and restart, and ask. Archon already current still
+/// offers `aether update`, which restarts archond only if it changes Aether.
+fn confirmed(plan: &restart::Plan, running: Option<&restart::Running>) -> anyhow::Result<bool> {
+    let stale = running
+        .is_some_and(|archond| archon_core::ops::bare_version(&archond.version) != plan.installed);
+    if plan.archon_changed || stale {
+        println!("{}", restart::announce(plan, running));
+        print!("Update Aether and restart now? [Y/n] ");
+    } else {
+        println!(
+            "archon {} is current. Aether is updated with `aether update`; archond restarts \
+             only if that changes Aether.",
+            plan.installed
+        );
+        print!("Check Aether now? [Y/n] ");
+    }
+    std::io::Write::flush(&mut std::io::stdout()).context("writing the question")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading the answer")?;
+    Ok(restart::is_yes(&answer))
 }
 
 /// How the part of an update that a signal may still stop has ended.
@@ -124,7 +256,11 @@ fn interrupted(interrupt: Interrupt, place: Option<Place>) -> anyhow::Result<Exi
 
 /// Everything before the swap: `place` is where to stage, `None` to only
 /// report. Changes nothing outside the staging directory.
-async fn prepare(args: &UpdateArgs, place: Option<&Place>, json: bool) -> anyhow::Result<Prepared> {
+async fn prepare(
+    args: &UpdateArgs,
+    place: Option<&Place>,
+    report: &mut Report,
+) -> anyhow::Result<Prepared> {
     assert_eq!(
         place.is_none(),
         args.check,
@@ -139,14 +275,14 @@ async fn prepare(args: &UpdateArgs, place: Option<&Place>, json: bool) -> anyhow
     let step = Step::decide(&current, &wanted, args.version.is_some());
     let installs = matches!(step, Step::Upgrade | Step::Downgrade);
     if let Some(place) = place.filter(|_| installs) {
-        let staged = stage(&source, place, step, current, wanted, json).await?;
+        let staged = stage(&source, place, step, current, wanted, report.json).await?;
         return Ok(Prepared::Staged(staged));
     }
     let (status, text) = standing(step, &current, &wanted);
     let value = serde_json::json!({
         "status": status, "current": current.to_string(), "release": wanted.to_string(),
     });
-    emit(json, || Ok(value), &text)?;
+    report.say(value, &text)?;
     let available = args.check && step == Step::Upgrade;
     let code = if available { UPDATE_AVAILABLE } else { 0 };
     Ok(Prepared::Reported(ExitCode::from(code)))
@@ -251,7 +387,7 @@ async fn stage(
 
 /// Swap the staged release in and report it. Nothing here waits, so no
 /// signal can end an update between its swap and its report.
-fn commit(staged: &Staged, place: &Place, json: bool) -> anyhow::Result<ExitCode> {
+fn commit(staged: &Staged, place: &Place, report: &mut Report) -> anyhow::Result<ExitCode> {
     let Staged {
         binaries,
         step,
@@ -276,7 +412,7 @@ fn commit(staged: &Staged, place: &Place, json: bool) -> anyhow::Result<ExitCode
         "archond_running": running, "aether_compatible": aether_ok,
     });
     let text = format!("{done} archon {current} to {wanted}.\n{archond_line}\n{aether_line}");
-    emit(json, || Ok(value), &text)?;
+    report.say(value, &text)?;
     Ok(ExitCode::SUCCESS)
 }
 
