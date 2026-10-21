@@ -1532,6 +1532,11 @@ mod tests {
             "a large request is a backlog ordered with `depends_on` and `priority`",
             "Never change a repository yourself or through a child.",
             "A mirror holds the registered repository's local base commit",
+            "Before you say a file has or lacks a change, or a commit or fix is present, read \
+             the file in the mirror or run `git log`, `git show` or `git grep` there",
+            "Never claim a mirror is stale without comparing its HEAD to the base commit",
+            "may be pending: look again shortly, and check `mirror` events for a failure or withheld \
+             access; never say it is not registered",
         ] {
             assert!(prompt.contains(said), "missing {said:?}");
         }
@@ -1760,7 +1765,7 @@ mod tests {
     }
 
     /// The prompt is paid for on every turn; the tools describe themselves.
-    const BUDGET_BYTES: usize = 12 * 1024 + 256;
+    const BUDGET_BYTES: usize = 12 * 1024 + 768;
 
     #[test]
     fn builtin_prompt_stays_within_its_budget() {
