@@ -59,7 +59,9 @@ use crate::steer::Steer;
 /// 17: a repository's `merge_waive_checks`, which an older archond would drop.
 /// 18: `say` may carry `images`, which an older archond would drop; a
 /// text-only `say` is the frame it always was.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// 19: `gc` may ask for a `preview`, which an older archond would ignore and
+/// collect for real.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Said beside an item whose `budget_usd` was set while budgets are off.
 pub const BUDGETS_OFF_NOTE: &str = "Dollar budgets are globally off ([limits] budgets_enabled = \
@@ -342,6 +344,9 @@ pub enum Request {
     Gc {
         older_than_secs: Option<u64>,
         force: bool,
+        /// Only list what the pass would delete from worktrees.
+        #[serde(default)]
+        preview: bool,
     },
 
     /// Spend over a range of local days, grouped by day, repository,
@@ -926,11 +931,21 @@ pub struct GcReport {
     /// Owned report snapshots of settled items removed after storage retention.
     #[serde(default)]
     pub reports: Vec<Reclaimed>,
+    /// A preview's worktrees whose ignored build output would be deleted.
+    #[serde(default)]
+    pub would_delete: Vec<WouldDelete>,
     /// Disk space freed by everything above together.
     pub bytes_freed: u64,
     /// The pass ran with the shorter disk-pressure ages.
     #[serde(default)]
     pub pressure: bool,
+}
+
+/// The paths in `path`, a worktree, that a gc preview found it would delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WouldDelete {
+    pub path: std::path::PathBuf,
+    pub paths: Vec<String>,
 }
 
 /// The build caches deleted from one worktree.
@@ -949,6 +964,7 @@ impl GcReport {
         self.artifacts.extend(other.artifacts);
         self.item_caches.extend(other.item_caches);
         self.reports.extend(other.reports);
+        self.would_delete.extend(other.would_delete);
         self.skipped.extend(other.skipped);
         self.failed.extend(other.failed);
         self.bytes_freed = self.bytes_freed.saturating_add(other.bytes_freed);

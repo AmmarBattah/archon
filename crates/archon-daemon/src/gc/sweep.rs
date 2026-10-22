@@ -203,7 +203,7 @@ fn reclaim_kept(path: &Path, within: &Path, policy: &Policy) -> Verdict {
 
 /// `None` when the canonical `path` is strictly inside the real directory
 /// `within`; else the skip that says why not.
-fn check_kept(path: &Path, within: &Path) -> Option<Verdict> {
+pub(super) fn check_kept(path: &Path, within: &Path) -> Option<Verdict> {
     assert!(path.is_absolute(), "canonical paths are absolute");
     let real_dir = std::fs::symlink_metadata(within).is_ok_and(|m| m.file_type().is_dir());
     let inside = within
@@ -285,9 +285,30 @@ pub(super) fn is_listed_worktree(repo: &Path, path: &Path) -> Result<bool, Archo
     Ok(listed && path != repo)
 }
 
+/// Whether git has `path` locked, which `git worktree remove` refuses even with one `--force`.
+pub(super) fn is_locked_worktree(repo: &Path, path: &Path) -> Result<bool, ArchonError> {
+    let out = git(repo, &["worktree", "list", "--porcelain"])?;
+    assert!(
+        out.contains("worktree "),
+        "the main worktree is always listed"
+    );
+    let locked = out.split("\n\n").any(|block| {
+        let mut lines = block.lines();
+        let listed = lines
+            .next()
+            .and_then(|l| l.strip_prefix("worktree "))
+            .map(|l| Path::new(l).canonicalize().unwrap_or_else(|_| l.into()));
+        listed.as_deref() == Some(path)
+            && block
+                .lines()
+                .any(|l| l == "locked" || l.starts_with("locked "))
+    });
+    Ok(locked)
+}
+
 /// Why `git worktree remove` would refuse `worktree` without `--force`, untracked
 /// caches aside, asked through `repo`'s shadow under `data_dir` so no filter runs.
-fn unremovable(
+pub(super) fn unremovable(
     data_dir: &Path,
     repo: &Path,
     worktree: &Path,
