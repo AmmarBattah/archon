@@ -45,6 +45,7 @@ pub(super) async fn finish_run(
         RunState::Succeeded { .. } => shipping_proof(ctx, &run).await,
         _ => ShippingProof::None,
     };
+    Box::pin(delete_role_branches(ctx, &run)).await?;
     let now = archon_core::now();
     let finished = {
         let mut store = ctx.store.lock().await;
@@ -80,6 +81,32 @@ pub(super) async fn finish_run(
     follow.release_builds.extend(item_build(ctx, &item).await?);
     follow.discard.push(run.id.clone());
     Ok(follow)
+}
+
+/// A team run's role branches that reached its run branch go with the run,
+/// whether or not the cleanup after their merge ran. This is before the run
+/// is persisted as finished, so a crash in between repeats it.
+async fn delete_role_branches(ctx: &DaemonContext, run: &PipelineRun) -> Result<(), ArchonError> {
+    assert!(
+        run.team_root.is_none() || !run.branch.is_empty(),
+        "team runs have a branch"
+    );
+    if run.team_root.is_none() {
+        return Ok(());
+    }
+    let (item, repo) = {
+        let store = ctx.store.lock().await;
+        let item = store.item(&run.item)?;
+        let repo = match &item.repo {
+            Some(id) => Some(store.repo(&resolve::repo_ref(id))?),
+            None => None,
+        };
+        (item, repo)
+    };
+    if let Some(repo) = repo {
+        super::team::delete_branches(ctx, &item.id, &run.id, repo.path, run.branch.clone()).await;
+    }
+    Ok(())
 }
 
 /// The build directory a settled item leaves behind, if it has a repository,

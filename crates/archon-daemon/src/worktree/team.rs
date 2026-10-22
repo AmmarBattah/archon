@@ -22,8 +22,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use archon_core::error::ArchonError;
+use archon_core::id::PipelineRunId;
 use archon_pipeline::team::{
-    MergeOutcome, MergePlan, RoleBranch, team_root, worker_branch_role, worker_dir,
+    MergeOutcome, MergePlan, RoleBranch, team_root, worker_branch, worker_branch_role, worker_dir,
 };
 
 use super::{Head, branch_exists, git_failure, head, path_arg};
@@ -503,6 +504,97 @@ pub fn merge_team(
     debug_assert!(!merge_in_progress(run_tree)?);
     let outcome = MergeOutcome::Merged;
     Ok(TeamMerge { outcome, saved })
+}
+
+/// Delete every role branch of run `run` (of `run_branch`) that is on the
+/// run branch, so shipping leaves none behind. A role's worktree still on
+/// one is detached first and kept for the next attempt, which forks a new
+/// branch. A branch not on the run branch holds unmerged work and is kept.
+/// Safe to repeat. Returns the branches deleted.
+pub fn delete_merged_role_branches(
+    repo_path: &Path,
+    run_branch: &str,
+    run: &PipelineRunId,
+) -> Result<Vec<String>, ArchonError> {
+    assert!(repo_path.is_absolute(), "repository paths are canonical");
+    assert!(
+        !run_branch.starts_with('-'),
+        "run branches are branch names"
+    );
+    let common = common_dir(repo_path)?;
+    let pattern = format!("refs/heads/{run_branch}--*");
+    let listed = git(
+        repo_path,
+        &["for-each-ref", "--format=%(refname:short)", &pattern],
+    )?;
+    let checked_out = checked_out_branches(repo_path)?;
+    let run_ref = format!("refs/heads/{run_branch}");
+    let mut deleted = Vec::new();
+    for branch in listed
+        .lines()
+        .filter(|b| is_worker_branch_of(run_branch, run, b))
+    {
+        let reference = format!("refs/heads/{branch}");
+        if !is_ancestor(repo_path, &reference, &run_ref)? {
+            continue;
+        }
+        if let Some(worker) = checked_out.iter().find(|(name, _)| name == branch) {
+            detach(&worker.1, &common, branch)?;
+        }
+        git(repo_path, &["update-ref", "-d", &reference])?;
+        deleted.push(branch.to_owned());
+    }
+    debug_assert!(
+        deleted
+            .iter()
+            .all(|b| !branch_exists(repo_path, b).unwrap_or(true))
+    );
+    Ok(deleted)
+}
+
+/// Whether `branch` is a [`worker_branch`] of `run_branch` made for `run`.
+fn is_worker_branch_of(run_branch: &str, run: &PipelineRunId, branch: &str) -> bool {
+    let Some(role) = worker_branch_role(run_branch, branch) else {
+        return false;
+    };
+    let attempt = branch
+        .rsplit_once("-a")
+        .and_then(|(_, n)| n.parse::<u32>().ok());
+    attempt.is_some_and(|n| n >= 1 && worker_branch(run_branch, run, role, n) == branch)
+}
+
+/// Every branch checked out in a worktree of `repo_path`, with that worktree.
+fn checked_out_branches(repo_path: &Path) -> Result<Vec<(String, PathBuf)>, ArchonError> {
+    let listing = git(repo_path, &["worktree", "list", "--porcelain"])?;
+    let mut found = Vec::new();
+    let mut path = None;
+    for line in listing.lines() {
+        if let Some(tree) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(tree));
+        } else if let (Some(branch), Some(tree)) = (line.strip_prefix("branch refs/heads/"), &path)
+        {
+            found.push((branch.to_owned(), tree.clone()));
+        }
+    }
+    Ok(found)
+}
+
+/// Detach the worktree `path` from `branch`, keeping its files and index.
+fn detach(path: &Path, common: &Path, branch: &str) -> Result<(), ArchonError> {
+    check_worktree(path, common)?;
+    let commit = git(path, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let reason = format!("archon: leave {branch}, merged into the run branch");
+    git(
+        path,
+        &["update-ref", "--no-deref", "-m", &reason, "HEAD", &commit],
+    )?;
+    if head(path)? != Head::Detached {
+        return Err(ArchonError::Invalid(format!(
+            "{} still has {branch:?} checked out",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The run worktree `run_tree`, proven a worktree of the repository whose

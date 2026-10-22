@@ -122,7 +122,7 @@ pub(super) async fn merge(
             outcome,
             saved: Vec::new(),
         }),
-        None => run_merge(repo_path, run.workspace.clone(), plan.clone()).await,
+        None => run_merge(repo_path.clone(), run.workspace.clone(), plan.clone()).await,
     };
     let mut table = ctx.runs.lock().await;
     let released = table.merging.remove(run_id);
@@ -133,8 +133,14 @@ pub(super) async fn merge(
     }
     table.merges.remove(run_id);
     let stage_id = plan.stage_id.clone();
+    let mut cleanup = None;
     let result = match merged {
-        Ok(merged) => record(ctx, &mut table, run, &plan, merged).await,
+        Ok(merged) => {
+            if merged.outcome == MergeOutcome::Merged {
+                cleanup = Some((run.item.clone(), run.branch.clone()));
+            }
+            record(ctx, &mut table, run, &plan, merged).await
+        }
         Err(error) => {
             let message = format!("merging the team's branches failed: {error}");
             finish::fail_run(ctx, &mut table, run, stage_id, message, true).await
@@ -142,8 +148,37 @@ pub(super) async fn merge(
     };
     if result.is_err() {
         requeue(&mut table, run_id, plan);
+        return result;
+    }
+    drop(table);
+    if let (Some((item, branch)), Some(repo_path)) = (cleanup, repo_path) {
+        delete_branches(ctx, &item, run_id, repo_path, branch).await;
     }
     result
+}
+
+/// Delete the merged role branches of `run`, once a team merge is
+/// persisted and again when the run ends. The merge is done and a repeat
+/// finds the rest, so a failure is posted to the run's progress rather
+/// than failing the run.
+pub(super) async fn delete_branches(
+    ctx: &DaemonContext,
+    item: &QueueItemId,
+    run: &PipelineRunId,
+    repo_path: PathBuf,
+    branch: String,
+) {
+    let id = run.clone();
+    let cleaned = tokio::task::spawn_blocking(move || {
+        git_team::delete_merged_role_branches(&repo_path, &branch, &id)
+    })
+    .await
+    .map_err(|e| ArchonError::io("team cleanup task", std::io::Error::other(e)))
+    .and_then(|done| done);
+    if let Err(error) = cleaned {
+        let text = format!("The merged role branches of this run were not deleted: {error}");
+        post_kept(ctx, item, run, &text).await;
+    }
 }
 
 /// Merge `plan` in the run worktree `tree` of the repository at
