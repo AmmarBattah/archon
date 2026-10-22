@@ -74,6 +74,10 @@ pub enum MergeState {
     /// A `grant_merge` request whose checks are still pending: archond reads
     /// them again and merges once all are green, or asks the operator.
     AwaitingChecks,
+    /// GitHub has not yet decided whether the pull request merges cleanly:
+    /// archond reads it again with a growing pause and merges once it can.
+    /// The operator's confirmation, if any, stays valid through the wait.
+    AwaitingMergeability,
     /// archond is checking and merging; the GitHub write may have happened.
     Merging,
     /// GitHub accepted the request but has not merged it yet.
@@ -104,6 +108,7 @@ impl MergeState {
         match self {
             Self::AwaitingOperator => "awaiting_operator",
             Self::AwaitingChecks => "awaiting_checks",
+            Self::AwaitingMergeability => "awaiting_mergeability",
             Self::Merging => "merging",
             Self::Queued => "queued",
             Self::Merged { .. } => "merged",
@@ -117,7 +122,7 @@ impl MergeState {
     /// request index are unchanged; the request's data holds the real state.
     pub fn column(&self) -> &'static str {
         match self {
-            Self::AwaitingChecks => "queued",
+            Self::AwaitingChecks | Self::AwaitingMergeability => "queued",
             other => other.kind(),
         }
     }
@@ -126,7 +131,11 @@ impl MergeState {
     pub fn is_open(&self) -> bool {
         matches!(
             self,
-            Self::AwaitingOperator | Self::AwaitingChecks | Self::Merging | Self::Queued
+            Self::AwaitingOperator
+                | Self::AwaitingChecks
+                | Self::AwaitingMergeability
+                | Self::Merging
+                | Self::Queued
         )
     }
 }
@@ -157,6 +166,10 @@ pub struct MergeRequest {
     /// The orchestrator's grant request waited for pending checks first.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waited: bool,
+    /// When the request began waiting for GitHub's mergeability check; the
+    /// wait's limit and pauses count from here, not from the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeability_wait_since: Option<Timestamp>,
     /// The checks as last read, in words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<String>,
@@ -209,6 +222,10 @@ impl MergeRequest {
             MergeState::AwaitingChecks => {
                 format!("{} at {head} waits for its checks to finish", self.pr_url)
             }
+            MergeState::AwaitingMergeability => format!(
+                "{} at {head} is waiting for GitHub to finish its mergeability check",
+                self.pr_url
+            ),
             MergeState::Merging => format!("{} at {head} is being merged", self.pr_url),
             MergeState::Queued => format!("{} at {head} is queued at GitHub", self.pr_url),
             MergeState::Merged {
@@ -237,7 +254,10 @@ impl MergeRequest {
                 "{what} awaits the operator's answer to Q{}",
                 self.waiting_on().unwrap_or_default()
             ),
-            MergeState::AwaitingChecks | MergeState::Merging | MergeState::Queued => {
+            MergeState::AwaitingChecks
+            | MergeState::AwaitingMergeability
+            | MergeState::Merging
+            | MergeState::Queued => {
                 format!("{what} is being fast-forwarded into its base")
             }
             MergeState::Merged { .. } => {
@@ -397,9 +417,19 @@ impl ChecksSeen {
     }
 }
 
+/// What the pull request's facts say about merging it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Assessment {
+    /// It may be merged now; the checks seen.
+    Ready(ChecksSeen),
+    /// GitHub has not decided whether it merges cleanly: read it again.
+    Undecided(ChecksSeen),
+}
+
 /// Whether the pull request may be merged now: the checks seen, or why not.
+/// An undecided mergeability is neither a yes nor a refusal.
 /// Checks that are not all green refuse unless the operator acknowledged them.
-pub fn evaluate(pr: &PullRequestFacts, expected: Expected<'_>) -> Result<ChecksSeen, String> {
+pub fn assess(pr: &PullRequestFacts, expected: Expected<'_>) -> Result<Assessment, String> {
     assert!(!expected.head.is_empty(), "a reviewed commit is expected");
     assert!(!expected.base.is_empty(), "a base branch is expected");
     match pr.state.as_str() {
@@ -424,12 +454,12 @@ pub fn evaluate(pr: &PullRequestFacts, expected: Expected<'_>) -> Result<ChecksS
             pr.base, expected.base
         ));
     }
+    let seen = ChecksSeen::of(&pr.checks);
     match pr.mergeable.as_str() {
         "MERGEABLE" => {}
         "CONFLICTING" => return Err("it conflicts with its base; retry the item".into()),
-        _ => return Err("GitHub is still working out whether it merges cleanly; ask again".into()),
+        _ => return Ok(Assessment::Undecided(seen)),
     }
-    let seen = ChecksSeen::of(&pr.checks);
     if !seen.all_green() && !expected.ignore_checks {
         return Err(format!(
             "its checks are not all green ({}); the operator must acknowledge that \
@@ -437,7 +467,17 @@ pub fn evaluate(pr: &PullRequestFacts, expected: Expected<'_>) -> Result<ChecksS
             seen.describe()
         ));
     }
-    Ok(seen)
+    Ok(Assessment::Ready(seen))
+}
+
+/// [`assess`] for a caller that cannot wait: an undecided mergeability refuses.
+pub fn evaluate(pr: &PullRequestFacts, expected: Expected<'_>) -> Result<ChecksSeen, String> {
+    match assess(pr, expected)? {
+        Assessment::Ready(seen) => Ok(seen),
+        Assessment::Undecided(_) => Err("GitHub is still working out whether it merges \
+             cleanly (see `gh pr view --json mergeable`); ask again in a minute"
+            .into()),
+    }
 }
 
 /// The operator's answer to a merge confirmation question.
@@ -638,6 +678,7 @@ mod tests {
             reason: Some("the operator said merge it".into()),
             waived_by: None,
             waited: false,
+            mergeability_wait_since: None,
             checks: None,
             state: MergeState::AwaitingOperator,
             requested_at: now,
