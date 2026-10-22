@@ -3015,3 +3015,88 @@ async fn a_leaf_stage_owes_no_stop() {
     assert!(h.backend.cancelled().is_empty());
     assert_eq!(stage_labels(&h), ["implement", "review", "review"]);
 }
+
+/// The lead's reviewer `n` returns a failing verdict on its own head, and
+/// Aether reports its task completed.
+async fn review_round_fails(h: &Harness, lead: &StageRun, n: usize) {
+    let event = review_round_event(h, lead, n);
+    pump::handle_fleet_event(&h.ctx, &event).await.unwrap();
+    // Aether replays an event it was not told was handled.
+    pump::handle_fleet_event(&h.ctx, &event).await.unwrap();
+}
+
+/// The event of the lead's reviewer `n` completing a failing verdict.
+fn review_round_event(h: &Harness, lead: &StageRun, n: usize) -> AetherEvent {
+    let lead_id = lead_agent(lead);
+    let reviewer = h.backend.delegate(&lead_id, REVIEW_MODEL);
+    let finding = serde_json::json!({"severity": "high", "title": format!("finding {n}")});
+    let verdict = serde_json::json!({
+        "verdict": "fail",
+        "head": format!("{n:07}abcdef"),
+        "findings": [finding],
+    });
+    h.backend.complete_delegated(&reviewer, verdict.clone());
+    AetherEvent {
+        seq: n as u64,
+        at: archon_core::now(),
+        agent: Some(reviewer),
+        task: None,
+        parent: Some(lead_id),
+        run: None,
+        kind: EventKind::TaskCompleted {
+            result: archon_aether::wire::TaskResult {
+                summary: "reviewed".into(),
+                artifacts: Vec::new(),
+                structured: Some(verdict),
+            },
+        },
+    }
+}
+
+/// Three failing rounds are no signal; the fourth posts one notice with the
+/// latest finding, and a fifth round posts nothing more. The run goes on.
+#[tokio::test]
+async fn the_fourth_failing_review_round_notifies_the_operator_once() {
+    let h = Harness::new().await;
+    let item = adaptive_item(&h).await;
+    let lead = h.running().await.remove(0);
+    for n in 1..=3 {
+        review_round_fails(&h, &lead, n).await;
+    }
+    assert!(h.notices(NotificationKind::Blocker).await.is_empty());
+    review_round_fails(&h, &lead, 4).await;
+    review_round_fails(&h, &lead, 5).await;
+    let notices = h.notices(NotificationKind::Blocker).await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let text = &notices[0];
+    assert!(text.contains(item.id.as_str()), "{text}");
+    assert!(text.contains("failed 4 rounds"), "{text}");
+    assert!(text.contains("finding 4"), "{text}");
+    assert!(!text.contains("finding 3"), "{text}");
+    assert_eq!(h.running().await.len(), 1, "the lead keeps running");
+}
+
+/// The fourth round was counted but the notice never reached the feed (a crash
+/// in between): replaying that reviewer's event posts it.
+#[tokio::test]
+async fn a_replayed_fourth_round_posts_the_notice_a_crash_lost() {
+    let h = Harness::new().await;
+    adaptive_item(&h).await;
+    let lead = h.running().await.remove(0);
+    for n in 1..=3 {
+        review_round_fails(&h, &lead, n).await;
+    }
+    let fourth = review_round_event(&h, &lead, 4);
+    pump::handle_fleet_event(&h.ctx, &fourth).await.unwrap();
+    assert_eq!(h.notices(NotificationKind::Blocker).await.len(), 1);
+    let key = format!("review_rounds:{}", lead.id);
+    let mut store = h.ctx.store.lock().await;
+    let kept = store.kv_get(&key).unwrap().expect("a tally");
+    assert!(kept.contains("\"told\":true"), "{kept}");
+    store
+        .kv_set(&key, &kept.replace("\"told\":true", "\"told\":false"))
+        .unwrap();
+    drop(store);
+    pump::handle_fleet_event(&h.ctx, &fourth).await.unwrap();
+    assert_eq!(h.notices(NotificationKind::Blocker).await.len(), 2);
+}
