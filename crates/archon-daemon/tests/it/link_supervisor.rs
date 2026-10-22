@@ -1542,3 +1542,81 @@ async fn operator_answer_carries_clipped_question_context() {
         text
     );
 }
+
+#[tokio::test]
+async fn a_turn_silent_for_half_an_hour_is_reported_to_the_operator_once() {
+    use archon_aether::events::EventKind;
+    let harness = Harness::new().await;
+    harness.connect().await;
+    harness.set_kv(keys::ORCHESTRATOR_AGENT, ORCH).await;
+    agent_table(&harness, &[(ORCH, "running")]);
+    harness
+        .fake
+        .script("send_message", Scripted::reply("message_sent", json!({})));
+    let orch = agent_id(ORCH);
+    let started = EventKind::AgentStarted { turn: 241 };
+    harness.ctx.supervisor.saw_event(&orch, &started);
+
+    let soon = archon_core::now() + chrono::TimeDelta::minutes(5);
+    assert!(!supervisor::report_stall(&harness.ctx, soon).await.unwrap());
+    assert!(
+        harness
+            .notifications(NotificationKind::Blocker)
+            .await
+            .is_empty()
+    );
+
+    let later = archon_core::now() + chrono::TimeDelta::minutes(31);
+    assert!(supervisor::report_stall(&harness.ctx, later).await.unwrap());
+    let blockers = harness.notifications(NotificationKind::Blocker).await;
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(
+        blockers[0].contains("without a message")
+            && blockers[0].contains("archon orchestrator restart"),
+        "{blockers:?}"
+    );
+    assert!(!supervisor::report_stall(&harness.ctx, later).await.unwrap());
+    assert_eq!(
+        harness.notifications(NotificationKind::Blocker).await.len(),
+        1
+    );
+    let nudges = harness.fake.received_named("send_message");
+    assert_eq!(nudges.len(), 1, "one nudge per stall: {nudges:?}");
+    assert_eq!(nudges[0]["to"], ORCH);
+    assert!(
+        nudges[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Continue:"),
+        "{nudges:?}"
+    );
+
+    let ended = EventKind::AgentTurnCompleted {
+        turn: 241,
+        next: Some("ready".into()),
+    };
+    harness.ctx.supervisor.saw_event(&orch, &ended);
+    let much_later = archon_core::now() + chrono::TimeDelta::hours(5);
+    assert!(
+        !supervisor::report_stall(&harness.ctx, much_later)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_turn_already_open_when_archond_restarts_is_still_watched() {
+    let harness = Harness::new().await;
+    harness.connect().await;
+    harness.set_kv(keys::ORCHESTRATOR_AGENT, ORCH).await;
+    agent_table(&harness, &[(ORCH, "running")]);
+    harness
+        .fake
+        .script("send_message", Scripted::reply("message_sent", json!({})));
+
+    let now = archon_core::now();
+    assert!(!supervisor::report_stall(&harness.ctx, now).await.unwrap());
+    let later = now + chrono::TimeDelta::minutes(31);
+    assert!(supervisor::report_stall(&harness.ctx, later).await.unwrap());
+    assert_eq!(harness.fake.received_named("send_message").len(), 1);
+}
