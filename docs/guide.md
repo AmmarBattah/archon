@@ -471,7 +471,7 @@ applies. A configured `[aether] address` (TCP) is rejected before attachment
 because the stock TUI requires a Unix socket. Raw `archon aether` passthrough
 keeps Aether's own endpoint selection.
 
-The native board shows new stage agents as `#q69g5fav implement · Chat polish`,
+The native board shows new stage agents as `implement`, `review 2/3`,
 with fan slots when needed and attempt/retry notes only above one. Run nodes
 use the item title; the default orchestrator name is `Archon`. Configured names
 and existing agents keep their names. Aether owns state colours, layout,
@@ -777,8 +777,7 @@ starts either ([which commands start archond](#which-commands-start-archond)).
 `archon aether <args…>` runs any `aether` command against Archon's instance,
 for example `archon aether agents`. `archon daemon stop` stops both
 daemons (`--keep-aether` stops only archond). In the TUI's tree each work item is one subtree: a node named after
-the item, with its stage agents (`implement · <title>`, `review 1/2 · <title>`,
-`ship · <title>`) underneath, beside the `archon` orchestrator.
+the item, with its stage agents (`implement`, `review 1/2`, `ship`) underneath, beside the `archon` orchestrator.
 
 ```sh
 archon repo add ~/code/api --ship pr
