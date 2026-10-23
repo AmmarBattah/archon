@@ -180,6 +180,15 @@ verifies itself ([operator authority](docs/operator-authority.md)). Read
 [SECURITY.md](SECURITY.md) and the
 [GitHub watcher guide](docs/github-watcher.md) before widening access.
 
+## Contributors
+
+- [@mengsig](https://github.com/mengsig): maintainer
+- [@devGunnin](https://github.com/devGunnin): maintainer
+- [@Markfds01](https://github.com/Markfds01): fix for the ship-stage "one URL"
+  panic on git older than 2.46 (#185, #186, landed in #189)
+
+Contributors are listed by GitHub handle, and the list is maintained by hand.
+
 ## Documentation
 
 [User guide](docs/guide.md) · [Install](docs/install.md) ·
@@ -188,5 +197,5 @@ verifies itself ([operator authority](docs/operator-authority.md)). Read
 [GitHub watcher](docs/github-watcher.md) ·
 [Operator authority](docs/operator-authority.md) · [Architecture](docs/ARCHITECTURE.md)
 
-Project version: **1.4.3**. Licensed under [MIT](LICENSE). For development,
+Project version: **1.4.4**. Licensed under [MIT](LICENSE). For development,
 see [CONTRIBUTING.md](CONTRIBUTING.md).
