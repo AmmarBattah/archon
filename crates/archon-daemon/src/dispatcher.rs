@@ -22,28 +22,41 @@ use archon_queue::dispatch::{GangWaiter, Hold, NeverFits};
 
 use crate::context::DaemonContext;
 use crate::executor::{self, FollowUp};
+use crate::readers::ReadOn;
 use crate::resolve;
 use crate::triggers::{self, TriggerEvent};
 
-/// The read-only view uses the dispatcher's complete snapshot and lock order.
-/// It does not check disk, collect worktrees, reserve slots, or dispatch work.
+/// The longest a read waits for the run table, which an admission pass holds
+/// across its writes; past it the read goes on without pending spawns.
+const READ_TABLE_WAIT: Duration = Duration::from_millis(100);
+
+/// The read-only view uses the dispatcher's complete snapshot and lock order,
+/// on a reader connection. It does not check disk, collect worktrees, reserve
+/// slots, or dispatch work.
 pub(crate) async fn read_snapshot(
     ctx: &DaemonContext,
 ) -> Result<archon_queue::DispatchSnapshot, ArchonError> {
     let caps = resolve::caps(ctx).await;
-    let envs = snapshot::Envs::prefetch(ctx).await?;
+    let envs = snapshot::Envs::prefetch(ctx, ReadOn::Reader).await?;
     // Recovery holds the run table while it rebuilds the drivers; no spawn is
     // pending before they are, so an empty table reads the same without waiting.
-    if !ctx.recovery.is_recovered() {
-        let rebuilding = executor::RunTable::default();
-        assert!(
-            rebuilding.pending.is_empty(),
-            "an empty table owes no spawn"
-        );
-        return snapshot::build(ctx, &rebuilding, caps, envs).await;
-    }
-    let table = ctx.runs.lock().await;
-    snapshot::build(ctx, &table, caps, envs).await
+    let recovered = ctx.recovery.is_recovered();
+    let table = if recovered {
+        tokio::time::timeout(READ_TABLE_WAIT, ctx.runs.lock())
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let Some(table) = table else {
+        if recovered {
+            tracing::debug!("the run table is busy; the view leaves out pending spawns");
+        }
+        let unseen = executor::RunTable::default();
+        assert!(unseen.pending.is_empty(), "an empty table owes no spawn");
+        return snapshot::build(ctx, ReadOn::Reader, &unseen, caps, envs).await;
+    };
+    snapshot::build(ctx, ReadOn::Reader, &table, caps, envs).await
 }
 
 /// Remembers the budget hold last announced, so each is posted once.
@@ -156,7 +169,7 @@ struct Admission {
 /// files are read before the table is taken.
 async fn admit(ctx: &DaemonContext) -> Result<Admission, ArchonError> {
     let caps = resolve::caps(ctx).await;
-    let envs = snapshot::Envs::prefetch(ctx).await?;
+    let envs = snapshot::Envs::prefetch(ctx, ReadOn::Writer).await?;
     if envs.weighted(&ctx.config)
         && let Err(error) = crate::quota::refresh(ctx).await
     {
@@ -164,7 +177,7 @@ async fn admit(ctx: &DaemonContext) -> Result<Admission, ArchonError> {
     }
     ctx.host.check(ctx.config.limits.host_limits());
     let mut table = ctx.runs.lock().await;
-    let snapshot = snapshot::build(ctx, &table, caps.clone(), envs).await?;
+    let snapshot = snapshot::build(ctx, ReadOn::Writer, &table, caps.clone(), envs).await?;
     let plan = archon_queue::plan_dispatch(&snapshot);
     let budget = BudgetView {
         caps,

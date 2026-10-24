@@ -63,7 +63,9 @@ use crate::steer::Steer;
 /// collect for real.
 /// 20: `refresh_item` may carry `model_plan`, `model_reasons` and
 /// `stage_timeouts`, which an older archond would drop.
-pub const PROTOCOL_VERSION: u32 = 20;
+/// 21: `tracked` changes with an `idempotency_key`, and `request_status`; an
+/// older archond knows neither request.
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Said beside an item whose `budget_usd` was set while budgets are off.
 pub const BUDGETS_OFF_NOTE: &str = "Dollar budgets are globally off ([limits] budgets_enabled = \
@@ -124,6 +126,20 @@ pub enum Request {
         /// Aether's out-of-band MCP caller identity, never a tool argument.
         caller: AetherAgentId,
         request: Box<Request>,
+    },
+    /// A change `archon mcp` forwards under its own request id, recorded with
+    /// its outcome for `request_status` (`archon_core::tracked`).
+    Tracked {
+        request_id: crate::id::RequestId,
+        /// A repeat with the same caller, command, key and request returns the
+        /// first outcome; the same key for another request is refused.
+        #[serde(default)]
+        idempotency_key: Option<String>,
+        request: Box<Request>,
+    },
+    /// What became of a tracked change the caller made.
+    RequestStatus {
+        request: crate::id::RequestId,
     },
     MessageOrchestrator {
         text: String,
@@ -521,8 +537,9 @@ impl Request {
     pub fn class(&self) -> RequestClass {
         use RequestClass::{Change, OperatorChange, OperatorRead, Read};
         match self {
-            Self::ForAgent { request, .. } => request.class(),
+            Self::ForAgent { request, .. } | Self::Tracked { request, .. } => request.class(),
             Self::Hello { .. }
+            | Self::RequestStatus { .. }
             | Self::Status(_)
             | Self::Guide { .. }
             | Self::RepoList
@@ -915,6 +932,7 @@ pub enum Reply {
     LocalReview(Box<crate::merge::LocalReview>),
     Promotion(Box<crate::integration::Promotion>),
     Settings(Box<crate::settings::SettingsView>),
+    RequestStatus(Box<crate::tracked::RequestStatus>),
 }
 
 /// What one gc pass did (ARCHITECTURE §13.2). Paths are real paths.

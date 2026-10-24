@@ -33,6 +33,8 @@ mod settings;
 mod snapshot;
 mod spend;
 pub mod stacks;
+mod tracked;
+pub use tracked::{Claim, TrackedRequest};
 
 use std::path::Path;
 
@@ -120,14 +122,21 @@ pub struct FinishedRun {
     pub answers: Vec<FeedItem>,
 }
 
+/// What a store keeps in memory beside its connection.
+#[derive(Debug, Default)]
+struct Learned {
+    config: archon_core::config::LearningConfig,
+    config_loaded: bool,
+    /// Aether's connected models with their tiers, refreshed while stale.
+    catalog: archon_core::model_tier::ModelCatalog,
+    catalog_at: Option<archon_core::Timestamp>,
+}
+
 #[derive(Debug)]
 pub struct Store {
     conn: rusqlite::Connection,
-    learning: std::cell::RefCell<archon_core::config::LearningConfig>,
-    learning_config_loaded: std::cell::Cell<bool>,
-    /// Aether's connected models with their tiers, refreshed while stale.
-    learning_models: std::cell::RefCell<archon_core::model_tier::ModelCatalog>,
-    learning_models_at: std::cell::Cell<Option<archon_core::Timestamp>>,
+    /// Shared with the readers opened beside this store, so they read alike.
+    learned: std::sync::Arc<std::sync::Mutex<Learned>>,
     /// The data directory's lock for an on-disk store opened read-write.
     /// Declared last, so it is released only after the connection closes.
     lock: Option<DataLock>,
@@ -157,9 +166,13 @@ impl Store {
     }
 
     fn open_locked(path: &Path, lock: DataLock) -> Result<Self, ArchonError> {
+        let exclusive = lock.is_exclusive();
         let conn = rusqlite::Connection::open(path)
             .map_err(|e| codec::store_error(&format!("open {}", path.display()), &e))?;
         let mut store = Self::init(conn, true)?;
+        if exclusive {
+            schema::defer_checkpoints(&store.conn)?;
+        }
         store.lock = Some(lock);
         Ok(store)
     }
@@ -189,12 +202,32 @@ impl Store {
         schema::check_read_only(&conn)?;
         Ok(Self {
             conn,
-            learning: Default::default(),
-            learning_config_loaded: Default::default(),
-            learning_models: Default::default(),
-            learning_models_at: Default::default(),
+            learned: Default::default(),
             lock: None,
         })
+    }
+
+    /// A read-only connection to the store archond writes, for the reads it
+    /// serves: in WAL mode it reads the last commit and never waits on the
+    /// writer. Unlike [`Self::open_read_only`] it is never immutable. It
+    /// shares this store's learning config and model catalog.
+    pub fn open_reader(&self, path: &Path) -> Result<Self, ArchonError> {
+        use rusqlite::OpenFlags;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = rusqlite::Connection::open_with_flags(path, flags)
+            .map_err(|e| codec::store_error(&format!("open reader {}", path.display()), &e))?;
+        schema::check_read_only(&conn)?;
+        schema::check_wal(&conn)?;
+        Ok(Self {
+            conn,
+            learned: std::sync::Arc::clone(&self.learned),
+            lock: None,
+        })
+    }
+
+    /// Held only to read or set a field; no store call is made under it.
+    fn learned(&self) -> std::sync::MutexGuard<'_, Learned> {
+        self.learned.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn open_in_memory() -> Result<Self, ArchonError> {
@@ -209,10 +242,7 @@ impl Store {
         debug_assert_eq!(version, schema::MIGRATIONS.len());
         Ok(Self {
             conn,
-            learning: Default::default(),
-            learning_config_loaded: Default::default(),
-            learning_models: Default::default(),
-            learning_models_at: Default::default(),
+            learned: Default::default(),
             lock: None,
         })
     }
@@ -745,6 +775,77 @@ impl Store {
     /// Remove `key`; a missing key is fine.
     pub fn kv_delete(&mut self, key: &str) -> Result<(), ArchonError> {
         settings::kv_delete(&self.conn, key)
+    }
+
+    // ----- tracked requests ------------------------------------------------
+    /// Records a keyed request pending, or finds the request its key was
+    /// used for before by the same caller and command.
+    pub fn claim_tracked(&mut self, tracked: &TrackedRequest) -> Result<Claim, ArchonError> {
+        tracked::claim(&mut self.conn, tracked)
+    }
+    /// Records how a tracked request ended. A keyed one must be claimed first.
+    pub fn finish_tracked(
+        &mut self,
+        tracked: &TrackedRequest,
+        result: Result<&archon_core::protocol::Reply, &archon_core::protocol::ErrorReply>,
+        at: Timestamp,
+    ) -> Result<(), ArchonError> {
+        tracked::finish(&mut self.conn, tracked, result, at)
+    }
+    /// A recorded request's status, with the caller it was made for.
+    pub fn tracked_status(
+        &self,
+        id: &archon_core::id::RequestId,
+    ) -> Result<Option<(String, archon_core::tracked::RequestStatus)>, ArchonError> {
+        tracked::status(&self.conn, id)
+    }
+    /// At start: the requests a stopped archond left pending become interrupted.
+    pub fn interrupt_tracked(&mut self, at: Timestamp) -> Result<usize, ArchonError> {
+        tracked::interrupt_pending(&mut self.conn, at)
+    }
+    /// Deletes the finished requests that started before `before`.
+    pub fn prune_tracked(&mut self, before: Timestamp) -> Result<usize, ArchonError> {
+        tracked::prune(&mut self.conn, before)
+    }
+}
+
+/// archond's WAL checkpoints, on a connection of their own: the writer then
+/// never copies the WAL into the database and syncs it inside a commit, with
+/// the store locked. A passive checkpoint waits on no reader or writer.
+#[derive(Debug)]
+pub struct Checkpointer {
+    conn: rusqlite::Connection,
+}
+
+impl Checkpointer {
+    /// Opens the store archond already opened and migrated.
+    pub fn open(path: &Path) -> Result<Self, ArchonError> {
+        use rusqlite::OpenFlags;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = rusqlite::Connection::open_with_flags(path, flags)
+            .map_err(|e| codec::store_error(&format!("open {}", path.display()), &e))?;
+        conn.busy_timeout(schema::BUSY_TIMEOUT)
+            .map_err(|e| codec::store_error("set busy_timeout", &e))?;
+        schema::check_wal(&conn)?;
+        Ok(Self { conn })
+    }
+
+    /// Copies what it can of the WAL into the database. Returns the WAL's
+    /// frames and how many of them are now in the database.
+    pub fn checkpoint(&self) -> Result<(u64, u64), ArchonError> {
+        let (log, done): (i64, i64) = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| codec::store_error("checkpoint the WAL", &e))?;
+        let log = codec::to_u64(log.max(0), "WAL frames")?;
+        let done = codec::to_u64(done.max(0), "checkpointed frames")?;
+        assert!(
+            done <= log,
+            "no more frames are checkpointed than the WAL holds"
+        );
+        Ok((log, done))
     }
 }
 
