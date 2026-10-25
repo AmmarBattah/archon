@@ -11,9 +11,9 @@ use archon_core::id::{QueueItemId, RequestId};
 use archon_core::notify::NotificationKind;
 use archon_core::protocol::{ClientKind, ItemQuery, Reply, Request, StatusQuery};
 use archon_core::queue::QueueState;
-use archon_core::tracked::TrackedState;
+use archon_core::tracked::{HELD_MAX, TrackedState};
 use archon_daemon::context::DaemonContext;
-use archon_daemon::handlers;
+use archon_daemon::{handlers, prune};
 use archon_queue::store::{TrackedRequest, keys};
 
 use crate::common::{self, Harness};
@@ -298,4 +298,176 @@ async fn viewed_at(h: &Harness, item: &QueueItemId) -> Option<String> {
         .await
         .kv_get(&key)
         .expect("the view mark")
+}
+
+#[tokio::test]
+async fn standby_still_reports_what_became_of_a_tracked_change() {
+    let h = Harness::new().await;
+    let caller = orchestrator_named(&h).await;
+    let id = RequestId::new();
+    let applied = forward(
+        &h.ctx,
+        &caller,
+        tracked(&id, Some("before"), notify("sent")),
+    )
+    .await
+    .expect("applied before the disk filled");
+    h.ctx
+        .standby
+        .set("store: disk full: insert feed entry".into())
+        .expect("not in standby yet");
+    let Reply::RequestStatus(status) = status_of(&h.ctx, &caller, &id).await else {
+        panic!("the status of a tracked change");
+    };
+    assert_eq!(status.state, TrackedState::Applied);
+    assert_eq!(status.reply.as_deref(), Some(&applied));
+    let refused = forward(
+        &h.ctx,
+        &caller,
+        tracked(&RequestId::new(), None, notify("x")),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ArchonError::DiskFull(_))),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reader_sees_one_commit_for_as_long_as_it_is_held() {
+    let h = Harness::new().await;
+    h.enqueue("listed before the reader").await;
+    let everything = ItemQuery::default();
+    let reader = h.ctx.read_store().await.expect("a reader");
+    assert_eq!(reader.items(&everything).expect("items").len(), 1);
+    tokio::time::timeout(READ_LIMIT, h.enqueue("enqueued while it reads"))
+        .await
+        .expect("a held reader never holds the writer");
+    let again = reader.items(&everything).expect("items");
+    assert_eq!(
+        again.len(),
+        1,
+        "a held reader keeps the commit it started at"
+    );
+    drop(reader);
+    let fresh = h.ctx.read_store().await.expect("a reader");
+    assert_eq!(fresh.items(&everything).expect("items").len(), 2);
+}
+
+/// Make the store refuse every recorded outcome, as a full disk would.
+fn refuse_outcomes(h: &Harness) {
+    let conn = rusqlite::Connection::open(&h.ctx.paths.store).expect("the store");
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_outcomes BEFORE UPDATE OF state ON tracked_requests
+         BEGIN SELECT RAISE(ABORT, 'outcome refused'); END;",
+    )
+    .expect("the trigger");
+}
+
+#[tokio::test]
+async fn an_outcome_archond_cannot_record_is_reported_not_hidden() {
+    let h = Harness::new().await;
+    let caller = orchestrator_named(&h).await;
+    refuse_outcomes(&h);
+    let id = RequestId::new();
+    let call = |id: &RequestId| tracked(id, Some("unrecorded"), notify("sent once"));
+    let answered = forward(&h.ctx, &caller, call(&id)).await;
+    let Err(error) = answered else {
+        panic!("an unrecorded outcome is an error: {answered:?}");
+    };
+    let text = error.to_string();
+    assert!(
+        text.contains("outcome refused") && text.contains("was applied"),
+        "{text}"
+    );
+
+    let Reply::RequestStatus(status) = status_of(&h.ctx, &caller, &id).await else {
+        panic!("the status of a tracked change");
+    };
+    assert_eq!(status.state, TrackedState::Applied, "{status:?}");
+    let repeated = forward(&h.ctx, &caller, call(&RequestId::new()))
+        .await
+        .expect("a repeat under the key");
+    assert_eq!(
+        Some(&repeated),
+        status.reply.as_deref(),
+        "the first reply, not pending"
+    );
+    assert_eq!(
+        h.notices(NotificationKind::Decision).await.len(),
+        1,
+        "applied once"
+    );
+}
+
+/// Let the store record outcomes again, as when space is freed.
+fn accept_outcomes(h: &Harness) {
+    let conn = rusqlite::Connection::open(&h.ctx.paths.store).expect("the store");
+    conn.execute_batch("DROP TRIGGER refuse_outcomes;")
+        .expect("the trigger");
+}
+
+#[tokio::test]
+async fn an_outcome_the_store_refused_is_recorded_once_it_takes_it() {
+    let h = Harness::new().await;
+    let caller = orchestrator_named(&h).await;
+    refuse_outcomes(&h);
+    let id = RequestId::new();
+    let refused = forward(&h.ctx, &caller, tracked(&id, Some("kept"), notify("kept"))).await;
+    assert!(refused.is_err(), "{refused:?}");
+    prune::prune_once(&h.ctx, archon_core::now())
+        .await
+        .expect("a pass while the store refuses");
+    let Reply::RequestStatus(status) = status_of(&h.ctx, &caller, &id).await else {
+        panic!("the status of a tracked change");
+    };
+    assert_eq!(status.state, TrackedState::Applied, "memory still keeps it");
+
+    accept_outcomes(&h);
+    prune::prune_once(&h.ctx, archon_core::now())
+        .await
+        .expect("a pass once the store takes it");
+    let stored = h.ctx.store.lock().await.tracked_status(&id).unwrap();
+    let (_, stored) = stored.expect("the outcome is recorded");
+    assert_eq!(stored.state, TrackedState::Applied, "{stored:?}");
+
+    let expired = archon_core::now() + chrono::Duration::hours(48);
+    prune::prune_once(&h.ctx, expired)
+        .await
+        .expect("a pass a day later");
+    let gone = h.ctx.store.lock().await.tracked_status(&id).unwrap();
+    assert!(gone.is_none(), "pruned like any other: {gone:?}");
+    let asked = Request::RequestStatus { request: id };
+    let after = forward(&h.ctx, &caller, asked).await;
+    assert!(matches!(after, Err(ArchonError::NotFound(_))), "{after:?}");
+}
+
+#[tokio::test]
+async fn a_change_is_refused_unapplied_while_archond_holds_too_many() {
+    let h = Harness::new().await;
+    let caller = orchestrator_named(&h).await;
+    refuse_outcomes(&h);
+    for n in 0..HELD_MAX {
+        let key = format!("held-{n}");
+        let call = tracked(&RequestId::new(), Some(&key), notify(&key));
+        let refused = forward(&h.ctx, &caller, call).await;
+        assert!(refused.is_err(), "outcome {n} is not recorded: {refused:?}");
+    }
+    let over = tracked(&RequestId::new(), Some("over"), notify("over"));
+    let refused = forward(&h.ctx, &caller, over).await;
+    assert!(
+        matches!(&refused, Err(ArchonError::Unavailable(m)) if m.contains("nothing was changed")),
+        "{refused:?}"
+    );
+    let notices = h.notices(NotificationKind::Decision).await.len();
+    assert_eq!(notices, HELD_MAX, "the refused change was not applied");
+
+    accept_outcomes(&h);
+    prune::prune_once(&h.ctx, archon_core::now())
+        .await
+        .expect("a pass once the store takes them");
+    let after = tracked(&RequestId::new(), Some("after"), notify("after"));
+    forward(&h.ctx, &caller, after).await.expect("room again");
+    let notices = h.notices(NotificationKind::Decision).await.len();
+    assert_eq!(notices, HELD_MAX + 1, "applied once there is room");
 }

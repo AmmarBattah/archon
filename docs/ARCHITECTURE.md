@@ -145,7 +145,7 @@ protocol 17 and later alone do not imply support.
 
 ```json
 {"req":1,"cmd":"hello","protocol_version":24,"client_name":"archon",
- "client_version":"1.4.5","features":[]}
+ "client_version":"1.4.6","features":[]}
 ```
 
 The reply is `Welcome {protocol_version, daemon_version, instance_id,
@@ -3299,8 +3299,19 @@ idempotency_key}`), followed by the tool's own advice on checking it.
   pass (§16) deletes finished requests 24 h after they started; a pending
   one is never pruned. An unkeyed change's outcome is written once, when it
   ends, so one interrupted by a restart is not found afterwards.
+- When the store refuses to record an outcome (a full disk), the caller
+  gets the store's error, which says whether the change itself was applied
+  or failed, and `archond` keeps that outcome in memory: `request_status`
+  and a repeat under the key report it. Each prune pass writes the kept
+  outcomes again and forgets those the store now holds. A restart before
+  that loses them and marks a keyed request left pending `interrupted`.
+- Memory holds at most 128 tracked requests, running or kept
+  (`tracked::HELD_MAX`). A change past that is refused (`unavailable`)
+  before it runs, so nothing kept is dropped.
 - A refusal by recovery or standby is not recorded, so the key stays free
   for the retry the refusal asks for.
+- `RequestStatus` is a read and is served in standby too, so a caller can
+  learn what became of a change made before the disk filled.
 
 ## 12. Operator chat and filtering
 
@@ -4404,7 +4415,7 @@ rubric), and a review task (seeded bug must be reported).
 | A report poll fails or panics | Poll error, feedback Archon cannot act on, or the poll task ends abnormally. | Contained to that report (§14): a `System` note, a retry with backoff, and after 5 failures in a row the report is `stopped`. Only a store failure stops the event pump. |
 | Restart during a team merge | Startup: a passed team stage without `kv.team_merge:<run>:<stage>:<attempt>`. | The rebuilt driver emits `MergeTeam` again. The merge aborts a half-done `git merge` and skips branches already on the run branch, so nothing lands twice (§13.1). |
 | Restart while a run waits at an operator gate | Startup. | The gate row and any decision are persisted, and the rebuilt driver reads them. An open gate is not asked again; one whose answer was recorded without its decision is asked again (§18.3). |
-| SQLite busy | rusqlite error. | WAL mode, `busy_timeout = 5s`. Only `archond` writes, and CLI reads also go through `archond`. Read tools run on four read-only connections of their own, so they never wait on the writer or its synced commits; the dispatcher reads on the writer. Their waiting reasons wait at most 100 ms for the run table, which an admission pass holds across its writes, and past that leave out pending spawns. `get_item` of a settled item resolves its notifications only when the writer is free, and otherwise leaves that to a later view. The WAL is checkpointed (`PASSIVE`) every 2 s on its own connection, off the writer's lock; the writer's own autocheckpoint is a backstop at 20000 pages. |
+| SQLite busy | rusqlite error. | WAL mode, `busy_timeout = 5s`. Only `archond` writes, and CLI reads also go through `archond`. Read tools run on four read-only connections of their own, so they never wait on the writer or its synced commits; each holds one read transaction while it is borrowed, so the reads of one reply see one commit, as under the writer's lock. The dispatcher reads on the writer. Their waiting reasons wait at most 100 ms for the run table, which an admission pass holds across its writes, and past that leave out pending spawns. `get_item` of a settled item resolves its notifications only when the writer is free, and otherwise leaves that to a later view. The WAL is checkpointed (`PASSIVE`) every 2 s on its own connection, off the writer's lock; the writer's own autocheckpoint is a backstop at 20000 pages. |
 | Store growth | The pruning pass, at startup and every 10 minutes. | `kv` entries nothing reads any more are deleted (below). Only a store failure stops the pass; anything else is logged and retried next pass. |
 
 **The `archon` MCP server.** Aether runs `archon mcp` as the `archon`

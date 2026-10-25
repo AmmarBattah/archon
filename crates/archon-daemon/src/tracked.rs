@@ -11,7 +11,7 @@ use archon_core::aether_ids::AetherAgentId;
 use archon_core::error::ArchonError;
 use archon_core::id::RequestId;
 use archon_core::protocol::{ErrorReply, Reply, Request};
-use archon_core::tracked::{RequestStatus, TrackedState, check_key};
+use archon_core::tracked::{HELD_MAX, RequestStatus, TrackedState, check_key};
 use archon_queue::store::{Claim, TrackedRequest};
 
 use crate::context::DaemonContext;
@@ -23,29 +23,39 @@ pub(crate) struct Tracking {
     key: Option<String>,
 }
 
-/// The tracked requests running now, by id, with the caller each is for.
+/// The tracked requests running now, by id, with the caller each is for,
+/// and those whose outcome the store refused, until it records them.
 #[derive(Debug, Default)]
 pub struct InFlight {
     running: std::sync::Mutex<HashMap<RequestId, (String, RequestStatus)>>,
+    unrecorded: std::sync::Mutex<Vec<TrackedRequest>>,
 }
 
 impl InFlight {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, (String, RequestStatus)>> {
         self.running.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn unrecorded(&self) -> std::sync::MutexGuard<'_, Vec<TrackedRequest>> {
+        self.unrecorded.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// A tracked request from the moment archond read it until it is recorded;
-/// dropping it forgets the request in memory, whatever became of it.
+/// dropping it forgets the request in memory, unless its outcome could not
+/// be recorded and memory keeps it instead.
 #[derive(Debug)]
 pub(crate) struct Ticket<'a> {
     ctx: &'a DaemonContext,
     record: TrackedRequest,
+    kept: bool,
 }
 
 impl Drop for Ticket<'_> {
     fn drop(&mut self) {
-        self.ctx.tracked.lock().remove(&self.record.id);
+        if !self.kept {
+            self.ctx.tracked.lock().remove(&self.record.id);
+        }
     }
 }
 
@@ -87,7 +97,8 @@ pub(crate) fn unwrap(request: Request) -> Result<(Option<Tracking>, Request), Ar
     Ok((Some(tracking), *request))
 }
 
-/// Make `request` known as pending for `caller`, before anything can refuse it.
+/// Make `request` known as pending for `caller`, before anything else can
+/// refuse it; refused here, unapplied, while memory holds [`HELD_MAX`].
 pub(crate) fn enter<'a>(
     ctx: &'a DaemonContext,
     caller: Option<&AetherAgentId>,
@@ -116,6 +127,13 @@ pub(crate) fn enter<'a>(
         finished_at: None,
     };
     let mut running = ctx.tracked.lock();
+    if running.len() >= HELD_MAX {
+        return Err(ArchonError::Unavailable(format!(
+            "archond holds {} tracked requests, running or with an outcome the store has not \
+             recorded yet; nothing was changed. Try again later.",
+            running.len()
+        )));
+    }
     if running.contains_key(&record.id) {
         return Err(ArchonError::Invalid(format!(
             "request {} is already running; every call needs a new request id",
@@ -124,7 +142,11 @@ pub(crate) fn enter<'a>(
     }
     running.insert(record.id.clone(), (record.caller.clone(), pending));
     drop(running);
-    Ok(Ticket { ctx, record })
+    Ok(Ticket {
+        ctx,
+        record,
+        kept: false,
+    })
 }
 
 /// Claim the ticket's key in the store, or find the call it was used for.
@@ -134,7 +156,7 @@ pub(crate) async fn claim(ticket: Ticket<'_>) -> Result<Begun<'_>, ArchonError> 
     if ticket.record.idempotency_key.is_none() {
         if ctx
             .read_store()
-            .await
+            .await?
             .tracked_status(&ticket.record.id)?
             .is_some()
         {
@@ -148,7 +170,9 @@ pub(crate) async fn claim(ticket: Ticket<'_>) -> Result<Begun<'_>, ArchonError> 
     let claim = ctx.store.lock().await.claim_tracked(&ticket.record)?;
     match claim {
         Claim::New => Ok(Begun::Run(ticket)),
-        Claim::Earlier { request, status } => replay(&ticket.record, &request, status),
+        Claim::Earlier { request, status } => {
+            replay(&ticket.record, &request, kept_or(ctx, status))
+        }
     }
 }
 
@@ -184,9 +208,24 @@ fn replay(
     }
 }
 
-/// Record how the ticket's request ended, then forget it in memory. Failing
-/// to record is logged: the caller still gets the real outcome.
-pub(crate) async fn finish(ticket: Ticket<'_>, result: &Result<Reply, ArchonError>) {
+/// The status memory keeps for a request a store row still shows pending:
+/// its outcome, when archond could not record it.
+fn kept_or(ctx: &DaemonContext, stored: RequestStatus) -> RequestStatus {
+    if stored.state != TrackedState::Pending {
+        return stored;
+    }
+    let kept = ctx.tracked.lock().get(&stored.request).cloned();
+    kept.map_or(stored, |(_, status)| status)
+}
+
+/// Record how the ticket's request ended, then forget it in memory. When the
+/// store refuses the record, memory keeps the outcome for `request_status`
+/// until [`record_kept`] records it, and the caller gets the store's error,
+/// saying what became of the change so that it is not repeated.
+pub(crate) async fn finish(
+    mut ticket: Ticket<'_>,
+    result: &Result<Reply, ArchonError>,
+) -> Result<(), ArchonError> {
     let error = result.as_ref().err().map(ErrorReply::from);
     let outcome = match (result, &error) {
         (Ok(reply), _) => Ok(reply),
@@ -200,8 +239,95 @@ pub(crate) async fn finish(ticket: Ticket<'_>, result: &Result<Reply, ArchonErro
         .lock()
         .await
         .finish_tracked(&ticket.record, outcome, at);
-    if let Err(failure) = written {
-        tracing::error!(request = %ticket.record.id, %failure, "a tracked request's outcome was not recorded; request_status will not find it");
+    let Err(failure) = written else {
+        return Ok(());
+    };
+    let status = ended(&ticket.record, result, error, at);
+    assert!(status.is_consistent(), "memory keeps a whole outcome");
+    let id = ticket.record.id.clone();
+    let entry = (ticket.record.caller.clone(), status);
+    ticket.ctx.tracked.lock().insert(id.clone(), entry);
+    ticket.ctx.tracked.unrecorded().push(ticket.record.clone());
+    ticket.kept = true;
+    tracing::error!(request = %id, %failure, "a tracked request's outcome was not recorded; memory keeps it until the store takes it");
+    let did = match result {
+        Ok(_) => "was applied",
+        Err(_) => "failed",
+    };
+    Err(failure.with_detail(&format!(
+        "the change itself {did}, as request_status {id} reports; do not repeat it"
+    )))
+}
+
+/// Record the outcomes memory kept when the store refused them, forgetting
+/// each the store now holds. One still refused stays, logged, for the next
+/// pass.
+pub(crate) async fn record_kept(ctx: &DaemonContext) {
+    let records = ctx.tracked.unrecorded().clone();
+    assert!(
+        records.len() <= HELD_MAX,
+        "kept outcomes count toward the bound"
+    );
+    let mut recorded = 0;
+    for record in records {
+        if let Err(error) = record_one(ctx, &record).await {
+            tracing::warn!(request = %record.id, %error, "a kept tracked outcome is still not recorded; the next prune pass retries");
+            continue;
+        }
+        ctx.tracked.lock().remove(&record.id);
+        ctx.tracked.unrecorded().retain(|kept| kept.id != record.id);
+        recorded += 1;
+    }
+    if recorded > 0 {
+        tracing::info!(recorded, "recorded tracked outcomes the store had refused");
+    }
+}
+
+/// Write one kept outcome, unless the store already shows it ended.
+async fn record_one(ctx: &DaemonContext, record: &TrackedRequest) -> Result<(), ArchonError> {
+    let kept = ctx.tracked.lock().get(&record.id).map(|(_, s)| s.clone());
+    let status = kept.expect("memory keeps an unrecorded outcome until it is recorded");
+    assert!(status.is_consistent(), "memory keeps a whole outcome");
+    let at = status.finished_at.expect("a kept outcome has ended");
+    let outcome = match (&status.reply, &status.error) {
+        (Some(reply), None) => Ok(reply.as_ref()),
+        (None, Some(error)) => Err(error),
+        _ => unreachable!("a kept outcome is a reply or an error"),
+    };
+    let mut store = ctx.store.lock().await;
+    let stored = store.tracked_status(&record.id)?;
+    if stored.is_some_and(|(_, stored)| stored.state != TrackedState::Pending) {
+        return Ok(());
+    }
+    store.finish_tracked(record, outcome, at)
+}
+
+/// The status of the ticket's request, ended at `at` with `result`.
+fn ended(
+    record: &TrackedRequest,
+    result: &Result<Reply, ArchonError>,
+    error: Option<ErrorReply>,
+    at: archon_core::Timestamp,
+) -> RequestStatus {
+    assert!(at >= record.started_at, "a request ends after it starts");
+    assert_eq!(
+        result.is_err(),
+        error.is_some(),
+        "only a failure has an error"
+    );
+    let (state, reply) = match result {
+        Ok(reply) => (TrackedState::Applied, Some(Box::new(reply.clone()))),
+        Err(_) => (TrackedState::Failed, None),
+    };
+    RequestStatus {
+        request: record.id.clone(),
+        command: record.command.clone(),
+        state,
+        idempotency_key: record.idempotency_key.clone(),
+        reply,
+        error,
+        started_at: record.started_at,
+        finished_at: Some(at),
     }
 }
 
@@ -216,7 +342,7 @@ pub(crate) async fn status(
     let running = ctx.tracked.lock().get(id).cloned();
     let found = match running {
         Some(entry) => Some(entry),
-        None => ctx.read_store().await.tracked_status(id)?,
+        None => ctx.read_store().await?.tracked_status(id)?,
     };
     match found {
         Some((owner, status)) if owner == caller => {
