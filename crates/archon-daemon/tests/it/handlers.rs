@@ -67,6 +67,64 @@ async fn setting_a_budget_says_whether_it_is_enforced() {
     assert!(matches!(h.cli(quiet).await.unwrap(), Reply::Item(_)));
 }
 
+/// A title changes before the first run, whose branch it then names, and
+/// never after, when a branch named after the old one exists.
+#[tokio::test]
+async fn a_title_changes_only_before_the_first_run() {
+    let h = Harness::new().await;
+    let item = h.enqueue("first name").await;
+    let retitle = |title: &str| Request::UpdateItem {
+        item: item.id.clone(),
+        patch: ItemPatch {
+            title: Some(title.into()),
+            ..ItemPatch::default()
+        },
+    };
+    let Reply::Item(renamed) = h.cli(retitle("  Better name ")).await.unwrap() else {
+        panic!("a queued item takes a new title")
+    };
+    assert_eq!(renamed.title, "Better name");
+    let error = h.cli(retitle("bad\u{7}name")).await.unwrap_err();
+    assert!(matches!(error, ArchonError::Invalid(_)), "{error}");
+
+    let claimed = h.enqueue("being claimed").await;
+    let now = archon_core::now();
+    let store = &h.ctx.store;
+    let state = archon_core::queue::QueueState::Dispatching;
+    store
+        .lock()
+        .await
+        .transition_item(&claimed.id, state, now)
+        .unwrap();
+    let claim = Request::UpdateItem {
+        item: claimed.id.clone(),
+        patch: ItemPatch {
+            title: Some("Too late".into()),
+            ..ItemPatch::default()
+        },
+    };
+    let error = h.cli(claim).await.unwrap_err();
+    assert!(
+        matches!(error, ArchonError::InvalidTransition(_)),
+        "{error}"
+    );
+    assert_eq!(h.item(&claimed.id).await.title, "being claimed");
+
+    h.dispatch().await;
+    let run = h.run(&item.id).await;
+    assert!(run.branch.ends_with("-better-name"), "{}", run.branch);
+    let error = h.cli(retitle("Third name")).await.unwrap_err();
+    assert!(
+        matches!(error, ArchonError::InvalidTransition(_)),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("before the first run"),
+        "{error}"
+    );
+    assert_eq!(h.item(&item.id).await.title, "Better name");
+}
+
 /// A request of each operator-only kind.
 fn operator_only_requests() -> Vec<Request> {
     vec![

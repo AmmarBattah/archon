@@ -344,11 +344,12 @@ pub(super) fn autonomy_change() -> Value {
     })
 }
 
-/// An existing pull request to deliver into, named one way.
+/// An existing pull request to deliver into, named one way; in a `ship =
+/// local` repository, a finished item's branch to commit onto.
 fn onto() -> Value {
     json!({
         "type": "object",
-        "description": "PR to deliver into: {item}|{pr}|{branch}",
+        "description": "Existing PR/branch: {item}|{pr}|{branch}",
     })
 }
 
@@ -585,6 +586,7 @@ fn update_item() -> ToolDefinition {
         object(
             json!({
                 "item": item_id(""),
+                "title": {"type": "string", "description": "Before the first run only."},
                 "priority": priority(),
                 "model_reasons": model_reasons(),
                 "model_plan": new_model_plan("Replaces the whole plan."),

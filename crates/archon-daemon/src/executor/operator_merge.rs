@@ -81,8 +81,11 @@ struct Shipped {
     run: PipelineRunId,
     repo: Repo,
     pr_url: String,
-    /// The reviewed commit its delivery pushed.
+    /// The reviewed commit its delivery pushed; for a local branch, the one
+    /// its newest refresh or restack fix recorded, if any came later.
     head: String,
+    /// Whether every run that delivered `head` had its change reviewed.
+    reviewed: bool,
 }
 
 impl Shipped {
@@ -144,13 +147,83 @@ fn shipped(store: &Store, id: &QueueItemId) -> Result<Shipped, ArchonError> {
         return Err(ArchonError::Invalid(format!("run {run} of {id} {why}")));
     };
     assert!(is_commit_id(&head), "checked by delivered");
+    let mut reviewed = item.autonomy.review != ReviewLevel::None;
+    let fixed = match pr_url.starts_with(LOCAL_REF_PREFIX) {
+        true => fixed_head(store, &item.id, &run, &pr_url)?,
+        false => None,
+    };
+    let head = match fixed {
+        Some(fixed) => {
+            reviewed &= fixed.reviewed;
+            fixed.head
+        }
+        None => head,
+    };
     Ok(Shipped {
         item,
         run,
         repo,
         pr_url,
         head,
+        reviewed,
     })
+}
+
+/// A later delivery on the owner's branch by one of its restack fixes or refreshes.
+struct Fixed {
+    head: String,
+    reviewed: bool,
+}
+
+/// The local commit the newest succeeded restack fix, refresh or `onto` item
+/// of `owner` recorded on the branch `delivery` names, when it finished after
+/// `run`, the owner's own delivering run: the branch has ended there since.
+/// It counts as reviewed only when every such later delivery was.
+fn fixed_head(
+    store: &Store,
+    owner: &QueueItemId,
+    run: &PipelineRunId,
+    delivery: &str,
+) -> Result<Option<Fixed>, ArchonError> {
+    assert!(delivery.starts_with(LOCAL_REF_PREFIX), "a local delivery");
+    let own = store.run(run)?;
+    let delivered_at = own.finished_at.unwrap_or(own.started_at);
+    let mut newest: Option<(archon_core::Timestamp, String)> = None;
+    let mut reviewed = true;
+    for id in store.stack_fixes_of(owner)? {
+        let fix = store.item(&id)?;
+        assert_ne!(&fix.id, owner, "a fix works on another item's branch");
+        let Some((finished, head)) = later_delivery(store, &fix, delivery, delivered_at)? else {
+            continue;
+        };
+        reviewed &= fix.autonomy.review != ReviewLevel::None;
+        if newest.as_ref().is_none_or(|(at, _)| finished > *at) {
+            newest = Some((finished, head));
+        }
+    }
+    Ok(newest.map(|(_, head)| Fixed { head, reviewed }))
+}
+
+/// When the succeeded `fix` finished and the local commit it recorded on the
+/// branch `delivery` names, if it finished after `delivered_at`.
+fn later_delivery(
+    store: &Store,
+    fix: &QueueItem,
+    delivery: &str,
+    delivered_at: archon_core::Timestamp,
+) -> Result<Option<(archon_core::Timestamp, String)>, ArchonError> {
+    let QueueState::Succeeded { run, .. } = &fix.state else {
+        return Ok(None);
+    };
+    let Some(finished) = store.run(run)?.finished_at else {
+        return Ok(None);
+    };
+    let stages = store.stage_runs(run)?;
+    let Some((url, head)) = local_delivery(store, run, &stages) else {
+        return Ok(None);
+    };
+    assert!(is_commit_id(&head), "checked by local_delivery");
+    Ok((url == delivery && finished > delivered_at).then_some((finished, head)))
 }
 
 /// `(pull request, commit)` from the stage that recorded the delivery.
@@ -392,8 +465,7 @@ pub(crate) async fn request(
         }
     };
     supersede_stale_requests(&mut *ctx.store.lock().await, &shipped)?;
-    let reviewed = shipped.item.autonomy.review != ReviewLevel::None;
-    if !(shipped.repo.grant_merge && reviewed) {
+    if !(shipped.repo.grant_merge && shipped.reviewed) {
         return ask(ctx, &shipped, reason, &seen).await;
     }
     if shipped.local_branch().is_some() {
@@ -1205,7 +1277,7 @@ async fn resume_waiting(ctx: &DaemonContext, mut merge: MergeRequest) -> Result<
         }
     };
     let shipped = shipped(&*ctx.store.lock().await, &merge.item)?;
-    let granted = shipped.repo.grant_merge && shipped.item.autonomy.review != ReviewLevel::None;
+    let granted = shipped.repo.grant_merge && shipped.reviewed;
     let still_pending = seen.failed.is_empty() && !seen.pending.is_empty();
     if granted && seen.all_green() {
         merge.state = MergeState::Merging;
@@ -1298,7 +1370,7 @@ fn next_step(merge: &MergeRequest, shipped: &Shipped, ready: &Ready) -> Next {
     if merge.authority != MergeAuthority::Grant {
         return Next::Merge { waived_by: None };
     }
-    let granted = shipped.repo.grant_merge && shipped.item.autonomy.review != ReviewLevel::None;
+    let granted = shipped.repo.grant_merge && shipped.reviewed;
     if !granted {
         return Next::AskOperator("the repository no longer grants the merge");
     }

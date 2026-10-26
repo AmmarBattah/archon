@@ -842,7 +842,7 @@ reference, `[image: shot.png, 14.2 KB]`, not the image. In the terminal UI
 | `archon queue refresh <id>` | merge a finished item's base branch, fetched from `origin`, into its branch: a new item resolves any conflicts, runs the checks, is reviewed from the new merge base and updates the same pull request (never a rebase or a second pull request); an item queued `onto` a pull request merges that pull request's current head instead |
 | `archon queue steer <id> [--note "…"] [--stage <stage>] [--model <provider/model>] [--effort <effort>] [--budget-usd <usd>] [--extend <minutes>] [--stage-timeout <stage>=<minutes>]… [--abort [--then retry\|skip] [--goto <stage>]] [--remove <stage>] [--insert <stage> [--from <pipeline>] [--after <stage>]] [--switch <pipeline>]` | change an item without cancelling it; see [steering an item](#steering-an-item) |
 | `archon log` | the complete feed; `--item <id>` keeps one item's entries, `--kind <kind>` (repeatable) some kinds, and `--follow` keeps printing new ones |
-| `archon merge <id> [--ignore-checks]` | merge a succeeded item's pull request at its reviewed commit; see [Merging on request](#merging-on-request). For a `ship = local` repository it fast-forwards the base branch to the item's reviewed commit and keeps the branch; refused, changing nothing, when the base moved (run `archon queue refresh <id>`), shares no history, or is checked out with local changes |
+| `archon merge <id> [--ignore-checks]` | merge a succeeded item's pull request at its reviewed commit; see [Merging on request](#merging-on-request). For a `ship = local` repository it fast-forwards the base branch to the item's reviewed commit and keeps the branch; refused, changing nothing, when the base moved, shares no history, or is checked out with local changes. After `archon queue refresh <id>` succeeds, it lands the refresh's reviewed commit |
 | `archon diff <id> [--full]` | show the branch, repository, base and diffstat a `ship = local` item left, and whether `archon merge` would land it now (`/diff <id>` in the chat) |
 | `archon reports` / `archon reports reopen <rpt_…>` | list published reports with their state and URL, or show a closed one again |
 | `archon github-watcher …` | route `@archon` on GitHub issues and PRs to the orchestrator. `operators <LOGIN>...` lets the GitHub accounts you list instruct it with your authority (off by default); see [`docs/github-watcher.md`](github-watcher.md) |
@@ -1091,6 +1091,17 @@ and `pushInsteadOf` does not apply to it. A delivered `onto` item has no
 branch of its own on `origin`, so it is not refreshed and an item depending
 on it in the same repository does not start: queue that work `onto` the
 item instead.
+
+In a `ship = local` repository there is no pull request: `onto` names a
+finished item (`{item: "qi_…"}`) or the branch its last run left
+(`{branch: "…"}`), and the new item, with its own pipeline, title and brief,
+works on that branch in that item's worktree, like a refresh: it waits while
+the item runs, its agents are told, its review reads the whole branch, and it
+ships as a local commit on top. Refused with the reason: `{pr: …}`, an item of
+another repository, one still running or without a branch, a refresh or
+earlier `onto` item itself (name its owner), one stacked on an unmerged
+parent, a team run, one with a fix, refresh or `onto` item still to finish,
+and a team pipeline; initiative members cannot take it there.
 
 ### Risk labels
 

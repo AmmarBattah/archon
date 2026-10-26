@@ -10,8 +10,10 @@ use archon_core::model::{Effort, ModelPlan, ModelPlanDraft, ModelReasons, check_
 use archon_core::notify::NotificationKind;
 use archon_core::protocol::{EnqueueRequest, ItemDetail, ItemPatch, ItemQuery, Reply};
 use archon_core::pull_request::{OntoPullRequest, OntoTarget};
-use archon_core::queue::{QueueItem, QueueState, check_enqueue, check_item_budget, check_tags};
-use archon_core::repo::Repo;
+use archon_core::queue::{
+    QueueItem, QueueState, check_enqueue, check_item_budget, check_tags, check_title,
+};
+use archon_core::repo::{Repo, ShipMode};
 use archon_pipeline::PipelineSpec;
 use archon_pipeline::spec::MIN_ROLES;
 
@@ -93,11 +95,14 @@ pub(super) async fn enqueue(
         created_at: now,
         updated_at: now,
     };
-    let stored = ctx
-        .store
-        .lock()
-        .await
-        .insert_enqueued(&item, key, &req.autonomy)?;
+    let stored = store_enqueued(
+        ctx,
+        (&env, &resolved.spec),
+        asked,
+        &item,
+        (key, &req.autonomy),
+    )
+    .await?;
     assert!(
         stored.id == item.id || key.is_some(),
         "only a key returns an older item"
@@ -145,10 +150,47 @@ async fn enqueue_onto(
     (target, has_dependencies): (Option<&OntoTarget>, bool),
     key: Option<&str>,
 ) -> Result<Option<OntoPullRequest>, ArchonError> {
+    if local_onto(env, target).is_some() {
+        return Ok(None);
+    }
     if let Some(frozen) = replayed_onto(ctx, key, target).await? {
         return Ok(Some(frozen));
     }
     freeze_onto(ctx, env, spec, target, has_dependencies).await
+}
+
+/// The `onto` target of an enqueue into a `ship = local` repository: with no
+/// pull request to deliver into, the item works on the target item's branch.
+fn local_onto<'a>(env: &RepoEnv, target: Option<&'a OntoTarget>) -> Option<&'a OntoTarget> {
+    let local = env.repo.as_ref().is_some_and(|r| r.ship == ShipMode::Local);
+    target.filter(|_| local)
+}
+
+/// Store the new `item`, as a fix of the item its local `onto` target names
+/// when it has one; a replay of idempotency `key` returns the first item.
+async fn store_enqueued(
+    ctx: &DaemonContext,
+    (env, spec): (&RepoEnv, &PipelineSpec),
+    (target, has_dependencies): (Option<&OntoTarget>, bool),
+    item: &QueueItem,
+    (key, asked): (Option<&str>, &archon_core::autonomy::AutonomyPatch),
+) -> Result<QueueItem, ArchonError> {
+    let Some(target) = local_onto(env, target) else {
+        return ctx.store.lock().await.insert_enqueued(item, key, asked);
+    };
+    let repo = check_onto(env, spec, has_dependencies)?;
+    if spec.file.stages.iter().any(|s| s.kind == StageKind::Team) {
+        return Err(ArchonError::Invalid(format!(
+            "pipeline {:?} runs a team, whose roles work on branches of their own, so it \
+             cannot work on another item's branch; pick a pipeline without a team stage",
+            spec.name()
+        )));
+    }
+    assert!(
+        item.onto.is_none(),
+        "a local repository freezes no pull request"
+    );
+    executor::onto::local::enqueue(ctx, repo, item, target, (key, asked)).await
 }
 
 /// The `onto` record an earlier enqueue with idempotency `key` froze for
@@ -184,30 +226,38 @@ pub(super) async fn freeze_onto(
     let Some(target) = target else {
         return Ok(None);
     };
+    let repo = check_onto(env, spec, has_dependencies)?;
+    let frozen = executor::onto::freeze(ctx, repo, target).await?;
+    assert_eq!(&frozen.target, target, "frozen as asked");
+    Ok(Some(frozen))
+}
+
+/// The repository of an item queued `onto` existing work, which starts in a
+/// worktree from that work's head and so stacks on nothing else.
+fn check_onto<'a>(
+    env: &'a RepoEnv,
+    spec: &PipelineSpec,
+    has_dependencies: bool,
+) -> Result<&'a Repo, ArchonError> {
     if has_dependencies {
         return Err(onto_with_dependencies());
     }
     if spec.file.pipeline.workspace != WorkspaceMode::Worktree {
         return Err(ArchonError::Invalid(format!(
             "pipeline {:?} does not work in a worktree, so it cannot start from the head of \
-             the pull request `onto` names; pick a pipeline that does",
+             the work `onto` names; pick a pipeline that does",
             spec.name()
         )));
     }
-    let Some(repo) = &env.repo else {
-        return Err(ArchonError::Invalid(
-            "`onto` needs a repository whose pull request it updates".into(),
-        ));
-    };
-    let frozen = executor::onto::freeze(ctx, repo, target).await?;
-    assert_eq!(&frozen.target, target, "frozen as asked");
-    Ok(Some(frozen))
+    env.repo.as_ref().ok_or_else(|| {
+        ArchonError::Invalid("`onto` needs a repository whose work it continues".into())
+    })
 }
 
 fn onto_with_dependencies() -> ArchonError {
     ArchonError::Invalid(
-        "an item queued `onto` a pull request starts from its head, so it cannot also stack on \
-         dependencies; queue it once they have succeeded"
+        "an item queued `onto` a pull request or branch starts from its head, so it cannot also \
+         stack on dependencies; queue it once they have succeeded"
             .into(),
     )
 }
@@ -350,6 +400,9 @@ pub(super) async fn update_within(
     if let Some(tags) = &patch.tags {
         check_tags(tags)?;
     }
+    if let Some(title) = &patch.title {
+        check_title(title)?;
+    }
     let current = ctx.store.lock().await.item(id)?;
     if matches!(current.state, QueueState::Succeeded { .. }) && patch.autonomy.is_some() {
         return after_success(ctx, current, patch, ceiling).await;
@@ -401,7 +454,8 @@ pub(super) async fn update_within(
         let table = ctx.runs.lock().await;
         let mut store = ctx.store.lock().await;
         let mut item = store.item(id)?;
-        check_patchable(&item, &patch, replaces_plan)?;
+        let ran = !store.runs_for_item(id)?.is_empty();
+        check_patchable(&item, &patch, (replaces_plan, ran))?;
         if let Some(revision) = &revision {
             revise::apply(&mut store, &table, &mut item, revision)?;
         }
@@ -484,12 +538,18 @@ async fn after_success(
 fn check_patchable(
     item: &QueueItem,
     patch: &ItemPatch,
-    replaces_plan: bool,
+    (replaces_plan, ran): (bool, bool),
 ) -> Result<(), ArchonError> {
     let id = &item.id;
     if matches!(item.state, QueueState::Succeeded { .. }) {
         return Err(ArchonError::InvalidTransition(format!(
             "item {id} already succeeded"
+        )));
+    }
+    if patch.title.is_some() && (ran || item.state.is_active()) {
+        return Err(ArchonError::InvalidTransition(format!(
+            "item {id} has started a run, on a branch named after its title; the title \
+             changes only before the first run"
         )));
     }
     let steered = replaces_plan || patch.brief_append.is_some();
@@ -514,6 +574,9 @@ fn apply_patch(
     }
     if let Some(text) = &patch.brief_append {
         item.amend_brief(text, archon_core::now())?;
+    }
+    if let Some(title) = patch.title {
+        item.title = title.trim().to_owned();
     }
     if let Some(priority) = patch.priority {
         item.priority = priority;
