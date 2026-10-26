@@ -1,11 +1,13 @@
 //! Reaching `archond` from the CLI. A command that only reads never starts it; one that changes
 //! something, or opens the chat or the terminal UI, starts it and says so.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use archon_client::ArchonClient;
+use archon_client::{ArchonClient, Principal};
+use archon_core::aether_ids::AetherAgentId;
 use archon_core::config::{AetherMode, Config};
 use archon_core::error::ArchonError;
 use archon_core::protocol::{AetherLinkStatus, ClientKind, Reply, Request};
@@ -27,6 +29,30 @@ pub fn archon_bin() -> anyhow::Result<PathBuf> {
         .with_context(|| format!("resolving {}", exe.display()))?;
     assert!(bin.is_absolute(), "canonical paths are absolute");
     Ok(bin)
+}
+
+/// Aether sets these on every engine child, so a shell an agent runs has them.
+const ENGINE_AGENT_VAR: &str = "AETHER_ENGINE_AGENT";
+const ENGINE_RUN_VAR: &str = "AETHER_ENGINE_RUN";
+
+/// Whom this CLI acts for: in an agent's shell that agent, so archond applies
+/// its rules and refuses what only the operator may do.
+pub fn principal() -> Principal {
+    principal_from(
+        std::env::var_os(ENGINE_AGENT_VAR),
+        std::env::var_os(ENGINE_RUN_VAR).is_some(),
+    )
+}
+
+/// An agent id that is not Unicode or does not parse, or a run without one,
+/// names no agent: such a shell is still an agent's, never the operator's.
+fn principal_from(agent: Option<OsString>, in_engine_run: bool) -> Principal {
+    let named = agent.map(|raw| raw.into_string().ok().map(|id| AetherAgentId::parse(&id)));
+    match (named, in_engine_run) {
+        (Some(Some(Ok(agent))), _) => Principal::Agent(agent),
+        (Some(_), _) | (None, true) => Principal::UnnamedAgent,
+        (None, false) => Principal::Operator,
+    }
 }
 
 /// What a command that only reads says when no archond answers.
@@ -91,7 +117,7 @@ async fn start(socket: &Path) -> anyhow::Result<ArchonClient> {
     );
     let client = ArchonClient::connect_or_start(socket, ClientKind::ArchonCli, &bin).await?;
     assert!(client.welcome().pid > 0, "a started archond names its pid");
-    Ok(client)
+    Ok(client.acting_for(principal()))
 }
 
 /// In dedicated mode, start Archon's own aetherd unless it answers, so the archond
@@ -150,7 +176,7 @@ pub async fn await_link(client: &ArchonClient, limit: Duration) -> anyhow::Resul
 pub async fn connect_existing() -> anyhow::Result<Option<ArchonClient>> {
     let socket = archon_client::default_socket();
     match ArchonClient::connect(&socket, ClientKind::ArchonCli).await {
-        Ok(client) => Ok(Some(client)),
+        Ok(client) => Ok(Some(client.acting_for(principal()))),
         Err(ArchonError::Unavailable(_)) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -276,6 +302,30 @@ mod tests {
         assert!(began.elapsed() < LINK_WAIT, "and no longer");
         drop(client);
         assert!(daemon.await.unwrap() >= 2, "it looked more than once");
+    }
+
+    #[test]
+    fn an_engine_childs_environment_names_whom_the_cli_acts_for() {
+        let agent = AetherAgentId::parse("agt_01STAGE").unwrap();
+        assert_eq!(principal_from(None, false), Principal::Operator);
+        assert_eq!(
+            principal_from(Some("agt_01STAGE".into()), true),
+            Principal::Agent(agent.clone())
+        );
+        assert_eq!(
+            principal_from(Some("agt_01STAGE".into()), false),
+            Principal::Agent(agent)
+        );
+        assert_eq!(principal_from(None, true), Principal::UnnamedAgent);
+        assert_eq!(
+            principal_from(Some(OsString::new()), false),
+            Principal::UnnamedAgent
+        );
+        let not_unicode = std::os::unix::ffi::OsStringExt::from_vec(vec![b'a', 0xff]);
+        assert_eq!(
+            principal_from(Some(not_unicode), false),
+            Principal::UnnamedAgent
+        );
     }
 
     #[test]
