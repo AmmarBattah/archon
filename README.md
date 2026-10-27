@@ -13,7 +13,7 @@ ceiling. Agents run on [Aether](https://github.com/mengsig/aether).
   the CLI, or mention `@archon` on a watched GitHub repository. The
   orchestrator answers code questions from its own copy of your
   repositories and queues every change as an item.
-- **Pipelines with real gates.** Eleven built-in pipelines, from a single
+- **Pipelines with real gates.** Twelve built-in pipelines, from a single
   agent with no reviewer to a lead with three independent ones, or your own
   in TOML. A failed gate sends the findings back to the implementer, which
   keeps its context through the fix.
