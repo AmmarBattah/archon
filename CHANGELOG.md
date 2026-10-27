@@ -43,6 +43,13 @@ restart.
   bypassed Archon's feed, push and notification center; stages also lose
   `refresh_provider_usage`. Archon's own `notify` stays (#291).
 
+### Ship checks
+
+- The clean check before delivery accepts a smudged LFS file whose content
+  matches the committed pointer (its bytes, or its size and SHA-256), so an
+  LFS repository's checkout is no longer refused as dirty. It runs no LFS
+  filter; a mismatch, deletion or mode change stays dirty (#292).
+
 ### Prompts and pipelines
 
 - Every built-in prompt, the shared proposal and report, and the stage
