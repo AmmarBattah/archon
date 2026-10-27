@@ -41,6 +41,9 @@ pub(super) struct Target {
     /// reviewed head of the pull request it is stacked on. Only commits after
     /// it must carry the repository's identity.
     pub since: Option<String>,
+    /// `since` is a reviewed head: a commit after it that `base` lacks must
+    /// carry the identity even when a remote holds it, as no review passed it.
+    pub reviewed: bool,
     /// The addresses a commit the run adds may carry, recorded at registration.
     pub allowed: Vec<String>,
     /// The repository's attribution policy at delivery.
@@ -103,7 +106,11 @@ pub(super) fn check(
             target.branch
         )));
     }
-    if let Err(refusal) = foreign_commits(tree, &base, &target.allowed)? {
+    let held = match held_elsewhere(tree, target)? {
+        Ok(held) => held,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    if let Err(refusal) = foreign_commits(tree, &base, &held, &target.allowed)? {
         return Ok(Err(refusal));
     }
     if target.attribution == Attribution::None
@@ -369,11 +376,51 @@ fn base_ref(tree: &Path, base: &str) -> Result<Option<String>, ArchonError> {
     Ok(None)
 }
 
-/// Refuse a commit the run adds, one neither `base` nor a remote holds, that
+/// Where commits beyond the floor may already be, exempt from the identity
+/// check: any remote, or for a reviewed stack only the base branch's refs.
+fn held_elsewhere(
+    tree: &Path,
+    target: &Target,
+) -> Result<Result<Vec<String>, String>, ArchonError> {
+    if !target.reviewed {
+        return Ok(Ok(vec!["--remotes".to_owned()]));
+    }
+    assert!(
+        target.since.is_some(),
+        "a reviewed stack starts at the reviewed head"
+    );
+    let base = &target.base;
+    let pattern = [
+        format!("refs/heads/{base}"),
+        format!("refs/remotes/origin/{base}"),
+    ];
+    let listed = git(
+        tree,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &pattern[0],
+            &pattern[1],
+        ],
+    )?;
+    let held: Vec<String> = listed
+        .lines()
+        .filter(|name| pattern.iter().any(|p| p == name))
+        .map(str::to_owned)
+        .collect();
+    if held.is_empty() {
+        return Ok(Err(missing_base(target)));
+    }
+    assert!(held.len() <= pattern.len(), "each ref listed once");
+    Ok(Ok(held))
+}
+
+/// Refuse a commit the run adds, one neither `base` nor `held` holds, that
 /// was not made under the repository's git identity or the daemon's own.
 fn foreign_commits(
     tree: &Path,
     base: &str,
+    held: &[String],
     allowed: &[String],
 ) -> Result<Result<(), String>, ArchonError> {
     assert!(
@@ -381,8 +428,14 @@ fn foreign_commits(
         "the daemon's own address is always allowed"
     );
     assert!(is_floor(base), "a full ref name or a commit id");
+    assert!(
+        held.iter().all(|h| h == "--remotes" || is_floor(h)),
+        "remotes or full ref names"
+    );
     let format = "--format=%H%x09%ae%x09%ce";
-    let log = git(tree, &["log", format, "HEAD", "--not", base, "--remotes"])?;
+    let mut args = vec!["log", format, "HEAD", "--not", base];
+    args.extend(held.iter().map(String::as_str));
+    let log = git(tree, &args)?;
     let mut foreign = Vec::new();
     for line in log.lines() {
         let fields: Vec<&str> = line.split('\t').collect();

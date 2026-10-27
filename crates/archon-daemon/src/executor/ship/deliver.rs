@@ -410,6 +410,7 @@ async fn prove(
         Err(refusal) => return Ok(Err(refusal)),
     };
     let onto = claimed.onto.as_ref().map(|onto| onto.head_sha.clone());
+    let reviewed = stacked.is_some();
     assert!(
         onto.is_none() || stacked.is_none(),
         "an onto item stacks on nothing"
@@ -421,6 +422,7 @@ async fn prove(
         branch: run.branch.clone(),
         base: base.to_owned(),
         since: onto.or(stacked),
+        reviewed,
         allowed: repo_identity::RepoIdentity::allowed(identity.as_ref()),
         attribution: repo.attribution,
     };
@@ -485,16 +487,18 @@ pub(in crate::executor) async fn prove_unchanged(
     run: &PipelineRun,
 ) -> Result<Result<(), String>, ArchonError> {
     assert!(run.workspace.is_absolute(), "a run has a worktree");
-    let (repo, since, base) = {
+    let (repo, since, reviewed, base) = {
         let store = ctx.store.lock().await;
         let vars = recover::load_run_vars(&store, &run.id)?;
         let base = base_of(&store, run, &vars)?;
         let item = store.item(&run.item)?;
         let stacked = super::super::onto::reviewed_dependency(&store, &item)?;
         let since = item.onto.map(|onto| onto.head_sha);
+        let reviewed = stacked.is_some();
         (
             repo_of(&store, run)?,
             since.or(stacked.map(|s| s.head_sha)),
+            reviewed,
             base,
         )
     };
@@ -510,6 +514,7 @@ pub(in crate::executor) async fn prove_unchanged(
         branch: run.branch.clone(),
         base,
         since,
+        reviewed,
         allowed: Vec::new(),
         attribution: repo.attribution,
     };

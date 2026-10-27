@@ -468,6 +468,20 @@ async fn a_stack_that_rewrites_the_contributor_s_commit_is_refused() {
     nothing_pushed_to_the_fork(&h, &gh, &head);
 }
 
+/// One commit in `workspace` by `other@example.com`, whom no review passed.
+fn other_commit(workspace: &std::path::Path) {
+    std::fs::write(workspace.join("other.txt"), "someone else\n").unwrap();
+    git(workspace, &["add", "other.txt"]);
+    let identity = [
+        "-c",
+        "user.name=Other",
+        "-c",
+        "user.email=other@example.com",
+    ];
+    let commit = [&identity[..], &["commit", "--quiet", "-m", "Other"]].concat();
+    git(workspace, &commit);
+}
+
 #[tokio::test]
 async fn a_stack_carrying_another_foreign_commit_is_refused() {
     let (h, gh, head, review) = reviewed_fork().await;
@@ -475,16 +489,7 @@ async fn a_stack_carrying_another_foreign_commit_is_refused() {
 
     settle_stacked(&h, &item, |workspace| {
         own_commit(workspace);
-        std::fs::write(workspace.join("other.txt"), "someone else\n").unwrap();
-        git(workspace, &["add", "other.txt"]);
-        let identity = [
-            "-c",
-            "user.name=Other",
-            "-c",
-            "user.email=other@example.com",
-        ];
-        let commit = [&identity[..], &["commit", "--quiet", "-m", "Other"]].concat();
-        git(workspace, &commit);
+        other_commit(workspace);
     })
     .await;
 
@@ -497,6 +502,29 @@ async fn a_stack_carrying_another_foreign_commit_is_refused() {
         "the reviewed commit is not foreign: {error}"
     );
     assert!(!gh.calls().iter().any(|c| c.starts_with("pr create")));
+}
+
+#[tokio::test]
+async fn a_stack_carrying_a_foreign_commit_a_remote_branch_holds_is_refused() {
+    let (h, gh, head, review) = reviewed_fork().await;
+    let item = stacked_on(&h, &review, &head).await;
+
+    settle_stacked(&h, &item, |workspace| {
+        other_commit(workspace);
+        git(
+            workspace,
+            &["update-ref", "refs/remotes/origin/unrelated", "HEAD"],
+        );
+        own_commit(workspace);
+    })
+    .await;
+
+    let QueueState::Failed { error, .. } = h.state(&item.id).await else {
+        panic!("refused: {:?}", h.state(&item.id).await);
+    };
+    assert!(error.contains("other@example.com"), "{error}");
+    assert!(!gh.calls().iter().any(|c| c.starts_with("pr create")));
+    nothing_pushed_to_the_fork(&h, &gh, &head);
 }
 
 #[tokio::test]
