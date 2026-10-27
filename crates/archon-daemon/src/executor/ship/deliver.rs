@@ -80,6 +80,9 @@ struct Claimed {
     repo: Option<Repo>,
     /// The existing pull request the item delivers into, if any.
     onto: Option<Box<OntoPullRequest>>,
+    /// The reviewed pull request the item is stacked on, if any: its own
+    /// commits start after that pull request's reviewed head.
+    stacked_on: Option<OntoPullRequest>,
     vars: BTreeMap<String, String>,
     /// The outcome persisted already, if any.
     recorded: Option<ShipOutcome>,
@@ -174,10 +177,12 @@ async fn claim(
         .map(|raw| serde_json::from_str::<ShipOutcome>(&raw))
         .transpose()
         .map_err(|e| ArchonError::Corrupt(format!("delivery outcome of run {run_id}: {e}")))?;
+    let item = store.item(&run.item)?;
     let claimed = Claimed {
         plan,
         repo: repo_of(&store, &run)?,
-        onto: store.item(&run.item)?.onto,
+        stacked_on: super::super::onto::reviewed_dependency(&store, &item)?,
+        onto: item.onto,
         vars: recover::load_run_vars(&store, run_id)?,
         recorded,
         gate,
@@ -400,13 +405,22 @@ async fn prove(
 ) -> Result<Result<checks::Checked, String>, ArchonError> {
     let identity = repo_identity::of(ctx, repo).await?;
     let run = &claimed.run;
+    let stacked = match stacked_since(ctx, repo, claimed.stacked_on.as_ref()).await? {
+        Ok(stacked) => stacked,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
+    let onto = claimed.onto.as_ref().map(|onto| onto.head_sha.clone());
+    assert!(
+        onto.is_none() || stacked.is_none(),
+        "an onto item stacks on nothing"
+    );
     let target = checks::Target {
         data_dir: ctx.paths.data_dir.clone(),
         repo_path: repo.path.clone(),
         workspace: run.workspace.clone(),
         branch: run.branch.clone(),
         base: base.to_owned(),
-        since: claimed.onto.as_ref().map(|onto| onto.head_sha.clone()),
+        since: onto.or(stacked),
         allowed: repo_identity::RepoIdentity::allowed(identity.as_ref()),
         attribution: repo.attribution,
     };
@@ -432,6 +446,38 @@ async fn prove(
     Ok(Ok(checked))
 }
 
+/// The reviewed head the commits of an item `stacked` on a reviewed pull
+/// request must start after, once GitHub shows that pull request still open
+/// at it; `Err` refuses the delivery. `None` for an item stacked on none.
+async fn stacked_since(
+    ctx: &DaemonContext,
+    repo: &Repo,
+    stacked: Option<&OntoPullRequest>,
+) -> Result<Result<Option<String>, String>, ArchonError> {
+    let Some(reviewed) = stacked else {
+        return Ok(Ok(None));
+    };
+    assert!(reviewed.review_only, "stacked on a reviewed pull request");
+    let url = reviewed.pr.url();
+    let binary = &ctx.config.github.binary;
+    let shown = super::super::gh::view_headed(binary, repo, &url).await?;
+    let open = shown.pr.state == "OPEN";
+    let head = shown.pr.head_ref_oid.as_deref();
+    if open && head == Some(reviewed.head_sha.as_str()) {
+        return Ok(Ok(Some(reviewed.head_sha.clone())));
+    }
+    let now = match (open, head) {
+        (true, Some(head)) => format!("its head moved to {head}"),
+        _ => format!("it is {}", shown.pr.state.to_lowercase()),
+    };
+    Ok(Err(format!(
+        "this item is stacked on {url} as reviewed at {}, but {now}: Archon ships another \
+         author's commits only as a review passed them in an open pull request. Queue a new \
+         review item of it, or queue this work again once it merged",
+        reviewed.head_sha
+    )))
+}
+
 /// Whether the run worktree holds no change, as a record stage claims when
 /// it reports "no change needed"; `Err` says why the claim is false.
 pub(in crate::executor) async fn prove_unchanged(
@@ -439,11 +485,18 @@ pub(in crate::executor) async fn prove_unchanged(
     run: &PipelineRun,
 ) -> Result<Result<(), String>, ArchonError> {
     assert!(run.workspace.is_absolute(), "a run has a worktree");
-    let (repo, onto, base) = {
+    let (repo, since, base) = {
         let store = ctx.store.lock().await;
         let vars = recover::load_run_vars(&store, &run.id)?;
         let base = base_of(&store, run, &vars)?;
-        (repo_of(&store, run)?, store.item(&run.item)?.onto, base)
+        let item = store.item(&run.item)?;
+        let stacked = super::super::onto::reviewed_dependency(&store, &item)?;
+        let since = item.onto.map(|onto| onto.head_sha);
+        (
+            repo_of(&store, run)?,
+            since.or(stacked.map(|s| s.head_sha)),
+            base,
+        )
     };
     let Some(repo) = repo else {
         return Ok(Err(
@@ -456,7 +509,7 @@ pub(in crate::executor) async fn prove_unchanged(
         workspace: run.workspace.clone(),
         branch: run.branch.clone(),
         base,
-        since: onto.map(|onto| onto.head_sha),
+        since,
         allowed: Vec::new(),
         attribution: repo.attribution,
     };

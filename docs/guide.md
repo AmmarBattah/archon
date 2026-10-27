@@ -382,6 +382,7 @@ per stage. Add your own under `~/.config/archon/pipelines/` or
 | `code-audit` | scope → audit (3 independent lenses) → report (HTML with issue drafts) | code inspection with evidence and follow-up findings; use `ask` for one question |
 | `e2e-testing` | setup → e2e (gate) → report | HTML and screenshot reports for Lavish |
 | `ask` | answer | a read-only answer about a repository, with no PR |
+| `review` | review (holds the review) | queued `onto` someone else's pull request, a fork's included: one lead has its frozen head reviewed and runs its checks, changing and pushing nothing. A pass is what lets `archon merge` merge that pull request; see [Reviewing a contributor's pull request](#reviewing-a-contributors-pull-request) |
 | `errand` | errand (report) | a small job that changes no repository, answered in text or as a Lavish page; no outward side effects |
 | `design-doc` | research → critique (gate, retry ×2) → report (HTML design/RFC) | design before a large or ambiguous change, strong tier and independent critic; no product-code changes or shipping. Use `proposal: lavish` for design and implementation in one item |
 
@@ -1074,8 +1075,10 @@ both, as in `direct → adaptive`.
 
 An item that `depends_on` an unmerged item of its own repository stacks on it:
 its branch forks from the first unmerged parent's, and `archond` opens its
-pull request against that branch. Other parents are merged
-in. A parent's merge retargets the child PR; later parent commits are merged
+pull request against that branch. One stacked on a passed `review` item
+starts from the head it passed instead (see
+[Reviewing a contributor's pull request](#reviewing-a-contributors-pull-request)).
+Other parents are merged in. A parent's merge retargets the child PR; later parent commits are merged
 forward. Conflicts create a fix item on the child branch, visible in the queue.
 
 ### Work onto an existing pull request
@@ -1088,7 +1091,9 @@ take it too. `archond` resolves it at enqueue and freezes the pull request's
 identity, head repository, head and base branches and head commit, which
 `get_item`, `queue show` and the orchestrator's briefing show. A closed or
 merged pull request, or one whose head is in a fork or in a repository your
-`gh` cannot push to, is refused then with the reason, as is `onto` together with `depends_on` or with a pipeline that does
+`gh` cannot push to, is refused then with the reason (unless the item's
+pipeline pushes nothing, as [`review`](#reviewing-a-contributors-pull-request)
+does), as is `onto` together with `depends_on` or with a pipeline that does
 not work in a worktree. The item's branch starts from the frozen head commit,
 and its agents are told to review against it. A replay with the same
 idempotency key returns the item as first frozen, without asking GitHub again.
@@ -1100,7 +1105,7 @@ item succeeds once GitHub shows that commit as the head: its summary ends
 the owner's text in its body stay as its owner left them, apart from its
 [risk label](#risk-labels) and the Risk section at the top, and nothing is merged: `archon merge`, `/merge`,
 `request_merge` and `merge=auto` all refuse such an item and name the pull request to
-merge by hand. When the head moved
+merge by hand, or a `review` item to queue onto it. When the head moved
 since enqueue (someone else pushed), delivery fails naming both commits
 instead of force-pushing; queue the work again `onto` it to start from the
 new head. The push goes only to the repository holding that head: an
@@ -1109,6 +1114,43 @@ and `pushInsteadOf` does not apply to it. A delivered `onto` item has no
 branch of its own on `origin`, so it is not refreshed and an item depending
 on it in the same repository does not start: queue that work `onto` the
 item instead.
+
+### Reviewing a contributor's pull request
+
+Someone else's pull request, a fork's included, gets the `review` pipeline:
+`archon queue add --pipeline review --onto 123 "Review #123"`, or `onto:
+{pr: 123}` from the orchestrator. Because that pipeline pushes nothing, its
+item may name a fork or a repository your `gh` cannot push to. It starts
+from the frozen head (a fork's is fetched from `refs/pull/123/head`), and its
+lead has the whole pull request, from its merge base with the base branch,
+reviewed at the item's `review` level (`standard`, one reviewer, by
+default) while it runs the checks. It commits nothing; a review whose
+branch moved off the frozen head is refused. A pass records the exact head
+its reviewers passed, which `queue show` and `get_item` show.
+
+`archon merge`, `/merge` and `request_merge` of that item then merge the
+pull request, under the usual confirmation or `grant_merge`, only:
+
+- at the head the review passed: a head that moved since (the contributor
+  pushed again) is refused with both commits; queue a new `review` item;
+- with every check green: `--ignore-checks`, a confirmation's
+  `yes ignore-checks` and `merge_waive_checks` do not apply to it;
+- by the first method the repository allows, pinned to that head, so GitHub
+  credits the contributor as the author; `merge = auto` never applies.
+
+An item with review level `none`, or whose reviewers did not pass, has no
+review on record and merges nothing.
+
+**Building on it.** An item that `depends_on` a succeeded `review` item (no
+`onto`) starts from the head that review passed and opens its own pull
+request into the reviewed pull request's base branch. Archon pushes nothing
+to the contributor's branch. At ship it checks that the reviewed pull
+request is still open at that head and that those commits sit unchanged
+beneath the item's own. Only commits after that head need the repository's
+git identity. A rebased, amended or squashed contributor commit, or any
+other foreign commit, is refused as before. If the contributor's pull
+request is later squash-merged, the stacked pull request still carries the
+original commits; `archon queue refresh` merges the new base into it.
 
 In a `ship = local` repository there is no pull request: `onto` names a
 finished item (`{item: "qi_…"}`) or the branch its last run left
@@ -1293,7 +1335,9 @@ not a draft, mergeable, on the right base, with no unmerged stack parent,
 and still at the commit its review passed. It merges by the first method the
 repository allows, pinned to that commit, never with `--admin`. Checks
 must be green unless you acknowledge them. A refusal says why, is recorded,
-and merges nothing. `archon queue show <item>` prints a `merge:` line.
+and merges nothing. `archon queue show <item>` prints a `merge:` line. A
+pull request Archon did not open merges only through a `review` item queued
+onto it; see [Reviewing a contributor's pull request](#reviewing-a-contributors-pull-request).
 
 You can also just tell the orchestrator "merge it", in chat or in a GitHub
 request with operator standing. It cannot merge by itself: it calls

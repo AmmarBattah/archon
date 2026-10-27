@@ -2341,6 +2341,7 @@ literal `{{`.
 | `agent-testing` | plan → exercise (fan_out 2, report) → report | Agents drive the product as a user would and report defects. workspace = worktree |
 | `code-audit` | scope (work) → audit (fan_out 3, report) → report | Security, reliability and maintainability lenses produce HTML with high/critical issue drafts. No code changes or ship. workspace = worktree, tier = strong, independent_reviewers. Use `ask` for one question. |
 | `e2e-testing` | setup → e2e (test gate, goto setup ×1) → report | The report stage produces HTML and screenshots under `.archon/reports/` for Lavish. |
+| `review` | review (work, `allow_delegation`, holds the review) | tier = balanced, independent_reviewers. Queued `onto` someone else's pull request, a fork's included; no `[pipeline.ship]`, so it commits and pushes nothing. Its lead has the frozen head reviewed at the item's review level, `standard` unless the item asks (§8.2); a pass lets the operator merge that pull request at that head (§18.6). |
 | `ask` | answer | workspace = repo-readonly (a disposable snapshot of the repository's `HEAD` commit, §13), requires_repo = false, tier = balanced |
 | `errand` | errand (report) | workspace = scratch, requires_repo = false, tier = balanced. A small job answered in its summary and optionally as one self-contained Lavish page. No repository changes or outward side effects; read an attached checkout only, and run code on a throwaway copy in scratch. Other files are temporary and collected after `worktrees.gc_after` (default 7d; §13.2). |
 | `design-doc` | research → critique (1, all_pass, goto research ×2) → report (HTML design/RFC) | workspace = worktree, requires_repo = true, tier = strong, independent_reviewers. Before a large or ambiguous change; no product-code changes or shipping. Use `proposal: lavish` for design and implementation in one item. |
@@ -4965,6 +4966,33 @@ state,isDraft,headRefOid,baseRefName,mergeable,statusCheckRollup` shows:
   restacked after its parent merged has a new head, so it needs a retry.
 - Every check is green, unless the operator acknowledged them with
   `--ignore-checks` or `yes ignore-checks`.
+
+**Another's pull request.** An item delivered `onto` an owner's pull
+request is never merged: it carries commits Archon never reviewed. A
+pull request Archon did not open, a fork's included, merges only through a
+succeeded item of a pipeline that pushes nothing (the built-in `review`)
+queued `onto` it. At enqueue such an item freezes the pull request with
+`review_only` set, which alone admits a fork or a repository `gh` cannot
+push to; its branch starts at the frozen head (a fork's fetched from
+`refs/pull/<n>/head`) and its review covers the whole pull request from its
+merge base. When the review is counted (§8.2), archond records the branch
+head it passed as `reviewed_head` in the stage's structured result, a key no
+agent can write; a branch moved off the frozen head is refused. A merge of
+that item then needs, besides the above:
+
+- a recorded `reviewed_head` equal to the frozen head, and GitHub's head
+  still at it: a head that moved since is refused naming both commits;
+- every check green: `--ignore-checks`, `yes ignore-checks` and
+  `merge_waive_checks` do not apply, and `merge = auto` never does.
+
+The method is chosen as for any merge, and no author is passed, so GitHub
+credits the pull request's author. An item that `depends_on` such a review
+item starts from its reviewed head and opens its own pull request into
+that pull request's base; at ship, `gh` must show the reviewed pull request
+open at that head, which becomes the floor of the attribution and foreign
+commit checks (§8.7): those commits must be ancestors of the item's head,
+unchanged, and every other foreign commit is still refused. Nothing is
+ever pushed to the reviewed pull request's branch.
 
 **The merge.** A `merge_requests` row (store V13) is written before any
 GitHub write, and an item has at most one open. archond then runs `gh pr

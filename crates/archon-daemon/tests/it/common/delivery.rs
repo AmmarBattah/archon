@@ -58,6 +58,16 @@ if [ "$1 $2 $4 $5" = "pr view --json labels,body" ]; then
     python3 -c 'import json,sys; print(json.dumps({"labels": [{"name": l} for l in open(sys.argv[1]).read().splitlines()], "body": open(sys.argv[2]).read()}))' "$state/labels-$n" "$state/body-$n"
     exit 0
 fi
+if [ "$1 $2 $4 $5" = "pr view --json id,number,url,state,headRefName,headRefOid,baseRefName,body,isDraft,reviewDecision,isCrossRepository,headRepository,headRepositoryOwner" ]; then
+    shown="$state/headed-${3##*/}.json"
+    [ -f "$shown" ] || { echo "GraphQL: Could not resolve to a PullRequest" >&2; exit 1; }
+    now=OPEN
+    [ -f "$state/merged" ] && now=MERGED
+    [ -f "$state/closed" ] && now=CLOSED
+    python3 -c 'import json,sys; pr=json.load(open(sys.argv[1])); pr["state"]=sys.argv[2]; pr["headRefOid"]=open(sys.argv[3]).read() if sys.argv[3] else pr["headRefOid"]; print(json.dumps(pr))' \
+        "$shown" "$now" "$([ -f "$state/view-head" ] && printf '%s' "$state/view-head")"
+    exit 0
+fi
 case "$1 $2" in
 "label list")
     [ "$3 $4 $5 $6" = "--json name --limit 1000" ] || exit 2
@@ -236,6 +246,13 @@ impl FakeGh {
         write("view-head", head);
         write("view-mergeable", mergeable);
         write("view-checks", &checks.to_string());
+    }
+
+    /// What `gh pr view <number> --json <head fields>` shows of pull request
+    /// `number`; its state and head follow what [`Self::show`] last set.
+    pub fn headed(&self, number: u64, pr: &Value) {
+        let file = self.state.join(format!("headed-{number}.json"));
+        std::fs::write(file, pr.to_string()).expect("pull request");
     }
 
     /// Whether a `gh pr merge` merged the pull request shown.

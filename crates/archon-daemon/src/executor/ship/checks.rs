@@ -37,7 +37,9 @@ pub(super) struct Target {
     /// The branch the change is for: the stack parent's, else the repository's.
     pub base: String,
     /// The commit the run's own commits start after, when not `base`: the
-    /// frozen head of the pull request an `onto` item delivers into.
+    /// frozen head of the pull request an `onto` item delivers into, or the
+    /// reviewed head of the pull request it is stacked on. Only commits after
+    /// it must carry the repository's identity.
     pub since: Option<String>,
     /// The addresses a commit the run adds may carry, recorded at registration.
     pub allowed: Vec<String>,
@@ -344,7 +346,8 @@ fn floor(tree: &Path, target: &Target) -> Result<Result<String, String>, ArchonE
         Some(0) => Ok(Ok(since.clone())),
         Some(1) => Ok(Err(format!(
             "the run branch `{}` does not hold {since}, the head of the pull request it \
-             delivers into, so it cannot be pushed there by fast-forward",
+             delivers into or is stacked on: its commits must stay as they are, beneath the \
+             run's own",
             target.branch
         ))),
         _ => Err(held.failure()),

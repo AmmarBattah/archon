@@ -225,8 +225,13 @@ pub(super) async fn freeze_onto(
         return Ok(None);
     };
     let repo = check_onto(env, spec, has_dependencies)?;
-    let frozen = executor::onto::freeze(ctx, repo, target).await?;
+    let review_only = !spec.delivers();
+    let frozen = executor::onto::freeze(ctx, repo, target, review_only).await?;
     assert_eq!(&frozen.target, target, "frozen as asked");
+    assert_eq!(
+        frozen.review_only, review_only,
+        "frozen as the pipeline works"
+    );
     Ok(Some(frozen))
 }
 
