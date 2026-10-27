@@ -57,7 +57,6 @@ pub(crate) async fn freeze(
         return Err(refused(&frozen.pr.url(), &why));
     }
     assert!(stack::is_commit_id(&frozen.head_sha), "checked by frozen");
-    assert!(review_only || !frozen.is_fork(), "checked by frozen");
     assert!(is_plain_branch(&frozen.head_ref), "checked by gh");
     Ok(frozen)
 }
@@ -210,7 +209,7 @@ fn frozen(
     };
     assert!(stack::is_commit_id(&head_sha), "checked by gh");
     let node_id = headed.pr.node_id().map(str::to_owned);
-    let frozen = OntoPullRequest {
+    Ok(OntoPullRequest {
         target: target.clone(),
         pr: headed.pr.identity(),
         node_id,
@@ -219,15 +218,7 @@ fn frozen(
         base_ref: headed.pr.base_ref_name,
         head_sha,
         review_only,
-    };
-    // GitHub's flag and the recorded repositories must agree on a fork.
-    if frozen.is_fork() != headed.is_cross_repository {
-        return Err(ArchonError::Protocol(format!(
-            "GitHub showed {url} with its head in `{}` but isCrossRepository {}",
-            frozen.head_repository, headed.is_cross_repository
-        )));
-    }
-    Ok(frozen)
+    })
 }
 
 fn refused(url: &str, why: &str) -> ArchonError {

@@ -14,6 +14,7 @@ use archon_core::protocol::{EnqueueRequest, Reply, RepoPatch, RepoRef, Request};
 use archon_core::pull_request::OntoTarget;
 use archon_core::queue::{QueueItem, QueueState};
 use archon_core::run::StageOutcome;
+use archon_daemon::executor::coordination;
 use common::delivery::{FakeGh, add_origin, origin_of, pushed, record, shipped_by};
 use common::{Harness, REPO_NAME, REVIEW_MODEL, git};
 use serde_json::{Value, json};
@@ -190,6 +191,10 @@ fn merge_item(item: &QueueItem, ignore_checks: bool) -> Request {
     }
 }
 
+async fn merges(h: &Harness, item: &QueueItem) -> Vec<MergeRequest> {
+    h.ctx.store.lock().await.merges_for_item(&item.id).unwrap()
+}
+
 fn merge_of(reply: Result<Reply, ArchonError>) -> MergeRequest {
     match reply {
         Ok(Reply::Merge(merge)) => *merge,
@@ -285,6 +290,35 @@ async fn another_s_pull_request_merges_only_with_its_checks_green() {
         "{reason}"
     );
     assert!(!gh.calls().iter().any(|c| c.starts_with("pr merge")));
+}
+
+/// Under `grant_merge`, a request made while checks run waits for them, as
+/// for Archon's own pull requests, and merges once they are green.
+#[tokio::test]
+async fn a_granted_merge_of_a_reviewed_pull_request_waits_for_pending_checks() {
+    let (h, gh, head, item) = reviewed_fork().await;
+    let running = json!([{"__typename": "CheckRun", "name": "ci", "status": "IN_PROGRESS", "conclusion": null}]);
+    gh.show(&head, "MERGEABLE", running);
+    let waiting = merge_of(h.orchestrator(request_merge(&item)).await);
+    assert_eq!(waiting.state, MergeState::AwaitingChecks);
+
+    coordination::reconcile(&h.ctx).await.unwrap();
+    let [still] = merges(&h, &item).await.try_into().expect("one request");
+    assert_eq!(still.state, MergeState::AwaitingChecks, "still pending");
+    assert!(!gh.merged());
+
+    gh.show(&head, "MERGEABLE", green());
+    coordination::reconcile(&h.ctx).await.unwrap();
+    let [done] = merges(&h, &item)
+        .await
+        .try_into()
+        .expect("the same request");
+    assert_eq!(
+        (&done.id, done.state.kind()),
+        (&waiting.id, "merged"),
+        "{done:?}"
+    );
+    assert!(gh.merged());
 }
 
 #[tokio::test]

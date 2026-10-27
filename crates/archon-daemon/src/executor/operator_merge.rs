@@ -230,20 +230,16 @@ fn reviewed_pull_request(
     })
 }
 
-/// Why another's pull request is not merged now: only every check green
-/// lets it merge, which no acknowledgement or waiver replaces.
-fn checks_not_green(shipped: &Shipped, facts: &PullRequestFacts) -> Option<String> {
-    if !shipped.review_of {
-        return None;
-    }
-    let seen = ChecksSeen::of(&facts.checks);
-    if seen.all_green() {
+/// Why another's pull request is not merged at the last step: only every
+/// check green lets it merge, which no acknowledgement or waiver replaces.
+fn checks_not_green(ready: &Ready) -> Option<String> {
+    if !ready.review_of || ready.seen.all_green() {
         return None;
     }
     Some(format!(
         "its checks are not all green ({}): a pull request Archon did not open merges only \
          with every check green, whatever is acknowledged; ask again once they pass",
-        seen.describe()
+        ready.seen.describe()
     ))
 }
 
@@ -954,6 +950,10 @@ async fn execute(
         }
     };
     merge.checks = Some(ready.seen.describe());
+    if let Some(why) = checks_not_green(&ready) {
+        merge.state = MergeState::Refused { reason: why };
+        return finish_merge(ctx, merge).await;
+    }
     let binary = &ctx.config.github.binary;
     let method = match merge_method(binary, &ready.repo).await {
         Ok(method) => method,
@@ -1058,6 +1058,8 @@ struct Ready {
     repo: Repo,
     base: String,
     seen: ChecksSeen,
+    /// The pull request is another's, passed by a review item.
+    review_of: bool,
 }
 
 /// What reading the pull request again just before a merge decided.
@@ -1104,9 +1106,7 @@ async fn ready(ctx: &DaemonContext, merge: &MergeRequest) -> Result<Readiness, A
         Ok(facts) => facts,
         Err(why) => return Ok(Readiness::Refused(why)),
     };
-    let refused =
-        moved_since_review(&shipped, &facts).or_else(|| checks_not_green(&shipped, &facts));
-    if let Some(why) = refused {
+    if let Some(why) = moved_since_review(&shipped, &facts) {
         return Ok(Readiness::Refused(why));
     }
     let expected = Expected {
@@ -1119,6 +1119,7 @@ async fn ready(ctx: &DaemonContext, merge: &MergeRequest) -> Result<Readiness, A
             repo: shipped.repo.clone(),
             base,
             seen,
+            review_of: shipped.review_of,
         })),
         Ok(Assessment::Undecided(_)) => Readiness::Undecided,
         Err(why) => Readiness::Refused(why),
