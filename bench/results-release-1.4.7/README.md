@@ -44,6 +44,43 @@ the released Aether 1.2.5.
   the last pre-release fix. It cost ≥ $0.64 billed and $0.15 estimated. Its
   results are under "Earlier round" below.
 
+## With #292 merged
+
+**Verdict: PASS.** `main`'s #292 (LFS-aware ship checks) was merged into
+`next` as `ed2debed`. The head with its CHANGELOG entry, `884b701c`, passed
+a Haiku smoke run 4/4 on the released Aether 1.2.5. The method, $7 cap and
+`baseline.json` are the ones above. The baselines, tasks and graders under
+`bench/` are byte-identical to `f23dd517`'s.
+
+`CARGO_BUILD_JOBS=4 make ci` passed on `ed2debed`: 3370 tests passed,
+0 failed and 9 ignored. `884b701c` changes only `CHANGELOG.md`.
+
+| Run | Archon | Archon cost | Archon wall | Aether | Smoke |
+|---|---|---|---|---|---|
+| Haiku merged, run 1 | 3/4 | ≥ $0.0659 | 1397 s | 4/4 | FAIL · ≥ $0.10 |
+| Haiku merged, run 2 | 4/4 | $0.0927 | 301 s | 4/4 | PASS · $0.13 |
+
+- **Run 1 never reached #292's code.** On `quality-ledger-transfer`, the
+  orchestrator spent 235 output tokens and enqueued no item. The trial hit
+  the 1200 s timeout with an empty queue, so no run started and no ship
+  check ran.
+- **Its cause is in Aether 1.2.5.** At orchestrator start-up, a wakeup was
+  lost. The task message was injected into the first turn after `wait_for`
+  ended that turn, and was marked consumed. It is filed as an Aether issue.
+- **Run 2.** Three trials ran the `direct` pipeline with `standard` review.
+  Each delivered its run through the merged ship checks; the fixtures use
+  no LFS. `review-seeded-bug` was answered with no item, as in run 1. The
+  Archon cost is in line with the head's three runs above ($0.0929 to
+  $0.1160).
+- **Logs.** Run 2's archond logs show only the socket directory tightening
+  and one "usage total went down" line. Every trial connected at
+  protocol 24.
+- **Binaries.** `archon` and `archon-bench` were built from `884b701c` in
+  the release profile with `--locked`. They are byte-identical to the
+  builds from `ed2debed` used in run 1.
+- **Evidence.** This item's artifacts keep run 1, with the `make ci` log
+  (`merge-292-bench-evidence`), and run 2 (`merge-292-bench-evidence-rerun`).
+
 ## The head's miss
 
 Haiku head run 1 missed `review-seeded-bug` (score 0.5).
@@ -164,6 +201,8 @@ Binary sha256 prefixes:
 |---|---|
 | head `archon` (`f23dd517`, release profile) | `6590c005` |
 | head `archon-bench` (`f23dd517`, release profile) | `6415ff45` |
+| merged `archon` (`884b701c` and `ed2debed`, release profile) | `2be11ad5` |
+| merged `archon-bench` (`884b701c` and `ed2debed`, release profile) | `e999332b` |
 | earlier-round `archon` (`148eec71`, dev profile) | `4e0a3205` |
 | earlier-round `archon-bench` (`148eec71`, dev profile) | `7236e403` |
 | released v1.4.6 `archon` | `acdc7128` |
