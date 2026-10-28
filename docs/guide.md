@@ -776,7 +776,12 @@ advice (`run archon update`) when a newer release exists.
 `/upgrade both latest` is also what to say when the orchestrator tells you a
 newer Archon or Aether exists: only your own message, typed here, starts it,
 never a GitHub request or an agent. (`archon update --yes` from a shell
-does the same, and also restarts the orchestrator.)
+does the same, and also restarts the orchestrator: with archond running it
+exits 0 only once the orchestrator, if one runs, is in a generation the new
+version created, names the step that did not finish otherwise, and Ctrl-C ends it at any step with exit 130; see
+[Updating](install.md#updating).) A restart Archon asked for itself is
+reported in the feed as `Archon's own aetherd restarted, as planned`, not
+as an aetherd that had stopped.
 
 `/upgrade` is `archon daemon upgrade` (or `archon daemon restart`): archond
 holds dispatch while running stage agents finish (at most 30 minutes),
@@ -802,7 +807,12 @@ as any command that changes something does; a command that only reads never
 starts either ([which commands start archond](#which-commands-start-archond)).
 `archon aether <args…>` runs any `aether` command against Archon's instance,
 for example `archon aether agents`. `archon daemon stop` stops both
-daemons (`--keep-aether` stops only archond). In the TUI's tree each work item is one subtree: a node named after
+daemons (`--keep-aether` stops only archond). Where some of Archon's config
+directory, data directory and socket are moved from their defaults and
+others are not, `daemon stop`, `daemon restart`, `archon aether stop` and
+the restart of `archon update` refuse and stop nothing, as autostart does. Archon's own aetherd is not stopped when it names another
+Aether instance than the one archond last linked to; when either is unknown
+the stop goes ahead with a warning. In the TUI's tree each work item is one subtree: a node named after
 the item, with its stage agents (`implement`, `review 1/2`, `ship`) underneath, beside the `archon` orchestrator.
 
 ```sh

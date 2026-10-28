@@ -162,10 +162,30 @@ restart`, with the same `--wait` and `--requeue`: running items resume as
 after any daemon restart); and `archon orchestrator restart`, which gives
 the orchestrator the new tools. In shared mode your own aetherd is never
 restarted; Archon's tools in it are refreshed with `aether mcp refresh
-archon`. Nothing is restarted when `archond` is not running or already runs
-the installed version, and a failed `aether update` is reported as a
-warning (exit 1) after the restart. Without `--yes`, off a terminal, the
-command prints what to run by hand:
+archon`. Nothing is restarted when `archond` is not running: the next
+command that needs it starts the new version. When `archond` already runs
+the installed version, only an orchestrator another archon created is
+restarted (an earlier update cut short after archond's restart leaves one).
+A failed `aether update` is reported as a warning (exit 1) after the
+restart. Where some of Archon's config directory, data directory and
+socket are moved from their defaults (`ARCHON_CONFIG_DIR`,
+`ARCHON_DATA_DIR`, `ARCHON_SOCKET`) and others are not, the new archon is
+installed but nothing is restarted, and the command fails naming them: the
+archond it would reach may be another setup's.
+
+Each step is said on stderr as it starts (`archon: update: restarting
+archond (pid 4242, for at most 2100s)`), and each has a deadline: the
+archond restart `--wait` plus five minutes, the question to a current
+archond about which archon created the orchestrator one minute, the
+orchestrator restart three minutes. With `--yes` and a running `archond`, the command exits 0 only
+once archond runs the new version and the orchestrator, if one runs, is in
+a generation the new version created; otherwise it exits non-zero naming
+the step that did not finish.
+The install report then names no commands to run by hand. Ctrl-C (SIGINT),
+SIGTERM or SIGHUP ends it at any step, the question included: it names the
+step it stopped, says what finishes the restart by hand, and exits 128 plus
+the signal (130 for Ctrl-C). Without `--yes`, off a terminal, the command
+prints what to run by hand:
 
 ```sh
 archon daemon stop --keep-aether
