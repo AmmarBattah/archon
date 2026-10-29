@@ -496,14 +496,14 @@ export function parseInline(src, refs = new Map()) {
     const opener = brackets.pop();
     pos += 1;
     if (!opener || !opener.active) { buf += ']'; return; }
-    const labelSrc = src.slice(opener.at, pos - 1);
     let target = null;
     let end = pos;
     if (src[end] === '(') {
       const tail = parseTail(end);
       if (tail) { target = tail; end = tail.end; }
     }
-    if (!target) {
+    if (!target && refs.size > 0 && pos - 1 - opener.at <= 999) {
+      const labelSrc = src.slice(opener.at, pos - 1);
       let label = labelSrc;
       let stop = pos;
       if (src[stop] === '[') {
@@ -547,8 +547,14 @@ export function parseInline(src, refs = new Map()) {
       else if (pos + 1 < src.length && ESCAPABLE.test(src[pos + 1])) { buf += src[pos + 1]; pos += 2; }
       else { buf += '\\'; pos += 1; }
     } else if (ch === '\n') {
-      if (/ {2,}$/.test(buf)) { buf = buf.replace(/ +$/, ''); flush(); append({ t: 'br' }); }
-      else buf = `${buf.replace(/ +$/, '')}\n`;
+      // Count the spaces in the source, not the buffer: reading a long
+      // buffer back would flatten it on every line.
+      let spaces = 0;
+      while (src.charCodeAt(pos - 1 - spaces) === 32 && spaces < buf.length) spaces += 1;
+      const hard = spaces >= 2;
+      if (spaces > 0) buf = buf.slice(0, buf.length - spaces);
+      if (hard) { flush(); append({ t: 'br' }); }
+      else buf += '\n';
       pos += 1;
     } else if (ch === '`') {
       let end = pos;

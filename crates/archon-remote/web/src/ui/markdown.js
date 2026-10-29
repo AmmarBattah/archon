@@ -69,7 +69,7 @@ export function clampedMarkdown(source, { limit, more = 'Show all', less = 'Show
   let used = 0;
   let keep = 0;
   while (keep < all.length && (keep === 0 || used + all[keep].size <= limit)) { used += all[keep].size; keep += 1; }
-  const folded = keep < all.length || used > limit;
+  const folded = keep < all.length;
   const body = h('div', { class: ['md', className] }, blocks(folded ? all.slice(0, keep) : all));
   if (!folded) return body;
   const toggle = h('button', { class: 'link-button', type: 'button', 'aria-expanded': 'false' }, more);
