@@ -172,8 +172,8 @@ Open the link and comment on the page; your comments go back to the
 orchestrator or, on a waiting proposal, decide it. You can also answer the
 gate in the chat: `/answer 5 approve`, `/answer 5 <feedback>` to send it
 back, or `/answer 5 reject` to cancel the item. `archon reports` lists every
-page with its id, and `archon reports reopen <id>` shows one again. Without Lavish the same
-questions arrive in the chat with the file's path.
+page with its id, and `archon reports reopen <id>` shows one again. Without
+Lavish the same questions arrive in the chat with the file's path.
 
 ## 7. GitHub, questions and lessons
 
