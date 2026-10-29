@@ -78,7 +78,8 @@ you:     /answer 4 yes
 A bare `yes` also works when it is the first message you send after the
 question and only one confirmation is waiting; otherwise use
 `/answer <n> yes`. Every change lands in the Authority feed with a number,
-and `/archon undo <n>` reverts it. If you would rather type the exact
+and a settings or autonomy change there can be reverted with
+`/archon undo <n>`. If you would rather type the exact
 change, a whole-message command applies at once, with no question:
 
 ```text
@@ -171,7 +172,7 @@ Open the link and comment on the page; your comments go back to the
 orchestrator or, on a waiting proposal, decide it. You can also answer the
 gate in the chat: `/answer 5 approve`, `/answer 5 <feedback>` to send it
 back, or `/answer 5 reject` to cancel the item. `archon reports` lists every
-page and `archon reports reopen` shows one again. Without Lavish the same
+page with its id, and `archon reports reopen <id>` shows one again. Without Lavish the same
 questions arrive in the chat with the file's path.
 
 ## 7. GitHub, questions and lessons
