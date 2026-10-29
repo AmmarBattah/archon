@@ -240,6 +240,8 @@ test('pathological input stays fast and bounded', () => {
     softBreaks: 'a\n'.repeat(95_000),
     lazyPipes: 'a|b\n'.repeat(40_000),
     closers: '['.repeat(95_000) + ']'.repeat(95_000),
+    nestedImages: '!['.repeat(10_000) + 'a' + '](x)'.repeat(10_000),
+    wideTable: '|a'.repeat(10_000) + '\n' + '|-'.repeat(10_000) + '\n' + '|\n'.repeat(4000),
     deepSpans: nest(3000, '*a ', ' a*').replace(/x/, ''),
   };
   const start = performance.now();

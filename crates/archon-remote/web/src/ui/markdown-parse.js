@@ -9,6 +9,7 @@
 export const MAX_SOURCE_CHARS = 200_000;
 export const MAX_BLOCK_DEPTH = 16;
 const MAX_INLINE_DEPTH = 24;
+const MAX_TABLE_COLUMNS = 64;
 const MAX_URL_CHARS = 1000;
 const MAX_TITLE_CHARS = 1024;
 
@@ -142,7 +143,7 @@ function tableAt(lines, i) {
   if (!DELIM_ROW.test(delim) || (!head.includes('|') && !delim.includes('|')) || indentOf(head) >= 4) return null;
   const heads = splitRow(head);
   const aligns = splitRow(delim);
-  if (heads.length !== aligns.length) return null;
+  if (heads.length !== aligns.length || heads.length > MAX_TABLE_COLUMNS) return null;
   return { heads, aligns: aligns.map((a) => (a.startsWith(':') ? (a.endsWith(':') ? 'center' : 'left') : (a.endsWith(':') ? 'right' : null))) };
 }
 
@@ -552,6 +553,8 @@ export function parseInline(src, refs = new Map()) {
     if (inner) {
       inner.prev = null;
       link.depth = depthOf(inner) + 1;
+      // Pathologically nested labels keep the link but drop the label.
+      if (link.depth > MAX_INLINE_DEPTH) { link.inner = null; link.depth = 1; }
     }
     append(link);
     // Links do not nest: earlier link openers can no longer close.
