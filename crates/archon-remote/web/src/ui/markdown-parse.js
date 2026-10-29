@@ -85,7 +85,7 @@ const FENCE = /^( {0,3})(`{3,}|~{3,})[ \t]*([^]*)$/;
 const LIST = /^( {0,3})([-+*]|\d{1,9}[.)])( +|$)/;
 const SETEXT = /^ {0,3}(=+|-+)[ \t]*$/;
 const QUOTE = /^ {0,3}> ?/;
-const DELIM_ROW = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*(?::?-+:?[ \t]*)?)*$/;
+const DELIM_ROW = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*(?:\|[ \t]*)?$/;
 const REF_DEF = /^ {0,3}\[((?:[^\]\\]|\\.){1,999})\]:[ \t]*(<[^<>]*>|\S+)(?:[ \t]+("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\((?:[^)\\]|\\.)*\)))?[ \t]*$/;
 
 function normalizeLabel(label) {
@@ -362,6 +362,8 @@ export function parseInline(src, refs = new Map()) {
   };
   let delims = null; // delimiter stack, a doubly linked list; `delims` is its top
   const brackets = [];
+  // Link openers below this stack index are off: a link cannot hold a link.
+  let linkFloor = 0;
   let buf = '';
   let pos = 0;
   const autolink = (href, text) => ({ t: 'link', href, title: null, image: false, depth: 1, inner: { t: 'text', v: text, prev: null, next: null } });
@@ -516,7 +518,9 @@ export function parseInline(src, refs = new Map()) {
   const closeBracket = () => {
     const opener = brackets.pop();
     pos += 1;
-    if (!opener || !opener.active) { buf += ']'; return; }
+    const off = opener && !opener.image && brackets.length < linkFloor;
+    if (linkFloor > brackets.length) linkFloor = brackets.length;
+    if (!opener || off) { buf += ']'; return; }
     let target = null;
     let end = pos;
     if (src[end] === '(') {
@@ -551,7 +555,7 @@ export function parseInline(src, refs = new Map()) {
     }
     append(link);
     // Links do not nest: earlier link openers can no longer close.
-    if (!opener.image) for (const b of brackets) if (!b.image) b.active = false;
+    if (!opener.image) linkFloor = brackets.length;
     pos = end;
   };
 
@@ -605,7 +609,7 @@ export function parseInline(src, refs = new Map()) {
       const image = ch === '!';
       flush();
       const node = append({ t: 'text', v: image ? '![' : '[' });
-      brackets.push({ node, at: pos + (image ? 2 : 1), image, active: true, delim: delims });
+      brackets.push({ node, at: pos + (image ? 2 : 1), image, delim: delims });
       pos += image ? 2 : 1;
     } else if (ch === '!') {
       buf += '!';

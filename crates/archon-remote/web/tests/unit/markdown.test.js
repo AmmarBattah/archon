@@ -235,6 +235,8 @@ test('pathological input stays fast and bounded', () => {
     fenceSeparator: `\`\`\`${' '.repeat(190_000)}\u2028`,
     fenceTicks: `${'`'.repeat(190_000)}\u2028`,
     refSpaces: `[a]: b${' '.repeat(190_000)}x`,
+    openersThenLinks: '['.repeat(119_000) + '[]()'.repeat(19_900),
+    imageOpenersThenLinks: '!['.repeat(60_000) + '[a](b)'.repeat(15_000),
     softBreaks: 'a\n'.repeat(95_000),
     lazyPipes: 'a|b\n'.repeat(40_000),
     closers: '['.repeat(95_000) + ']'.repeat(95_000),
