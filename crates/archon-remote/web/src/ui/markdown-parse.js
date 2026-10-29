@@ -41,7 +41,7 @@ function unescapeText(s) {
 // The only hrefs the app will emit: http(s), mailto, and its own #/ routes.
 // Anything else, however it is disguised, is refused (null).
 export function safeHref(raw) {
-  const s = String(raw ?? '').replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, '');
+  const s = trimEndWhile(String(raw ?? ''), (c) => c <= 32).replace(/^[\x00-\x20]+/, '');
   if (!s || /[\x00-\x20\x7f-\x9f\u2028\u2029\ufeff]/.test(s)) return null;
   if (/^#\/[A-Za-z0-9\-._~!$&'()*+,;=:@/%?]*$/.test(s)) return { href: s, external: false };
   const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(s);
@@ -61,6 +61,24 @@ export function safeHref(raw) {
 
 const isBlank = (l) => !/\S/.test(l);
 const indentOf = (l) => /^ */.exec(l)[0].length;
+// End-anchored regexes retry from every start on a long inner run, so trim
+// from the end by hand.
+function trimEndWhile(s, test) {
+  let n = s.length;
+  while (n > 0 && test(s.charCodeAt(n - 1))) n -= 1;
+  return s.slice(0, n);
+}
+const isSpTab = (c) => c === 32 || c === 9;
+
+// An ATX heading's text without its optional closing run of #.
+function atxText(raw) {
+  let s = trimEndWhile(raw, isSpTab);
+  const hashes = trimEndWhile(s, (c) => c === 35);
+  if (hashes.length === 0) return '';
+  if (hashes.length < s.length && isSpTab(hashes.charCodeAt(hashes.length - 1))) s = trimEndWhile(hashes, isSpTab);
+  return s.trim();
+}
+
 const HR = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const ATX = /^ {0,3}(#{1,6})(?:[ \t]+(.*))?$/;
 const FENCE = /^( {0,3})(`{3,}|~{3,})[ \t]*(.*)$/;
@@ -172,7 +190,7 @@ function parseBlocks(lines, depth, ctx) {
 
     const atx = ATX.exec(line);
     if (atx) {
-      const text = (atx[2] ?? '').replace(/[ \t]+#+[ \t]*$/, '').replace(/^#+[ \t]*$/, '').trim();
+      const text = atxText(atx[2] ?? '');
       i += 1;
       push({ t: 'h', level: atx[1].length, text }, from);
       continue;
@@ -237,7 +255,7 @@ function parseBlocks(lines, depth, ctx) {
       para.shift();
     }
     if (!para.length) continue;
-    const text = para.join('\n').replace(/[ \t]+$/, '');
+    const text = trimEndWhile(para.join('\n'), isSpTab);
     push(level ? { t: 'h', level, text } : { t: 'p', text }, from);
   }
   return blocks;
@@ -315,10 +333,13 @@ const EMAIL = /<([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-
 
 function trimUrlTail(url) {
   let s = url;
+  let close = 0;
+  let open = 0;
+  for (const c of s) { if (c === ')') close += 1; else if (c === '(') open += 1; }
   for (;;) {
     const last = s.at(-1);
     if (last && '?!.,:*_~\'"'.includes(last)) s = s.slice(0, -1);
-    else if (last === ')' && s.split(')').length > s.split('(').length) s = s.slice(0, -1);
+    else if (last === ')' && close > open) { s = s.slice(0, -1); close -= 1; }
     else if (last === ';' && /&[A-Za-z0-9]+;$/.test(s)) s = s.replace(/&[A-Za-z0-9]+;$/, '');
     else return s;
   }
