@@ -10,6 +10,7 @@ export const MAX_SOURCE_CHARS = 200_000;
 export const MAX_BLOCK_DEPTH = 16;
 const MAX_INLINE_DEPTH = 24;
 const MAX_TABLE_COLUMNS = 64;
+const MAX_TABLE_CELLS = 20_000;
 const MAX_URL_CHARS = 1000;
 const MAX_TITLE_CHARS = 1024;
 
@@ -224,7 +225,7 @@ function parseBlocks(lines, depth, ctx) {
     if (table) {
       i += 2;
       const rows = [];
-      while (i < n && !isBlank(lines[i]) && !startsBlock(lines[i], depth)) {
+      while (i < n && !isBlank(lines[i]) && !startsBlock(lines[i], depth) && (rows.length + 1) * table.heads.length <= MAX_TABLE_CELLS) {
         const cells = splitRow(lines[i]);
         rows.push(table.heads.map((_, k) => cells[k] ?? ''));
         i += 1;
@@ -432,9 +433,9 @@ export function parseInline(src, refs = new Map()) {
   // Nesting depth of a chain. The scans share one budget, so flat input
   // cannot make repeated wrapping quadratic; once spent, nothing new nests.
   let budget = 8 * src.length + 1000;
-  const depthOf = (head) => {
+  const depthOf = (head, stop = null) => {
     let d = 0;
-    for (let n = head; n; n = n.next) {
+    for (let n = head; n && n !== stop; n = n.next) {
       budget -= 1;
       if (budget < 0) return Infinity;
       d = Math.max(d, n.depth ?? 0);
@@ -446,7 +447,7 @@ export function parseInline(src, refs = new Map()) {
     const head = from.next;
     if (head === to) return null;
     const tail = to.prev;
-    const depth = depthOf(head) + 1;
+    const depth = depthOf(head, to) + 1;
     if (depth > MAX_INLINE_DEPTH) return null;
     const node = { t: type, depth, ...extra, inner: head, prev: from, next: to };
     head.prev = null;

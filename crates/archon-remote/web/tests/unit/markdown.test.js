@@ -242,6 +242,7 @@ test('pathological input stays fast and bounded', () => {
     closers: '['.repeat(95_000) + ']'.repeat(95_000),
     nestedImages: '!['.repeat(10_000) + 'a' + '](x)'.repeat(10_000),
     wideTable: '|a'.repeat(10_000) + '\n' + '|-'.repeat(10_000) + '\n' + '|\n'.repeat(4000),
+    tallTable: '|a'.repeat(64) + '\n' + '|-'.repeat(64) + '\n' + '|\n'.repeat(99_000),
     deepSpans: nest(3000, '*a ', ' a*').replace(/x/, ''),
   };
   const start = performance.now();
@@ -259,6 +260,12 @@ test('nesting is capped: deep quotes and lists end as text, not a crash', () => 
   assert.match(out, /deep/);
   const lists = md(Array.from({ length: 100 }, (_, i) => `${' '.repeat(i * 2)}- x${i}`).join('\n'));
   assert.ok(lists.split('<ul').length - 1 <= 17);
+});
+
+test('many emphasis runs in one paragraph all render', () => {
+  const out = md(Array.from({ length: 200 }, (_, i) => `*w${i}*`).join(' '));
+  assert.equal(out.split('<em>').length - 1, 200);
+  assert.ok(!out.includes('*'));
 });
 
 test('input past the size cap is cut with an ellipsis', () => {
